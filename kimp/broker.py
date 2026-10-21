@@ -1,0 +1,873 @@
+"""
+헷지 브로커: 진입·청산·되돌리기·손익·송금·대조 (페이퍼·드라이런·실거래 공통 로직)
+
+실행기(kimp/executor.py)만 바꿔 끼운다. 이 파일의 흐름은 모드와 상관없이 똑같이 돈다.
+
+진입 (세 단계, 페이퍼도 실거래도 이 순서)
+------------------------------------------------------------------
+  0) 계산만 먼저: 그 순간 호가로 체결 계산(EntryPlan) → 호가 충분? 너무 밀리지 않나? 양쪽 돈 충분?
+  1) 바이비트 숏 bybit_qty 개              → 실제 숏 금액 N USDT
+  2) 업비트 USDT N 개 매도                  → 원화 (수수료 빼고)
+  3) 그 원화 ÷ (1 + 수수료율) 로 코인 매수   (살 때 수수료는 원화에서 따로 빠짐)
+  포지션은 0) 다음 OPENING 으로 먼저 저장하고, 단계마다 체결(Fill)을 바로 저장한다.
+  → 중간에 프로그램이 꺼져도 어디까지 했는지 남아 있다.
+
+  4) 양쪽 크기 맞추기: 부분 체결로 금액이 1% 넘게 다르면 큰 쪽을 줄인다 (비용은 이 포지션 진입 비용으로)
+
+  중간 실패 → 끝난 단계를 거꾸로 되돌린다 (ABORTED)
+    2) 실패: 숏 닫기
+    3) 실패: 받은 원화로 USDT 되사기 + 숏 닫기
+  되돌리기도 실패 → ERROR (사람이 거래소에서 정리, 신규 진입 중단, 긴급 알림)
+
+주문마다 추적번호 (레그 리스크 대비)
+------------------------------------------------------------------
+  주문을 내기 '전에' 추적번호(client_id)와 함께 SENT 로 기록 → 주문 → DONE / VOID
+  응답이 끊겨 결과를 모르면(OrderUnknown) 추측하지 않고, 다음 스캔에 추적번호로 거래소에 조회해서 채운 뒤 이어서
+
+청산 (세 단계)
+------------------------------------------------------------------
+  1) 업비트 코인 매도 → 2) 받은 원화로 USDT 매수 → 3) 바이비트 숏 닫기 (강제청산이면 3 대신 '강제청산됨' 기록)
+  CLOSING 으로 바꾸고 시작. 단계마다 '목표 양에 닿을 때까지' 남은 양만 다시 주문 (일부 체결 대비, 최대 3번).
+  그래도 남거나 실패하면 CLOSING 그대로 두고, 다음 스캔(sync)에서 남은 양만 이어서.
+  손익은 '실제 체결값' 으로 계산한다 (kimp/pnl.compute_pnl).
+
+송금 (리밸런싱)
+------------------------------------------------------------------
+  출금 요청 → Transfer(REQUESTED) → 받는 쪽 입금 확인 → CONFIRMED
+  송금 중에는 또 보내지 않는다. 송금 중인 돈은 '받는 쪽' 자본으로 친다.
+  페이퍼는 요청하자마자 도착, 실거래는 수 분 걸린다.
+
+대조 (RECONCILE_INTERVAL_SEC 마다)
+------------------------------------------------------------------
+  DB 의 열린 포지션 ↔ 실행기가 알려주는 실제 숏 개수·업비트 코인 개수
+  다르면 신규 진입 중단 + 긴급 알림 (자동으로 고치지 않는다)
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from kimp.config import FeeSettings
+from kimp.db import (
+    ExitReason,
+    Fill,
+    FillState,
+    FundingEvent,
+    Position,
+    PositionStatus,
+    Transfer,
+    TransferStatus,
+    utcnow,
+)
+from kimp.executor import (
+    BYBIT_USDT,
+    UPBIT_KRW,
+    UPBIT_USDT,
+    LegFill,
+    OrderFailed,
+    OrderUnknown,
+    PaperExecutor,
+    coin_key,
+    new_client_id,
+)
+from kimp.pnl import EntryLegs, ExitLegs, PnLBreakdown, compute_pnl, liquidation_price
+from kimp.premium import ExitPlan, Quote, premium_percent
+from kimp.safety import Safety, kst_midnight_utc
+
+logger = logging.getLogger(__name__)
+
+
+class EntryRejected(Exception):
+    """진입 못 함 (호가 부족, 잔고 부족, 너무 많이 밀림, 주문 실패 후 되돌림 등)"""
+
+
+class InsufficientBalance(EntryRejected):
+    """
+    한쪽 USDT 가 모자라서 진입 못 함 → 리밸런싱(송금)하면 들어갈 수도 있다
+
+    Attributes:
+        side: 모자란 쪽 ('upbit' / 'bybit')
+        need_usdt: 그쪽에 필요한 USDT (지금 있는 것 포함한 전체)
+    """
+
+    def __init__(self, message: str, side: str, need_usdt: float):
+        super().__init__(message)
+        self.side = side
+        self.need_usdt = need_usdt
+
+
+@dataclass(frozen=True)
+class ExitValuation:
+    """
+    "지금 청산하면 얼마?" 계산 결과 (판단용. 실제 청산은 이 순간 시세 quote 로 주문)
+
+    Attributes:
+        plan: 체결 계산 (업비트 코인 매도, USDT 매수, 바이비트 숏 닫기)
+        legs: 손익 계산용 청산 값 / pnl: 손익 상세
+        quote: 판단한 그 순간 시세 (페이퍼는 이 호가로 체결)
+    """
+
+    plan: ExitPlan
+    legs: ExitLegs
+    pnl: PnLBreakdown
+    tether_premium: Optional[float] = None
+    site_premium: Optional[float] = None
+    fx_krw: Optional[float] = None
+    quote: Optional[Quote] = None
+
+    @property
+    def exit_premium(self) -> float:
+        """실제 체결가로 계산한 청산 김프 (코인 몫, %)"""
+        return self.plan.premium
+
+
+def entry_legs_of(pos: Position) -> EntryLegs:
+    """DB 에 저장된 포지션 → 손익 계산용 진입 값"""
+    return EntryLegs(
+        usdt_sold=pos.usdt_sold, usdt_price_krw=pos.entry_usdt_price_krw, usdt_fee_krw=pos.entry_usdt_fee_krw,
+        upbit_qty=pos.upbit_qty, upbit_price_krw=pos.entry_upbit_price_krw, upbit_fee_krw=pos.entry_upbit_fee_krw,
+        bybit_qty=pos.bybit_qty, bybit_price_usdt=pos.entry_bybit_price_usdt,
+        bybit_fee_usdt=pos.entry_bybit_fee_usdt,
+    )
+
+
+# Fill.side 이름 → (거래소, 수수료 단위)
+#   진입: open_short, sell_usdt, buy / 크기 맞추기: trim_short, trim_coin, trim_buy_usdt
+#   되돌리기: unwind_sell, unwind_buy_usdt, unwind_close_short / 청산: sell, buy_usdt, close_short, liquidated
+LEG_INFO = {
+    "open_short": ("bybit", "USDT"), "sell_usdt": ("upbit", "KRW"), "buy": ("upbit", "KRW"),
+    "trim_short": ("bybit", "USDT"), "trim_coin": ("upbit", "KRW"), "trim_buy_usdt": ("upbit", "KRW"),
+    "sell": ("upbit", "KRW"), "buy_usdt": ("upbit", "KRW"), "close_short": ("bybit", "USDT"),
+    "liquidated": ("bybit", "USDT"),
+    "unwind_sell": ("upbit", "KRW"), "unwind_buy_usdt": ("upbit", "KRW"), "unwind_close_short": ("bybit", "USDT"),
+}
+
+# 청산 한 번에 남은 양을 다시 주문하는 최대 횟수
+MAX_LEG_RETRIES = 3
+
+
+@dataclass
+class LegSum:
+    """같은 단계 체결 여러 건의 합계. avg = 금액 합 ÷ 개수 합 (개수 가중 평균가)"""
+
+    qty: float = 0.0
+    cost: float = 0.0
+    fee: float = 0.0
+
+    @property
+    def avg(self) -> float:
+        return self.cost / self.qty if self.qty else 0.0
+
+
+class HedgeBroker:
+    """진입·청산·송금·대조 공통 로직. 체결은 executor 가 한다"""
+
+    def __init__(self, executor, fees: FeeSettings, max_slippage_percent: float, leverage: float = 1.0,
+                 mmr: float = 0.005, now_fn: Callable[[], datetime] = utcnow, safety: Optional[Safety] = None,
+                 auto_transfer: Optional[bool] = None, network: str = "PAPER", transfer_min_usdt: float = 0.0,
+                 transfer_max_usdt_per_day: Optional[float] = None, transfer_alert_minutes: float = 60.0,
+                 reconcile_interval_sec: float = 600.0, hedge_tolerance_percent: float = 1.0):
+        """
+        Args:
+            executor: 실행기 (PaperExecutor / DryRunExecutor / LiveExecutor)
+            max_slippage_percent: 진입할 때 맨 앞 호가보다 이 % 이상 밀리면 진입 안 함
+            leverage / mmr: 바이비트 레버리지, 유지증거금률 (증거금·강제청산 가격 계산)
+            now_fn: 시각 (시뮬레이션은 과거 시각)
+            safety: 안전장치 (없으면 막지 않음)
+            auto_transfer: 송금이 필요할 때 자동으로 보낼지. None 이면 엔진이 설정(PAPER_AUTO_REBALANCE)을 따른다
+        """
+        self.ex = executor
+        self.fees = fees
+        self.max_slippage_percent = max_slippage_percent
+        self.leverage = leverage
+        self.mmr = mmr
+        self._now = now_fn
+        self.safety = safety or Safety(max_consecutive_failures=10 ** 9)
+        self.auto_transfer = auto_transfer
+        self.network = network
+        self.transfer_min_usdt = transfer_min_usdt
+        self.transfer_max_usdt_per_day = transfer_max_usdt_per_day
+        self.transfer_alert_minutes = transfer_alert_minutes
+        self.reconcile_interval_sec = reconcile_interval_sec
+        self.hedge_tolerance_percent = hedge_tolerance_percent
+        self._last_reconcile = -1e18
+
+    @property
+    def is_paper(self) -> bool:
+        return self.ex.is_paper
+
+    # ------------------------------------------------------------------
+    # 잔고
+    # ------------------------------------------------------------------
+    def ensure_initial_balances(self, session: Session, total_usdt: float, upbit_share: float) -> bool:
+        """페이퍼: 처음 한 번 시작 자본 나눠 넣기 / 드라이런: 실제 잔고 복사 / 실거래: 할 일 없음"""
+        return self.ex.ensure_initial(session, total_usdt, upbit_share)
+
+    def balance(self, session: Session, asset: str) -> float:
+        """쓸 수 있는 잔고 (UPBIT_USDT / BYBIT_USDT / UPBIT_KRW / coin_key(...))"""
+        return self.ex.free(session, asset)
+
+    def capital_split(self, session: Session, positions: Iterable[Position],
+                      quotes: Dict[str, Quote]) -> Tuple[float, float]:
+        """
+        지금 양쪽 거래소에 있는 자본 (USDT 로 환산)
+
+        업비트 = 남은 USDT + 자투리 원화 + 들고 있는 코인을 지금 팔아 USDT 로 되사면 받을 개수
+        바이비트 = 남은 USDT + 포지션 증거금 + 숏 평가 손익
+        송금 중인 돈은 받는 쪽으로 친다 (곧 도착하니까). 시세가 없는 코인은 진입 때 판 USDT 개수로.
+        """
+        any_quote = next(iter(quotes.values()), None)
+        usdt_mid = any_quote.usdt_krw if any_quote else None
+        upbit = self.balance(session, UPBIT_USDT)
+        if usdt_mid:
+            upbit += self.balance(session, UPBIT_KRW) / usdt_mid
+        bybit = self.balance(session, BYBIT_USDT)
+        for pos in positions:
+            quote = quotes.get(pos.coin)
+            plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_fee_rate) if quote else None
+            upbit += plan.usdt_bought if plan else pos.usdt_sold
+            short_pnl = (pos.entry_bybit_price_usdt - plan.bybit.avg_price) * pos.bybit_qty if plan else 0.0
+            bybit += pos.bybit_margin_usdt + short_pnl
+        for t in self.pending_transfers(session):
+            if t.to_bybit:
+                bybit += t.amount_usdt - t.fee_usdt
+            else:
+                upbit += t.amount_usdt - t.fee_usdt
+        return upbit, bybit
+
+    # ------------------------------------------------------------------
+    # 주문 한 동작 + 기록
+    # ------------------------------------------------------------------
+    def _leg(self, session: Session, pos: Position, side: str, call: Callable[[str], LegFill]) -> LegFill:
+        """
+        주문 한 동작: 추적번호를 붙여 SENT 로 먼저 저장 → 주문 → 결과로 DONE (안 들어갔으면 VOID)
+
+        결과를 모르면(OrderUnknown) SENT 그대로 둔다 → 다음 스캔(sync)에서 추적번호로 조회해서 채운다.
+        """
+        exchange, cur = LEG_INFO[side]
+        cid = new_client_id()
+        row = Fill(position_id=pos.id, exchange=exchange, side=side, qty=0.0, avg_price=0.0, cost=0.0, fee=0.0,
+                   fee_currency=cur, slippage_percent=0.0, client_id=cid, state=FillState.SENT)
+        session.add(row)
+        session.commit()
+        try:
+            f = call(cid)
+        except OrderUnknown:
+            raise
+        except OrderFailed:
+            row.state = FillState.VOID
+            session.commit()
+            raise
+        self._fill_row(row, f)
+        session.commit()
+        return f
+
+    @staticmethod
+    def _fill_row(row: Fill, f: LegFill) -> None:
+        row.qty, row.avg_price, row.cost, row.fee = f.qty, f.avg_price, f.cost, f.fee
+        row.order_id, row.slippage_percent, row.state = f.order_id, f.slippage_percent, FillState.DONE
+
+    @staticmethod
+    def _sums(session: Session, pos: Position) -> Dict[str, LegSum]:
+        """이 포지션의 체결 합계 {단계: LegSum} (같은 단계가 여러 건이면 더함, 확인된 것만)"""
+        out: Dict[str, LegSum] = {}
+        for f in session.scalars(select(Fill).where(Fill.position_id == pos.id).order_by(Fill.id)):
+            if f.state not in (None, FillState.DONE):
+                continue
+            s = out.setdefault(f.side, LegSum())
+            s.qty += f.qty
+            s.cost += f.cost if f.cost is not None else f.qty * f.avg_price
+            s.fee += f.fee
+        return out
+
+    def _resolve_sent(self, session: Session, pos: Position) -> bool:
+        """
+        결과를 모르는 주문(SENT)을 추적번호로 조회해서 채운다
+
+        Returns:
+            전부 정리됐으면 True. 아직 모르는 게 남았으면 False (이 포지션은 이번 스캔에 손대지 않음)
+        """
+        rows = list(session.scalars(select(Fill).where(Fill.position_id == pos.id, Fill.state == FillState.SENT)))
+        for row in rows:
+            try:
+                f = self.ex.lookup(session, row.side, pos.coin, row.client_id)
+            except Exception as exc:
+                logger.warning("#%d %s 주문 %s 결과 조회 실패 (다음에 다시): %s", pos.id, pos.coin, row.client_id, exc)
+                return False
+            if f is None or f.qty <= 0:
+                row.state = FillState.VOID
+            else:
+                self._fill_row(row, f)
+                logger.warning("[복구] #%d %s %s 주문 결과를 조회로 찾음: %g개 평균 %.8g",
+                               pos.id, pos.coin, row.side, f.qty, f.avg_price)
+            session.commit()
+        self.safety.clear(f"unknown-{pos.id}")
+        return True
+
+    def _order_unknown(self, session: Session, pos: Position, exc: Exception) -> None:
+        """주문 결과를 모름: 포지션은 그대로(OPENING/CLOSING) 두고 막아둔 뒤, 다음 스캔에 조회해서 이어서"""
+        self.safety.record_failure(f"{pos.coin}: {exc}")
+        self.safety.block(f"unknown-{pos.id}", f"#{pos.id} {pos.coin} 주문 결과를 모름 — 추적번호로 계속 조회 중")
+        logger.critical("[주문 결과 모름] #%d %s %s → 추측해서 진행하지 않고, 다음 스캔에 추적번호로 조회해서 이어서 처리",
+                        pos.id, pos.coin, exc)
+
+    # ------------------------------------------------------------------
+    # 진입
+    # ------------------------------------------------------------------
+    def open_hedge(self, session: Session, quote: Quote, bybit_qty: float) -> Position:
+        """
+        진입 (파일 맨 위 설명 순서) → 양쪽 크기 맞추기 → OPEN
+
+        Raises:
+            InsufficientBalance: 한쪽 USDT 가 모자람 (아무 주문도 안 냄)
+            EntryRejected: 호가 부족 / 너무 밀림 (아무 주문도 안 냄), 주문 실패 후 되돌림 (ABORTED),
+                           주문 결과 모름 (OPENING 으로 남고 다음 스캔에 이어서)
+        """
+        rate = self.fees.upbit_trade_fee_rate
+        plan = quote.entry_plan(bybit_qty, rate)
+        if plan is None or not plan.bybit.is_complete:
+            raise EntryRejected("바이비트 매수 호가가 모자람")
+        if not plan.usdt.is_complete:
+            raise EntryRejected("업비트 USDT 매수 호가가 모자람")
+        if not plan.upbit.is_complete:
+            raise EntryRejected("업비트 코인 매도 호가가 모자람")
+        for name, fill in (("업비트 코인", plan.upbit), ("업비트 USDT", plan.usdt), ("바이비트", plan.bybit)):
+            if fill.slippage_percent > self.max_slippage_percent:
+                raise EntryRejected(f"{name}에서 너무 밀림 {fill.slippage_percent:.3f}%")
+
+        margin = plan.bybit.cost / self.leverage
+        by_fee = plan.bybit.cost * self.fees.bybit_taker_fee_rate
+        upbit_have = self.balance(session, UPBIT_USDT)
+        bybit_have = self.balance(session, BYBIT_USDT)
+        if upbit_have < plan.usdt_sold:
+            raise InsufficientBalance(f"업비트 USDT 부족 {upbit_have:,.2f} < {plan.usdt_sold:,.2f} "
+                                      f"(업비트로 {plan.usdt_sold - upbit_have:,.2f} USDT 더 필요)",
+                                      side="upbit", need_usdt=plan.usdt_sold)
+        if bybit_have < margin + by_fee:
+            raise InsufficientBalance(f"바이비트 USDT 부족 {bybit_have:,.2f} < {margin + by_fee:,.2f} "
+                                      f"(바이비트로 {margin + by_fee - bybit_have:,.2f} USDT 더 필요)",
+                                      side="bybit", need_usdt=margin + by_fee)
+
+        # 0) 시작 기록 (중간에 꺼져도 남도록)
+        pos = Position(
+            coin=quote.coin, status=PositionStatus.OPENING, is_paper=self.ex.is_paper, opened_at=self._now(),
+            usdt_sold=0.0, entry_usdt_price_krw=0.0, entry_usdt_fee_krw=0.0, upbit_qty=0.0,
+            entry_upbit_price_krw=0.0, entry_upbit_fee_krw=0.0, bybit_qty=0.0, entry_bybit_price_usdt=0.0,
+            entry_bybit_fee_usdt=0.0, entry_premium=plan.premium, entry_tether_premium=quote.tether_premium,
+            entry_site_premium=quote.site_premium, entry_fx_krw=quote.fx_krw, leverage=self.leverage,
+            bybit_margin_usdt=0.0, liquidation_price=0.0, funding_usdt=0.0,
+        )
+        session.add(pos)
+        session.commit()
+
+        coin, ex = quote.coin, self.ex
+        try:
+            short = self._leg(session, pos, "open_short",  # 1)
+                              lambda cid: ex.open_short(session, quote, coin, bybit_qty, client_id=cid))
+            usdt = self._leg(session, pos, "sell_usdt",  # 2)
+                             lambda cid: ex.sell_usdt(session, quote, short.cost, client_id=cid))
+            krw_for_coin = (usdt.cost - usdt.fee) / (1 + rate)  # 3)
+            self._leg(session, pos, "buy",
+                      lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid))
+        except OrderUnknown as exc:
+            self._order_unknown(session, pos, exc)
+            raise EntryRejected(f"주문 결과 모름 → 다음 스캔에 조회: {exc}") from exc
+        except OrderFailed as exc:
+            self.safety.record_failure(f"{coin} 진입: {exc}")
+            self._unwind_entry(session, pos, quote, str(exc))
+            raise EntryRejected(f"주문 실패 → 되돌림: {exc}") from exc
+
+        self._balance_hedge(session, pos, quote)
+        self._return_leftover_krw(session, pos, quote)
+        self._finish_entry(session, pos)
+        self.safety.record_success()
+        return pos
+
+    def _balance_hedge(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
+        """
+        진입 뒤 양쪽 금액 맞추기 (부분 체결 대비)
+
+        업비트 코인 값(USDT) = 코인 개수 × 업비트 매수 호가 ÷ USDT 가격
+        바이비트 숏 금액     = 숏 개수 × 바이비트 가격
+        차이가 HEDGE_TOLERANCE_PERCENT(1%) 보다 크면 큰 쪽을 줄인다
+          - 숏이 크면: 남는 만큼 숏 닫기 (trim_short)
+          - 코인이 많으면: 남는 코인 팔기 (trim_coin) → 남은 원화는 _return_leftover_krw 가 USDT 로
+        맞추는 비용은 이 포지션 진입 비용에 들어간다 (_finish_entry). 실패하면 그대로 두고 긴급 알림.
+        예) 숏 100 USDT, 코인 80 USDT 어치 → 숏 20 USDT 닫기 (수수료 0.011 + 호가 간격 ≈ 0.02 USDT)
+        """
+        if quote is None:
+            return
+        rate = self.fees.upbit_trade_fee_rate
+        sums = self._sums(session, pos)
+        o = sums["open_short"]
+        short_qty = o.qty - sums.get("trim_short", LegSum()).qty
+        coin_qty = sums["buy"].qty - sums.get("trim_coin", LegSum()).qty
+        px, coin_bid, usdt_px = quote.bybit.mid or o.avg, quote.upbit.best_bid, quote.usdt_krw
+        if not (px and coin_bid and usdt_px):
+            return
+        short_usdt = short_qty * px
+        coin_usdt = coin_qty * coin_bid / usdt_px
+        diff = short_usdt - coin_usdt
+        if abs(diff) <= short_usdt * self.hedge_tolerance_percent / 100:
+            return
+        logger.warning("#%d %s 양쪽 크기 차이 %.2f%% (숏 %.2f / 코인 %.2f USDT) → 큰 쪽을 줄여 맞춤",
+                       pos.id, pos.coin, abs(diff) / short_usdt * 100, short_usdt, coin_usdt)
+        try:
+            if diff > 0:
+                qty = diff / px
+                self._leg(session, pos, "trim_short", lambda cid: self.ex.close_short(
+                    session, quote, pos.coin, qty, o.avg, qty * o.avg / self.leverage, client_id=cid))
+            else:
+                qty = -diff * usdt_px / coin_bid
+                if qty * coin_bid < self.ex.min_order_krw(pos.coin):
+                    return  # 업비트 최소 주문보다 작아서 못 팖 (그대로 둠)
+                self._leg(session, pos, "trim_coin",
+                          lambda cid: self.ex.sell_coin(session, quote, pos.coin, qty, client_id=cid))
+        except OrderFailed as exc:
+            self.safety.record_failure(f"{pos.coin} 크기 맞추기: {exc}")
+            logger.critical("[크기 맞추기 실패] #%d %s 양쪽 차이 %.2f USDT 그대로 관리합니다 (청산은 정상): %s",
+                            pos.id, pos.coin, diff, exc)
+
+    def _return_leftover_krw(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
+        """
+        진입하고 남은 원화를 USDT 로 되돌리기 (trim_buy_usdt)
+
+        예) USDT 100개 판 원화로 코인을 사려 했는데 80% 만 사짐 → 약 20 USDT 어치 원화가 남음
+            → 그 원화로 USDT 를 되사고, '판 USDT' 에서 되산 만큼 뺀다 (손익 기록이 실제 잔고와 맞게)
+        업비트 최소 주문 금액(기본 5,000원) 미만 자투리는 그냥 둔다.
+        """
+        rate = self.fees.upbit_trade_fee_rate
+        sums = self._sums(session, pos)
+        s = lambda k: sums.get(k, LegSum())  # noqa: E731
+        krw_in = sum(s(k).cost - s(k).fee for k in ("sell_usdt", "trim_coin"))
+        krw_out = sum(s(k).cost + s(k).fee for k in ("buy", "trim_buy_usdt"))
+        left = krw_in - krw_out
+        if left < self.ex.min_order_krw("USDT"):
+            return
+        try:
+            self._leg(session, pos, "trim_buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
+                session, quote, left / (1 + rate), client_id=cid))
+        except OrderFailed as exc:
+            self.safety.record_failure(f"{pos.coin} 남은 원화 되돌리기: {exc}")
+            logger.critical("[남은 원화 되돌리기 실패] #%d %s 원화 %s 원이 업비트에 남아 있습니다: %s",
+                            pos.id, pos.coin, f"{left:,.0f}", exc)
+
+    def _finish_entry(self, session: Session, pos: Position) -> None:
+        """
+        체결 합계로 포지션 채우기 → OPEN
+
+        크기 맞추기 비용도 여기서 진입 비용에 넣는다:
+          - 숏을 줄였으면: 줄인 부분의 손익 (팔 때 − 되살 때) − 수수료 → 바이비트 진입 비용에 더함
+          - 코인을 줄였으면: 되산 USDT 만큼 '판 USDT' 에서 빼고, 수수료는 업비트 진입 비용에 더함
+        """
+        sums = self._sums(session, pos)
+        o, u, b = sums["open_short"], sums["sell_usdt"], sums["buy"]
+        ts, tc, tb = (sums.get(k, LegSum()) for k in ("trim_short", "trim_coin", "trim_buy_usdt"))
+        trim_pnl = (o.avg - ts.avg) * ts.qty - ts.fee if ts.qty else 0.0
+        pos.bybit_qty, pos.entry_bybit_price_usdt = o.qty - ts.qty, o.avg
+        pos.entry_bybit_fee_usdt = o.fee - trim_pnl
+        pos.usdt_sold, pos.entry_usdt_price_krw, pos.entry_usdt_fee_krw = u.qty - tb.qty, u.avg, u.fee + tb.fee
+        pos.upbit_qty, pos.entry_upbit_price_krw, pos.entry_upbit_fee_krw = b.qty - tc.qty, b.avg, b.fee + tc.fee
+        pos.entry_premium = premium_percent(b.avg, o.avg, u.avg)
+        pos.bybit_margin_usdt = pos.bybit_qty * o.avg / self.leverage
+        pos.liquidation_price = liquidation_price(o.avg, self.leverage, self.mmr)
+        pos.status = PositionStatus.OPEN
+        session.commit()
+
+    def _unwind_entry(self, session: Session, pos: Position, quote: Optional[Quote], why: str) -> None:
+        """
+        진입 중 실패: 끝난 단계를 거꾸로 되돌린다 → ABORTED (되돌리기도 실패하면 ERROR)
+
+        남은 것을 계산해서 그만큼만 되돌린다 (일부 체결·크기 맞추기까지 포함)
+          코인이 남았으면 팔고 → 남은 원화로 USDT 되사고 → 남은 숏 닫기
+        예) 숏 100개 + USDT 50개 판 뒤 코인 매수 실패 → 받은 원화로 USDT 되사기 → 숏 100개 닫기
+        """
+        rate = self.fees.upbit_trade_fee_rate
+        s = lambda k, sums: sums.get(k, LegSum())  # noqa: E731
+        try:
+            sums = self._sums(session, pos)
+            coin_left = s("buy", sums).qty - s("trim_coin", sums).qty - s("unwind_sell", sums).qty
+            if coin_left > 1e-12:
+                self._leg(session, pos, "unwind_sell",
+                          lambda cid: self.ex.sell_coin(session, quote, pos.coin, coin_left, client_id=cid))
+            sums = self._sums(session, pos)
+            krw_in = sum(s(k, sums).cost - s(k, sums).fee for k in ("sell_usdt", "trim_coin", "unwind_sell"))
+            krw_out = sum(s(k, sums).cost + s(k, sums).fee for k in ("buy", "trim_buy_usdt", "unwind_buy_usdt"))
+            if krw_in - krw_out >= self.ex.min_order_krw("USDT"):
+                self._leg(session, pos, "unwind_buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
+                    session, quote, (krw_in - krw_out) / (1 + rate), client_id=cid))
+            sums = self._sums(session, pos)
+            o = s("open_short", sums)
+            short_left = o.qty - s("trim_short", sums).qty - s("unwind_close_short", sums).qty
+            if short_left > o.qty * 1e-9:
+                self._leg(session, pos, "unwind_close_short", lambda cid: self.ex.close_short(
+                    session, quote, pos.coin, short_left, o.avg, short_left * o.avg / self.leverage, client_id=cid))
+        except OrderFailed as exc:
+            pos.status = PositionStatus.ERROR
+            pos.exit_reason = "UNWIND_FAILED"
+            session.commit()
+            self.safety.record_failure(f"{pos.coin} 되돌리기: {exc}")
+            logger.critical("[되돌리기 실패] #%d %s 진입 실패(%s) 후 되돌리기도 실패: %s → 거래소에서 직접 확인·정리하세요 "
+                            "(신규 진입 중단)", pos.id, pos.coin, why, exc)
+            return
+
+        # 되돌림 손익 (수수료·호가 간격 정도 손해)
+        sums = self._sums(session, pos)
+        o = s("open_short", sums)
+        net = s("unwind_buy_usdt", sums).qty + s("trim_buy_usdt", sums).qty - s("sell_usdt", sums).qty
+        for k in ("trim_short", "unwind_close_short"):
+            c = s(k, sums)
+            if c.qty:
+                net += (o.avg - c.avg) * c.qty - c.fee
+        net -= o.fee
+        pos.status, pos.closed_at, pos.exit_reason = PositionStatus.ABORTED, self._now(), "ENTRY_FAILED"
+        pos.net_pnl_usdt = net
+        session.commit()
+        logger.error("[진입 되돌림] #%d %s %s → 끝난 단계를 되돌렸습니다 (손익 %+.4f USDT)", pos.id, pos.coin, why, net)
+
+    # ------------------------------------------------------------------
+    # 평가 / 청산
+    # ------------------------------------------------------------------
+    def value_exit(self, pos: Position, quote: Quote) -> Optional[ExitValuation]:
+        """
+        "지금 청산하면 얼마?" 계산 (주문은 안 냄)
+
+        Returns:
+            ExitValuation. 호가가 모자라서 다 못 팔면 None
+        """
+        plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_fee_rate)
+        if plan is None or not plan.is_complete:
+            return None
+        by_fee = plan.bybit.cost * self.fees.bybit_taker_fee_rate
+        legs = ExitLegs(upbit_price_krw=plan.upbit.avg_price, upbit_fee_krw=plan.coin_fee_krw,
+                        usdt_price_krw=plan.usdt.avg_price, usdt_fee_krw=plan.usdt_fee_krw,
+                        usdt_bought=plan.usdt_bought, bybit_price_usdt=plan.bybit.avg_price, bybit_fee_usdt=by_fee)
+        pnl = compute_pnl(entry_legs_of(pos), legs, pos.funding_usdt, self.fees)
+        return ExitValuation(plan=plan, legs=legs, pnl=pnl, tether_premium=quote.tether_premium,
+                             site_premium=quote.site_premium, fx_krw=quote.fx_krw, quote=quote)
+
+    def value_liquidation(self, pos: Position, quote: Quote) -> Optional[ExitValuation]:
+        """
+        바이비트 숏이 강제청산됐을 때 결과 계산
+
+        바이비트: 증거금을 전부 잃는다 (숏 손익 = −증거금) / 업비트: 남은 코인을 지금 팔아 USDT 로 되산다
+        """
+        plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_fee_rate)
+        if plan is None or not plan.upbit.is_complete or not plan.usdt.is_complete:
+            return None
+        legs = ExitLegs(upbit_price_krw=plan.upbit.avg_price, upbit_fee_krw=plan.coin_fee_krw,
+                        usdt_price_krw=plan.usdt.avg_price, usdt_fee_krw=plan.usdt_fee_krw,
+                        usdt_bought=plan.usdt_bought, bybit_price_usdt=pos.liquidation_price, bybit_fee_usdt=0.0)
+        pnl = compute_pnl(entry_legs_of(pos), legs, pos.funding_usdt, self.fees,
+                          bybit_leg_override_usdt=-pos.bybit_margin_usdt)
+        return ExitValuation(plan=plan, legs=legs, pnl=pnl, tether_premium=quote.tether_premium,
+                             site_premium=quote.site_premium, fx_krw=quote.fx_krw, quote=quote)
+
+    def close_hedge(self, session: Session, pos: Position, valuation: ExitValuation, reason: str,
+                    liquidated: bool = False) -> Optional[PnLBreakdown]:
+        """
+        청산 시작 (CLOSING) → 세 단계 실행
+
+        Returns:
+            확정 손익. 다 못 끝냈으면 None (CLOSING 으로 남고 다음 스캔에서 남은 양만 이어서)
+        """
+        pos.status = PositionStatus.CLOSING
+        pos.exit_reason = ExitReason.LIQUIDATION if liquidated else reason
+        pos.exit_tether_premium, pos.exit_site_premium, pos.exit_fx_krw = (
+            valuation.tether_premium, valuation.site_premium, valuation.fx_krw)
+        session.commit()
+        return self._continue_close(session, pos, valuation.quote)
+
+    def _continue_close(self, session: Session, pos: Position, quote: Optional[Quote]) -> Optional[PnLBreakdown]:
+        """
+        청산 남은 양만 실행 ('체결 기록이 있나' 가 아니라 '목표 양에 닿았나' 로 판단)
+
+          1) 코인: 목표 = 진입 때 산 개수 (실제로 가진 만큼까지). 30개 중 20개만 팔렸으면 남은 10개만 다시
+          2) USDT: 판 코인에서 받은 원화를 다 쓸 때까지 (5,000원 미만 자투리는 남김)
+          3) 숏: 목표 = 숏 개수. 50개 중 30개만 닫혔으면 남은 20개만 다시
+        한 번에 최대 3번까지 다시 주문. 그래도 남으면 CLOSING 으로 두고 다음 스캔에 이어서 + 긴급 알림.
+        """
+        if not self._resolve_sent(session, pos):
+            return None
+        rate = self.fees.upbit_trade_fee_rate
+        liquidated = pos.exit_reason == ExitReason.LIQUIDATION
+        if liquidated and not self.ex.short_liquidated(session, pos.coin):
+            # 봇 계산으로는 강제청산 가격인데 거래소에서는 아직 숏이 살아 있음 (실거래) → 시장가로 바로 닫는다
+            liquidated = False
+            pos.exit_reason = ExitReason.STOP_LOSS
+            logger.critical("#%d %s 강제청산 가격 도달했지만 숏이 아직 열려 있어서 바로 정리합니다", pos.id, pos.coin)
+        s = lambda k, sums: sums.get(k, LegSum())  # noqa: E731
+        coin_bid = quote.upbit.best_bid if quote else None
+        done = False
+        try:
+            for _ in range(MAX_LEG_RETRIES):
+                sums = self._sums(session, pos)
+                left = pos.upbit_qty - s("sell", sums).qty
+                left = min(left, self.balance(session, coin_key(pos.coin)))
+                coin_done = left <= pos.upbit_qty * 1e-9 or (coin_bid is not None and
+                                                              left * coin_bid < self.ex.min_order_krw(pos.coin))
+                if not coin_done:  # 1)
+                    f = self._leg(session, pos, "sell",
+                                  lambda cid: self.ex.sell_coin(session, quote, pos.coin, left, client_id=cid))
+                    coin_done = f.qty <= 0
+                sums = self._sums(session, pos)
+                krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +
+                                                                           s("buy_usdt", sums).fee)
+                if krw_left >= self.ex.min_order_krw("USDT"):  # 2)
+                    self._leg(session, pos, "buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
+                        session, quote, krw_left / (1 + rate), client_id=cid))
+                if liquidated:  # 3) 강제청산됨 (거래소가 이미 정리)
+                    if not s("liquidated", sums).qty:
+                        self.ex.mark_liquidated(session, pos.coin, pos.bybit_qty)
+                        row = Fill(position_id=pos.id, exchange="bybit", side="liquidated", fee_currency="USDT",
+                                   slippage_percent=0.0, client_id="liquidated", qty=0, avg_price=0, cost=0, fee=0)
+                        self._fill_row(row, LegFill(pos.bybit_qty, pos.liquidation_price,
+                                                    pos.bybit_qty * pos.liquidation_price, 0.0, "liquidated"))
+                        session.add(row)
+                        session.commit()
+                    short_done = True
+                else:  # 3) 숏 닫기 (남은 개수만)
+                    short_left = pos.bybit_qty - s("close_short", sums).qty
+                    short_done = short_left <= pos.bybit_qty * 1e-9
+                    if not short_done:
+                        f = self._leg(session, pos, "close_short", lambda cid: self.ex.close_short(
+                            session, quote, pos.coin, short_left, pos.entry_bybit_price_usdt,
+                            pos.bybit_margin_usdt * short_left / pos.bybit_qty, client_id=cid))
+                        short_done = f.qty >= short_left * (1 - 1e-9) or f.qty <= 0
+                sums = self._sums(session, pos)
+                krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +
+                                                                           s("buy_usdt", sums).fee)
+                if coin_done and short_done and krw_left < self.ex.min_order_krw("USDT"):
+                    done = True
+                    break
+        except OrderUnknown as exc:
+            self._order_unknown(session, pos, exc)
+            return None
+        except OrderFailed as exc:
+            self.safety.record_failure(f"{pos.coin} 청산: {exc}")
+            logger.critical("[청산 실패] #%d %s 청산 중 실패: %s → CLOSING 으로 두고 다음 스캔에서 남은 양만 이어서",
+                            pos.id, pos.coin, exc)
+            return None
+        if not done:
+            self.safety.record_failure(f"{pos.coin} 청산: {MAX_LEG_RETRIES}번 해도 다 안 끝남")
+            logger.critical("[청산 덜 끝남] #%d %s %d번 다시 주문해도 남음 → 다음 스캔에서 이어서",
+                            pos.id, pos.coin, MAX_LEG_RETRIES)
+            return None
+
+        sums = self._sums(session, pos)
+        sold, bought = s("sell", sums), s("buy_usdt", sums)
+        short = s("liquidated", sums) if liquidated else s("close_short", sums)
+        legs = ExitLegs(upbit_price_krw=sold.avg, upbit_fee_krw=sold.fee, usdt_price_krw=bought.avg,
+                        usdt_fee_krw=bought.fee, usdt_bought=bought.qty, bybit_price_usdt=short.avg,
+                        bybit_fee_usdt=short.fee)
+        pnl = compute_pnl(entry_legs_of(pos), legs, pos.funding_usdt, self.fees,
+                          bybit_leg_override_usdt=-pos.bybit_margin_usdt if liquidated else None)
+        pos.status, pos.closed_at = PositionStatus.CLOSED, self._now()
+        pos.exit_upbit_price_krw, pos.exit_upbit_fee_krw = sold.avg, sold.fee
+        pos.exit_usdt_price_krw, pos.exit_usdt_fee_krw, pos.usdt_bought = bought.avg, bought.fee, bought.qty
+        pos.exit_bybit_price_usdt, pos.exit_bybit_fee_usdt = short.avg, short.fee
+        pos.exit_premium = premium_percent(sold.avg, short.avg, bought.avg) if sold.qty and bought.qty else None
+        pos.upbit_leg_usdt, pos.bybit_leg_usdt = pnl.upbit_leg_usdt, pnl.bybit_leg_usdt
+        pos.gross_pnl_usdt, pos.total_cost_usdt = pnl.gross_usdt, pnl.total_cost_usdt
+        pos.net_pnl_usdt, pos.net_pnl_percent = pnl.net_usdt, pnl.net_percent
+        session.commit()
+        self.safety.record_success()
+        return pnl
+
+    # ------------------------------------------------------------------
+    # 펀딩비 / 조회
+    # ------------------------------------------------------------------
+    def apply_funding(self, session: Session, pos: Position, rate: float, mark_price: float,
+                      funding_time_ms: int) -> float:
+        """
+        펀딩비 한 번 반영 (우리는 숏). 펀딩비 = 숏 개수 × 기준 가격 × 비율 (+ 받음 / − 냄)
+
+        예) 740.7개 × 1.35 USDT × 0.01% = +0.1 USDT. 실거래는 거래소가 잔고에 반영하고, 여기서는 기록만.
+        """
+        amount = pos.bybit_qty * mark_price * rate
+        pos.funding_usdt += amount
+        self.ex.credit_funding(session, amount)
+        session.add(FundingEvent(position_id=pos.id, rate=rate, mark_price=mark_price,
+                                 amount_usdt=amount, funding_time_ms=funding_time_ms))
+        session.commit()
+        return amount
+
+    @staticmethod
+    def open_positions(session: Session) -> List[Position]:
+        """관리 중인 포지션 (OPEN). 진입 중·청산 중·확인 필요 포지션은 sync 가 따로 처리"""
+        return list(session.scalars(select(Position).where(Position.status == PositionStatus.OPEN)))
+
+    @staticmethod
+    def unfinished_positions(session: Session) -> List[Position]:
+        """OPENING / CLOSING / ERROR (이 코인은 새로 진입하면 안 됨)"""
+        return list(session.scalars(select(Position).where(Position.status.in_(PositionStatus.UNFINISHED))))
+
+    def entries_allowed(self, session: Session) -> Tuple[bool, str]:
+        return self.safety.entries_allowed(session)
+
+    # ------------------------------------------------------------------
+    # 매 스캔: 송금 확인 → 덜 끝난 진입/청산 이어서 → 대조
+    # ------------------------------------------------------------------
+    def sync(self, session: Session, quotes: Dict[str, Quote], coins: Iterable[str] = ()) -> None:
+        self.ex.refresh()
+        self._poll_transfers(session)
+        for pos in self.unfinished_positions(session):
+            quote = quotes.get(pos.coin)
+            if pos.status == PositionStatus.ERROR:
+                continue  # 사람이 정리해야 함
+            if self.ex.is_paper and quote is None:
+                continue  # 페이퍼는 시세가 있어야 체결 계산 가능
+            if not self._resolve_sent(session, pos):
+                continue  # 아직 결과 모르는 주문 → 다음 스캔에 다시 조회
+            if pos.status == PositionStatus.OPENING:
+                sums = self._sums(session, pos)
+                if {"open_short", "sell_usdt", "buy"} <= sums.keys():
+                    # 세 단계는 끝났는데 기록 직전에 꺼졌던 경우 → 크기 맞추고 OPEN
+                    self._balance_hedge(session, pos, quote)
+                    self._return_leftover_krw(session, pos, quote)
+                    self._finish_entry(session, pos)
+                    logger.warning("[복구] #%d %s 진입이 끝나 있어서 OPEN 으로", pos.id, pos.coin)
+                else:
+                    self._unwind_entry(session, pos, quote, "진입 도중 멈춤 (재시작/결과 확인)")
+            elif pos.status == PositionStatus.CLOSING:
+                pnl = self._continue_close(session, pos, quote)
+                if pnl:
+                    logger.warning("[청산 이어서 완료] #%d %s 순손익 %+.2f USDT (%+.3f%%)",
+                                   pos.id, pos.coin, pnl.net_usdt, pnl.net_percent)
+        now = self._now().timestamp()
+        if now - self._last_reconcile >= self.reconcile_interval_sec:
+            self._last_reconcile = now
+            issues = self.reconcile(session, set(coins) | set(quotes))
+            if issues:
+                self.safety.block("reconcile", "대조 불일치: " + " / ".join(issues))
+            else:
+                self.safety.clear("reconcile")
+
+    def reconcile(self, session: Session, coins: Iterable[str]) -> List[str]:
+        """
+        DB 열린 포지션 ↔ 실제 숏 개수·업비트 코인 개수 (다르면 문제 목록)
+
+        - 숏: DB 합계와 실제가 0.1% 넘게 다르면 문제 (예: DB 100개, 거래소 0개 → 누가 손으로 닫았거나 강제청산)
+        - 업비트 코인: 실제가 DB 합계보다 0.5% 넘게 적으면 문제 (더 많은 건 원래 갖고 있던 코인일 수 있어 괜찮음)
+        - 진입 중·청산 중인 코인은 건너뜀 (sync 가 처리 중)
+        """
+        busy = {p.coin for p in self.unfinished_positions(session)}
+        want_short: Dict[str, float] = {}
+        want_coin: Dict[str, float] = {}
+        for p in self.open_positions(session):
+            want_short[p.coin] = want_short.get(p.coin, 0.0) + p.bybit_qty
+            want_coin[p.coin] = want_coin.get(p.coin, 0.0) + p.upbit_qty
+        issues = []
+        for coin in sorted(set(coins) | set(want_short)):
+            if coin in busy:
+                continue
+            short = self.ex.short_qty(session, coin)
+            want = want_short.get(coin, 0.0)
+            if short is not None and abs(short - want) > max(1e-9, want * 0.001):
+                issues.append(f"{coin} 바이비트 숏 DB {want:g}개 / 실제 {short:g}개")
+            have = self.ex.coin_total(session, coin)
+            need = want_coin.get(coin, 0.0)
+            if need > 0 and have is not None and have < need * 0.995:
+                issues.append(f"{coin} 업비트 코인 DB {need:g}개 / 실제 {have:g}개")
+        return issues
+
+    # ------------------------------------------------------------------
+    # 송금
+    # ------------------------------------------------------------------
+    @staticmethod
+    def pending_transfers(session: Session) -> List[Transfer]:
+        return list(session.scalars(select(Transfer).where(Transfer.status == TransferStatus.REQUESTED)))
+
+    @staticmethod
+    def transfers(session: Session) -> List[Transfer]:
+        """실패하지 않은 송금 전부 (시간 순)"""
+        return list(session.scalars(select(Transfer).where(Transfer.status != TransferStatus.FAILED)
+                                    .order_by(Transfer.id)))
+
+    def transfer(self, session: Session, amount_usdt: float, fee_usdt: float, reason: str = "") -> float:
+        """
+        송금 요청: amount 가 + 면 업비트 → 바이비트, − 면 바이비트 → 업비트
+
+        보내는 쪽 '남는 USDT' 까지만, 하루 한도까지만, 최소 금액 이상만. 송금 중이면 안 보냄.
+        예) 업비트 → 바이비트 30 USDT, 수수료 1 → 업비트 −30, (도착하면) 바이비트 +29
+
+        Returns:
+            실제로 요청한 양 (부호 포함). 안 보냈으면 0
+        """
+        if self.pending_transfers(session):
+            logger.info("송금 중인 건이 있어서 이번엔 안 보냄")
+            return 0.0
+        to_bybit = amount_usdt > 0
+        send = min(abs(amount_usdt), self.balance(session, UPBIT_USDT if to_bybit else BYBIT_USDT))
+        if self.transfer_max_usdt_per_day is not None:
+            since = kst_midnight_utc(self._now().timestamp())
+            today = session.scalar(select(func.coalesce(func.sum(Transfer.amount_usdt), 0.0)).where(
+                Transfer.status != TransferStatus.FAILED, Transfer.requested_at >= since)) or 0.0
+            send = min(send, self.transfer_max_usdt_per_day - today)
+        if send <= max(fee_usdt, self.transfer_min_usdt) or send <= 0:
+            return 0.0
+        t = Transfer(direction="upbit->bybit" if to_bybit else "bybit->upbit", amount_usdt=send, fee_usdt=fee_usdt,
+                     network=self.network, status=TransferStatus.REQUESTED, reason=reason, requested_at=self._now())
+        session.add(t)
+        session.commit()
+        try:
+            t.withdraw_id = self.ex.withdraw(session, to_bybit, send, self.network)
+        except OrderFailed as exc:
+            t.status, t.note = TransferStatus.FAILED, str(exc)[:200]
+            session.commit()
+            self.safety.record_failure(f"송금: {exc}")
+            logger.critical("[송금 실패] %s USDT %s: %s", t.direction, f"{send:,.2f}", exc)
+            return 0.0
+        session.commit()
+        logger.warning("[송금 요청 · %s] %s USDT %s 개 (%s, 수수료 %g)", reason or "-", t.direction, f"{send:,.2f}",
+                       self.network, fee_usdt)
+        self._poll_transfers(session)
+        return send if to_bybit else -send
+
+    def _poll_transfers(self, session: Session) -> None:
+        """송금 중인 건이 받는 쪽에 들어왔는지 확인. 늦으면 한 번 긴급 알림"""
+        for t in self.pending_transfers(session):
+            try:
+                arrived = self.ex.transfer_arrived(session, t)
+            except Exception as exc:  # 조회 실패는 다음에 다시
+                logger.warning("송금 #%d 확인 실패 (다음에 다시): %s", t.id, exc)
+                continue
+            if arrived:
+                t.status, t.confirmed_at = TransferStatus.CONFIRMED, self._now()
+                logger.warning("[송금 도착] #%d %s USDT %s 개", t.id, t.direction, f"{t.amount_usdt - t.fee_usdt:,.2f}")
+            elif arrived is False:
+                t.status = TransferStatus.FAILED
+                logger.critical("[송금 실패] #%d %s USDT %s 개 — 거래소 출금 내역을 확인하세요",
+                                t.id, t.direction, f"{t.amount_usdt:,.2f}")
+            else:
+                requested = t.requested_at if t.requested_at.tzinfo else t.requested_at.replace(tzinfo=timezone.utc)
+                minutes = (self._now() - requested).total_seconds() / 60
+                if minutes > self.transfer_alert_minutes and not t.alerted:
+                    t.alerted = 1
+                    logger.critical("[송금 지연] #%d %s USDT %s 개가 %.0f분째 도착 안 함 — 출금·입금 내역 확인",
+                                    t.id, t.direction, f"{t.amount_usdt:,.2f}", minutes)
+            session.commit()
+
+
+def broker_kwargs(settings, safety: Optional[Safety] = None) -> dict:
+    """설정 → HedgeBroker 공통 옵션 (실시간 봇과 시뮬레이션이 같은 값을 쓰게)"""
+    return dict(safety=safety, network=settings.transfer_network, transfer_min_usdt=settings.transfer_min_usdt,
+                transfer_max_usdt_per_day=settings.transfer_max_usdt_per_day,
+                transfer_alert_minutes=settings.transfer_alert_minutes,
+                reconcile_interval_sec=settings.reconcile_interval_sec,
+                hedge_tolerance_percent=settings.hedge_tolerance_percent)
+
+
+class PaperBroker(HedgeBroker):
+    """페이퍼 트레이딩: HedgeBroker + PaperExecutor (예전 사용법 그대로: PaperBroker(fees, 0.3, leverage=…))"""
+
+    def __init__(self, fees: FeeSettings, max_slippage_percent: float, leverage: float = 1.0,
+                 mmr: float = 0.005, now_fn: Callable[[], datetime] = utcnow,
+                 upbit_min_order_krw: float = 5_000.0, **kwargs):
+        super().__init__(PaperExecutor(fees, leverage, upbit_min_order_krw), fees, max_slippage_percent,
+                         leverage=leverage, mmr=mmr, now_fn=now_fn, **kwargs)

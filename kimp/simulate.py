@@ -49,7 +49,8 @@ from kimp.fx import FxQuote
 from kimp.history import (BYBIT, MINUTE_MS, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade,
                           make_history_session_factory, value_at)
 from kimp.market_data import FundingInfo
-from kimp.paper_broker import PaperBroker
+from kimp.broker import PaperBroker, broker_kwargs
+from kimp.safety import Safety
 from kimp.premium import OrderBook, Quote
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,10 @@ class HistoricalMarket:
         """바이비트 최소 주문 개수"""
         return self.precision.min_qty(coin)
 
+    def min_notional_usdt(self, coin: str) -> float:
+        """바이비트 최소 주문 금액 (실시간 봇과 같은 값)"""
+        return getattr(self.precision, "min_notional_usdt", lambda _c: 0.0)(coin)
+
 
 class SimFx:
     """과거 달러 환율을 '지금 환율' 처럼 알려주는 공급기 (표시용. 없으면 None)"""
@@ -306,8 +311,11 @@ def run_simulation(
     # 시뮬레이션용 설정: 메모리 DB, 김프 기록/현황 로그는 끔 (필요 없고 느려짐)
     sim_settings = replace(settings, db_path=":memory:", snapshot_interval_sec=float("inf"))
     session_factory = make_session_factory(":memory:")
+    # 실시간 봇과 같은 브로커·안전장치 설정 (비상정지 파일만 안 봄)
+    safety = Safety(settings.max_consecutive_failures, settings.daily_loss_limit_usdt, None, clock)
     broker = PaperBroker(settings.fees, settings.max_slippage_percent, leverage=settings.bybit_leverage,
-                         mmr=settings.bybit_mmr, now_fn=lambda: datetime.fromtimestamp(clock(), timezone.utc))
+                         mmr=settings.bybit_mmr, now_fn=lambda: datetime.fromtimestamp(clock(), timezone.utc),
+                         upbit_min_order_krw=settings.upbit_min_order_krw, **broker_kwargs(settings, safety))
     engine = Engine(sim_settings, market, fx, broker, session_factory, list(coins), clock=clock)
 
     clock.now_sec = (start_ms + MINUTE_MS) / 1000
@@ -333,8 +341,9 @@ def run_simulation(
             progress(i / max(total, 1))
     fxq = fx.get()
     result.fx_end = fxq.rate if fxq else None
-    result.transfer_count = len(engine.transfers)
-    result.transfer_fee_usdt = sum(fee for _, _, fee in engine.transfers)
+    transfers = engine.transfers
+    result.transfer_count = len(transfers)
+    result.transfer_fee_usdt = sum(t.fee_usdt for t in transfers)
 
     # 결과 모으기
     with session_factory() as session:

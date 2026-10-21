@@ -72,14 +72,37 @@ Engine.step()  (스캔 한 번)
 - `fetch_quotes(coins, fx_krw)`: 업비트 코인 + USDT/KRW 호가를 요청 1번에, 바이비트는 코인마다. **USDT/KRW 호가가 없으면 그 스캔은 건너뛴다** (김프 계산 기준이라서)
 - `filter_supported()`, `round_qty()`, `min_qty()`, `fetch_funding()`
 
-### `kimp/paper_broker.py` — 가짜 체결과 잔고
-- 잔고 이름: `upbit:USDT`, `upbit:<코인>`, `upbit:KRW`(자투리), `bybit:USDT`(증거금 제외 남은 돈)
-- `ensure_initial_balances(총액, 업비트 비율)`: 처음 1번만 목표 비율대로 나눠 넣는다
-- `open_hedge()`: 세 가지(업비트 USDT 매도, 코인 매수, 바이비트 숏)가 다 될 때만 한 번에 저장. 안 되면 `EntryRejected` (부족한 금액 포함)
-- `value_exit()` / `close_hedge()`: 지금 청산하면 얼마 / 실제 청산
-- `value_liquidation()` / `close_hedge(liquidated=True)`: 강제청산 (증거금 손실 + 업비트 즉시 정리)
-- `capital_split()`: 지금 양쪽 자본 (USDT 환산, 보유 코인은 지금 팔아 되사면 받을 USDT 로)
-- `apply_funding()`: 펀딩비 1번 반영
+### 모드 구조: 페이퍼·드라이런·실거래는 같은 로직 (자세히: [live.md](live.md))
+엔진 → 브로커(공통) → 실행기(모드마다 다름). 실행기는 주문 '한 동작' 씩만 한다.
+
+### `kimp/broker.py` — 공통 브로커 `HedgeBroker`
+- `open_hedge()`: 계산 확인(호가·밀림·잔고) → `OPENING` 저장 → ① 바이비트 숏 ② 업비트 USDT 매도 ③ 받은 원화로 코인 매수. 단계마다 `Fill` 저장
+  - 실패하면 `_unwind_entry()`: 끝난 단계를 거꾸로 되돌림 → `ABORTED`, 되돌리기도 실패하면 `ERROR`
+- `value_exit()` / `value_liquidation()`: 지금 청산하면 얼마 (판단용)
+- `close_hedge()` → `_continue_close()`: `CLOSING` → 코인 매도 → USDT 매수 → 숏 닫기. 실패하면 다음 스캔에 남은 단계만. 손익은 실제 체결값으로
+- `sync()`: 매 스캔 — 송금 도착 확인, `OPENING`/`CLOSING` 이어서, 주기적으로 `reconcile()` (DB ↔ 실제 숏·코인 개수)
+- `transfer()` / `_poll_transfers()`: 송금 요청 → 도착 확인 (`transfers` 테이블). 송금 중엔 또 안 보냄, 하루 한도·최소 금액
+- `capital_split()`: 양쪽 자본 (송금 중인 돈은 받는 쪽으로)
+- `PaperBroker`: `HedgeBroker` + `PaperExecutor` / `broker_kwargs(settings)`: 실시간 봇과 시뮬레이션이 같은 옵션을 쓰게
+
+### `kimp/executor.py` — 페이퍼 실행기 `PaperExecutor`
+- 동작: `open_short`, `sell_usdt`, `buy_coin_with_krw`, `sell_coin`, `buy_usdt_with_krw`, `close_short`, `withdraw`, `transfer_arrived`, `free`, `coin_total`, `short_qty`
+- 그 순간 호가로 체결 계산, 장부 `paper_balances` (`upbit:USDT`, `upbit:<코인>`, `upbit:KRW`, `bybit:USDT`, `bybit:SHORT:<코인>`)
+- `fail_next`: 테스트에서 특정 동작을 한 번 실패시키기
+
+### `kimp/live_executor.py` — 실거래 / 드라이런 실행기
+- `LiveExecutor`: ccxt 로 실제 주문 → 끝날 때까지 조회 → 실제 체결 개수·평균가·수수료. 시작 때 `setup()` 으로 바이비트 단방향·격리·레버리지. 출금·입금 확인
+- `DryRunExecutor`: 실제 잔고로 장부 시작 + 페이퍼처럼 계산 + "[드라이런] 실제였다면 …" 로그. 주문 안 냄
+
+### `kimp/safety.py` — 안전장치 `Safety`
+- `entries_allowed()`: 비상정지 파일, 텔레그램 /stop, 연속 실패, `ERROR` 포지션, 대조 불일치, 하루 손실 한도 → 하나라도 있으면 신규 진입 중단
+
+### `kimp/notify.py` — 텔레그램
+- `TelegramLogHandler`: 경고 이상 + 진입·청산·송금 로그를 텔레그램으로 / `TelegramCommands`: `/status` `/stop` `/resume`
+
+### `kimp/live_check.py` — 실거래 전 점검 (읽기만)
+
+### `kimp/paper_broker.py` — 예전 이름 호환 (`PaperBroker`, `UPBIT_USDT` …)
 
 ### `kimp/engine.py` — 전략 엔진
 - `step()`: 스캔 한 번 (위 흐름 참고)
@@ -150,6 +173,7 @@ Engine.step()  (스캔 한 번)
 | `test_fx.py` | 고정 환율, 갱신 간격, 실패 시 이전 값 |
 | `test_config.py` | 코인별 덮어쓰기, 레버리지 → 자본 비율, 잘못된 값 거부 |
 | `test_report.py` | 리포트 숫자 계산 |
+| `test_live_broker.py` | 가짜 ccxt 업비트·바이비트로 실거래 실행기: 실제 체결값 손익, 되돌리기, ERROR, 청산 이어서, 재시작 복구, 대조 불일치, 강제청산 처리, 송금 요청→도착·한도·지연 알림, 드라이런 주문 0건, 안전장치, 설정, 텔레그램 |
 | `test_carry.py` | 펀딩비 평균, 진입·청산 규칙, 왕복 잔고 = 손익, 가격 변동 상쇄, 강제청산 안전장치, 강제청산, 자동 크기 |
 | `test_screen.py` | 추천 코인 순위: 김프 기록, 반감기, 스윙 백테스트(익절·손절·펀딩비·끝까지 보유), 순위 |
 

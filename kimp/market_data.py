@@ -122,6 +122,12 @@ class MarketData:
         market = self.bybit.market(bybit_symbol(coin))
         return float(market.get("limits", {}).get("amount", {}).get("min") or 0.0)
 
+    def min_notional_usdt(self, coin: str) -> float:
+        """바이비트 최소 주문 금액 (USDT). 예) XRP 5 USDT. 정보가 없으면 0"""
+        market = self.bybit.market(bybit_symbol(coin))
+        info = (market.get("info") or {}).get("lotSizeFilter") or {}
+        return float(info.get("minNotionalValue") or market.get("limits", {}).get("cost", {}).get("min") or 0.0)
+
     # ------------------------------------------------------------------
     # 시세
     # ------------------------------------------------------------------

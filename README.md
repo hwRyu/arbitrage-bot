@@ -1,6 +1,9 @@
 # arbitrage-bot
 
-업비트 원화 마켓 + 바이비트 USDT 무기한 김프 헷지 봇 + 바이비트 펀딩비 수익 전략 (현재: 페이퍼 트레이딩 전용)
+업비트 원화 마켓 + 바이비트 USDT 무기한 김프 헷지 봇 + 바이비트 펀딩비 수익 전략
+(김프 헷지: 페이퍼 / 드라이런 / 실거래, 펀딩비: 페이퍼)
+
+> **실거래 준비는 [docs/live.md](docs/live.md)**, 서버 배포는 [docs/deploy.md](docs/deploy.md).
 
 > **명령어와 실행 방법은 [docs/commands.md](docs/commands.md)** 에 모아 두었습니다. 펀딩비 전략은 [docs/carry.md](docs/carry.md).
 
@@ -41,6 +44,14 @@
 ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.5        # 공통
 SOL_ENTRY_PREMIUM_THRESHOLD_PERCENT=-1.0    # SOL 만 -1.0%
 ```
+
+## 실거래
+```bash
+python3 -m kimp.live_check      # 키·IP·권한·출금 주소·텔레그램 점검 (읽기만)
+PAPER_TRADING=false python3 main.py                                   # 드라이런 (주문 안 냄)
+PAPER_TRADING=false LIVE_DRY_RUN=false LIVE_CONFIRM=YES python3 main.py  # 실제 주문
+```
+페이퍼·드라이런·실거래는 **같은 엔진·브로커**를 쓰고 주문 실행기만 다릅니다. 순서는 [docs/live.md](docs/live.md) 5번.
 
 ## 실행
 ```bash
@@ -98,7 +109,13 @@ python3 -m unittest discover -s tests -v
 | `kimp/premium.py` | 김프 계산, 호가창으로 진입·청산 체결 계산 (업비트 2단계 + 바이비트) |
 | `kimp/pnl.py` | 비용 포함 손익 (USDT), 강제청산 가격 |
 | `kimp/market_data.py` | 업비트·바이비트 시세 (ccxt) |
-| `kimp/paper_broker.py` | 가짜 주문 체결, 페이퍼 잔고, 펀딩비, 강제청산, 자본 분배 |
+| `kimp/broker.py` | **공통 브로커** (모든 모드 같은 로직): 진입 3단계·되돌리기·청산 이어서·손익·송금·대조 |
+| `kimp/executor.py` | 페이퍼 실행기 (호가로 체결 계산, 가짜 잔고) |
+| `kimp/live_executor.py` | 실거래 실행기 (실제 주문·잔고·출금) / 드라이런 실행기 |
+| `kimp/safety.py` | 안전장치 (비상정지, 하루 손실 한도, 연속 실패, 대조 불일치) |
+| `kimp/notify.py` | 텔레그램 알림·명령 |
+| `kimp/live_check.py` | 실거래 전 점검 (읽기만) |
+| `kimp/paper_broker.py` | 예전 이름 호환용 연결 파일 |
 | `kimp/engine.py` | 스캔 → 포지션 관리(강제청산 감시) → 리밸런싱 확인 → 새 진입 |
 | `kimp/fx.py` | 달러 환율 (표시용) |
 | `kimp/db.py` | SQLite 테이블 |

@@ -15,6 +15,8 @@ python3 -m unittest discover -s tests   # 테스트 (인터넷 필요 없음)
 | 하고 싶은 것 | 명령 | 걸리는 시간 |
 |---|---|---|
 | 봇 실행 (김프 + 펀딩비, 페이퍼) | `python3 main.py` | Ctrl+C 로 끔 |
+| 실거래 전 점검 (읽기만) | `python3 -m kimp.live_check` | 몇 초 |
+| 드라이런 / 실거래 | `PAPER_TRADING=false python3 main.py` ([live.md](live.md)) | |
 | 김프 전략 코인 추천 순위 | `python3 -m kimp.screen` | 처음 2~3분, 다음부터 수십 초 |
 | 김프 전략 과거 시뮬레이션 | `python3 -m kimp.simulate --from 2026-09-22` | 코인당 처음 1~2분 |
 | 펀딩비 전략 코인 순위 | `python3 -m kimp.carry_backtest screen` | 처음 약 2분 |
@@ -99,8 +101,16 @@ CARRY_ENTRY_MIN_DAILY_PERCENT=0.05 CARRY_LEVERAGE=2 python3 -m kimp.carry_backte
 | `CARRY_LEVERAGE` | 1 | 펀딩비 전략 숏 레버리지 |
 | `CARRY_LIQ_GUARD_PERCENT` | 15 | 펀딩비 전략: 강제청산까지 이보다 가까우면 양쪽 미리 정리 |
 
-## 7. 송금(리밸런싱)은 누가 하나
-- **지금은 실제 송금을 봇이 하지 않는다.** 실주문 기능 자체가 아직 없어서(페이퍼만) "필요하면 알림 → 사용자가 직접 송금" 이다.
-- **실거래 단계에서 자동 송금으로 바꿀 계획이다.** 송금 시점은 지금 페이퍼와 같고, 출금 API 권한·출금 주소 등록·트래블룰 확인이 먼저 필요하다 (concept.md 11번).
-- 페이퍼·시뮬레이션에서는 페이퍼 잔고를 사람이 옮길 수 없으니, 필요한 순간(청산 후 비율이 10%p 넘게 깨짐 / 진입하려는데 한쪽이 모자람)에 **사용자가 보냈다고 치고** 자동으로 옮기고 수수료 1번을 뗀다.
+## 7. 실거래 (자세히: [live.md](live.md))
+```bash
+python3 -m kimp.live_check                                               # ❌ 없을 때까지
+PAPER_TRADING=false python3 main.py                                      # 드라이런 (주문 안 냄)
+PAPER_TRADING=false LIVE_DRY_RUN=false LIVE_CONFIRM=YES python3 main.py  # 실제 주문
+touch data/STOP                                                          # 비상정지 (지우면 재개)
+```
+텔레그램: `/status`, `/stop`, `/resume`
+
+## 8. 송금(리밸런싱)은 누가 하나
+- 페이퍼·시뮬레이션: 필요한 순간(청산 후 비율이 10%p 넘게 깨짐 / 진입하려는데 한쪽이 모자람) **사용자가 보냈다고 치고** 바로 옮기고 수수료 1번 (`PAPER_AUTO_REBALANCE`)
+- 실거래: `AUTO_TRANSFER_ENABLED=true` 면 봇이 출금하고 도착을 확인한다. false(기본)면 알림만 하고 직접 보낸다 ([live.md](live.md) 4번)
 - 펀딩비 전략은 바이비트 안에서 끝나서 송금이 필요 없다.

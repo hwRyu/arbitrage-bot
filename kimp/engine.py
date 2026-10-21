@@ -26,43 +26,39 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from kimp.config import Settings
+from kimp.broker import EntryRejected, ExitValuation, HedgeBroker, InsufficientBalance
 from kimp.db import ExitReason, FundingEvent, Position, PremiumSnapshot
+from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.market_data import MarketData
-from kimp.paper_broker import (
-    BYBIT_USDT,
-    UPBIT_USDT,
-    EntryRejected,
-    ExitValuation,
-    InsufficientBalance,
-    PaperBroker,
-)
 from kimp.pnl import estimated_exit_premium, margin_to_add_usdt
 from kimp.premium import Quote
 
 logger = logging.getLogger(__name__)
 
-# 업비트 원화 마켓 최소 주문 금액 (원). 이보다 작으면 거래소가 주문을 거절한다.
-UPBIT_MIN_ORDER_KRW = 5_000
 
 # 같은 경고를 너무 자주 찍지 않으려고 두는 간격 (초)
 LOG_COOLDOWN_SEC = 60.0
 
 
 class Engine:
-    """김프 헷지 전략 엔진 (페이퍼 트레이딩)"""
+    """
+    김프 헷지 전략 엔진 (페이퍼 · 드라이런 · 실거래 공통)
+
+    엔진은 모드를 모른다. 주문·잔고는 전부 broker(HedgeBroker) 를 통하고, 모드 차이는 broker 의 실행기에만 있다.
+    """
 
     def __init__(
         self,
         settings: Settings,
         market: MarketData,
         fx,
-        broker: PaperBroker,
+        broker: HedgeBroker,
         session_factory: sessionmaker[Session],
         coins: List[str],
         clock: Callable[[], float] = time.time,
@@ -72,7 +68,7 @@ class Engine:
             settings: 봇 설정
             market: 거래소 시세 조회기
             fx: 달러 환율 공급기 (get() 이 FxQuote 또는 None). 표시용이라 None 이어도 매매는 된다
-            broker: 페이퍼 트레이딩 체결기
+            broker: 체결기 (실행기만 페이퍼/드라이런/실거래로 다름)
             session_factory: DB 연결 만드는 함수
             coins: 운용할 코인 (양쪽 거래소에 다 있는 것만)
             clock: 지금 시각(초). 평소엔 진짜 시계, 시뮬레이션에서는 과거 시각을 알려주는 가짜 시계
@@ -90,9 +86,18 @@ class Engine:
         self._last_funding_check: Dict[str, float] = {}
         self._last_log: Dict[str, float] = {}
         self._reentry_allowed_at: Dict[str, float] = {}
-        # 페이퍼 자동 송금 기록 [(시각 초, 보낸 양 USDT(+ 업비트→바이비트), 수수료)]
-        self.transfers: List[Tuple[float, float, float]] = []
         self._last_status_log = 0.0
+
+    @property
+    def transfers(self) -> list:
+        """지금까지 한 송금 (실패 제외, DB 기록)"""
+        with self.session_factory() as session:
+            return self.broker.transfers(session)
+
+    @property
+    def auto_transfer(self) -> bool:
+        """송금이 필요할 때 자동으로 보낼지 (브로커가 정해 주면 그 값, 아니면 PAPER_AUTO_REBALANCE)"""
+        return self.s.paper_auto_rebalance if self.broker.auto_transfer is None else self.broker.auto_transfer
 
     # ------------------------------------------------------------------
     # 실행
@@ -134,6 +139,8 @@ class Engine:
             return
 
         with self.session_factory() as session:
+            # 송금 도착 확인, 덜 끝난 진입·청산 이어서, 거래소와 대조 (페이퍼도 같은 흐름)
+            self.broker.sync(session, quotes, self.coins)
             open_positions = {p.coin: p for p in self.broker.open_positions(session)}
 
             closed_any = False
@@ -149,7 +156,11 @@ class Engine:
             if closed_any:
                 self._check_rebalance(session, list(open_positions.values()), quotes, when="청산 후")
 
-            self._try_entries(session, quotes, open_positions)
+            allowed, why = self.broker.entries_allowed(session)
+            if allowed:
+                self._try_entries(session, quotes, open_positions)
+            else:
+                self._log_throttled("entries-blocked", logging.WARNING, f"신규 진입 중단 중: {why}")
             self._save_snapshots(session, quotes)
             self._log_status(session, quotes, open_positions)
 
@@ -194,13 +205,15 @@ class Engine:
         """청산 실행 + 로그 + 재진입 대기 시작"""
         final = self.broker.close_hedge(session, pos, valuation, reason, liquidated=liquidated)
         self._reentry_allowed_at[pos.coin] = self._clock() + self.s.reentry_cooldown_sec
+        if final is None:
+            return  # 일부 단계 실패 → CLOSING 으로 남음, 다음 스캔에서 이어서 (broker.sync)
         level = logging.CRITICAL if liquidated else logging.INFO
         logger.log(
             level,
             "[청산 %s] #%d %s | 김프 %+.3f%% → %+.3f%% | 업비트 USDT %.2f개 → %.2f개 (%+.2f) | 바이비트 %+.2f "
             "| 펀딩 %+.2f - 비용 %.2f = 순손익 %+.2f USDT (%+.3f%%)",
-            reason, pos.id, pos.coin, pos.entry_premium, valuation.exit_premium,
-            pos.usdt_sold, valuation.plan.usdt_bought, valuation.plan.usdt_bought - pos.usdt_sold,
+            reason, pos.id, pos.coin, pos.entry_premium, pos.exit_premium,
+            pos.usdt_sold, pos.usdt_bought, pos.usdt_bought - pos.usdt_sold,
             final.bybit_leg_usdt, final.funding_usdt, final.total_cost_usdt, final.net_usdt, final.net_percent,
         )
 
@@ -328,13 +341,14 @@ class Engine:
                     "진입 보류: 양쪽 비율을 맞춰도 자리가 없음 (포지션 크기 × 최대 개수가 자본에 비해 큼) → 송금 안 함",
                 )
                 return None
-        if self.s.paper_auto_rebalance:
+        if self.auto_transfer:
+            if self.broker.pending_transfers(session):
+                return None  # 송금 중 → 도착할 때까지 기다림
             fee = self.s.rebalance_transfer_fee_usdt
-            sent = self.broker.transfer(session, move, fee)
+            sent = self.broker.transfer(session, move, fee, reason=when)
             if sent:
-                self.transfers.append((self._clock(), sent, fee))
                 logger.warning(
-                    "[송금 · 페이퍼 · %s] %s로 USDT %s 개 (수수료 %s) | 전: 업비트 %s / 바이비트 %s (%.1f : %.1f, 목표 %.1f : %.1f)",
+                    "[송금 · %s] %s로 USDT %s 개 (수수료 %s) | 전: 업비트 %s / 바이비트 %s (%.1f : %.1f, 목표 %.1f : %.1f)",
                     when, direction, f"{abs(sent):,.2f}", f"{fee:g}", f"{upbit:,.2f}", f"{bybit:,.2f}",
                     share * 100, (1 - share) * 100, target * 100, (1 - target) * 100,
                 )
@@ -360,11 +374,12 @@ class Engine:
           예) 전체 10,000 USDT × 43.5% × 90% ÷ 3 ≈ 1,305 USDT
         """
         fixed = self.s.params_for(coin).position_size_usdt
-        if fixed is not None:
-            return fixed
-        upbit, bybit = self.broker.capital_split(session, positions, quotes)
-        return ((upbit + bybit) * self.s.upbit_target_share() * self.s.capital_usage_percent / 100
-                / self.s.max_open_positions)
+        if fixed is None:
+            upbit, bybit = self.broker.capital_split(session, positions, quotes)
+            fixed = ((upbit + bybit) * self.s.upbit_target_share() * self.s.capital_usage_percent / 100
+                     / self.s.max_open_positions)
+        cap = self.s.max_position_usdt
+        return min(fixed, cap) if cap else fixed
 
     def _try_entries(self, session: Session, quotes: Dict[str, Quote], open_positions: Dict[str, Position]) -> None:
         """
@@ -375,14 +390,15 @@ class Engine:
         - 진입 기준은 코인별 설정 (없으면 공통값)
         - 여러 코인이 동시에 조건을 만족하면 '자기 기준보다 더 많이 낮은' 코인부터
         """
-        slots = self.s.max_open_positions - len(open_positions)
+        busy = {p.coin for p in self.broker.unfinished_positions(session)}  # 진입 중·청산 중·확인 필요
+        slots = self.s.max_open_positions - len(open_positions) - len(busy - set(open_positions))
         if slots <= 0:
             return
         fee_rate = self.s.fees.upbit_trade_fee_rate
 
         candidates = []
         for coin, quote in quotes.items():
-            if coin in open_positions or self._clock() < self._reentry_allowed_at.get(coin, 0.0):
+            if coin in open_positions or coin in busy or self._clock() < self._reentry_allowed_at.get(coin, 0.0):
                 continue
             threshold = self.s.params_for(coin).entry_premium_threshold_percent
             top = quote.entry_premium_top
@@ -409,8 +425,10 @@ class Engine:
                     # 한쪽이 모자람 → 리밸런싱 (페이퍼는 자동 송금 후 한 번 더 시도, 실거래는 알림만)
                     self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
                     if not self._check_rebalance(session, list(open_positions.values()), quotes,
-                                                 when="진입 막힘", need=exc) or not self.s.paper_auto_rebalance:
+                                                 when="진입 막힘", need=exc) or not self.auto_transfer:
                         continue
+                    if self.broker.pending_transfers(session):
+                        continue  # 실거래: 송금이 도착하면 다음 스캔에 다시 시도
                     pos = self.broker.open_hedge(session, quote, bybit_qty)
             except EntryRejected as exc:
                 self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
@@ -438,6 +456,9 @@ class Engine:
         바이비트 숏 개수 = 포지션 크기(USDT) ÷ 바이비트 맨 앞 매수 호가 → 주문 단위로 내림
         예) 1,000 USDT ÷ 1.35 = 740.74개 → XRP 는 0.1개 단위라 740.7개
 
+        최소 주문 확인 (모든 모드 같음, 값만 거래소에서):
+          바이비트 최소 개수·최소 금액 (마켓 정보, 예: XRP 0.1개 / 5 USDT),
+          업비트 최소 주문 금액 (실거래는 거래소 조회, 아니면 UPBIT_MIN_ORDER_KRW 기본 5,000원)
         Returns:
             숏 개수. 최소 주문 개수/금액보다 작으면 None
         """
@@ -450,9 +471,15 @@ class Engine:
             self._log_throttled(f"reject-{coin}", logging.INFO,
                                 f"{coin} 진입 보류: 개수 {qty} 가 바이비트 최소 {min_qty} 보다 작음")
             return None
-        if quote.usdt_krw and qty * best_bid * quote.usdt_krw < UPBIT_MIN_ORDER_KRW:
+        min_usdt = getattr(self.market, "min_notional_usdt", lambda _c: 0.0)(coin)
+        if qty * best_bid < min_usdt:
             self._log_throttled(f"reject-{coin}", logging.INFO,
-                                f"{coin} 진입 보류: 업비트 주문 금액이 최소 {UPBIT_MIN_ORDER_KRW:,}원보다 작음")
+                                f"{coin} 진입 보류: 바이비트 주문 금액 {qty * best_bid:.2f} USDT 가 최소 {min_usdt:g} USDT 보다 작음")
+            return None
+        min_krw = self.broker.ex.min_order_krw(coin)
+        if quote.usdt_krw and qty * best_bid * quote.usdt_krw < min_krw:
+            self._log_throttled(f"reject-{coin}", logging.INFO,
+                                f"{coin} 진입 보류: 업비트 주문 금액이 최소 {min_krw:,.0f}원보다 작음")
             return None
         return qty
 

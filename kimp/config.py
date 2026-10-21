@@ -143,8 +143,60 @@ class Settings:
     # ------------------------------------------------------------------
     # 실행 모드
     # ------------------------------------------------------------------
-    # 지금 버전은 페이퍼 트레이딩(가짜 주문)만 된다. false 면 실행을 막는다.
+    # true = 페이퍼(가짜 주문, 가짜 잔고). false = 실거래 계열 (아래 LIVE_* 확인, docs/live.md)
     paper_trading: bool = True
+
+    # ------------------------------------------------------------------
+    # 실거래 (PAPER_TRADING=false 일 때만, docs/live.md)
+    # ------------------------------------------------------------------
+    # 거래소 API 키. 로그에는 절대 안 찍는다
+    upbit_access_key: str = ""
+    upbit_secret_key: str = ""
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+    # 실수로 실거래가 켜지는 것 방지: 정확히 YES 라고 적어야 실제 주문을 낸다
+    live_confirm: str = ""
+    # true = 실제 키·잔고·호가로 돌지만 주문은 안 냄 (페이퍼 장부로 '이 주문을 냈을 것' 만 기록). 첫 단계
+    live_dry_run: bool = True
+    # 포지션 하나 최대 금액 (USDT). 자동 크기나 POSITION_SIZE_USDT 보다 크면 이 값으로 줄인다
+    #   모든 모드에 똑같이 적용. 비우면 제한 없음, 단 실거래·드라이런에서 비우면 50
+    max_position_usdt: Optional[float] = None
+    # 하루(한국 시간 0시 기준) 확정 손실이 이 USDT 를 넘으면 그날은 신규 진입 중단
+    #   모든 모드에 똑같이 적용. 비우면 제한 없음, 단 실거래·드라이런에서 비우면 10
+    daily_loss_limit_usdt: Optional[float] = None
+    # 주문 실패가 연속 이 횟수면 신규 진입 중단 (가진 포지션은 계속 관리)
+    max_consecutive_failures: int = 3
+    # 이 파일이 있으면 신규 진입 중단 (비상정지). 지우면 재개. 텔레그램 /stop, /resume 도 같음
+    stop_file: str = "data/STOP"
+    # 거래소 실제 잔고·포지션과 DB 를 비교하는 간격 (초). 다르면 신규 진입 중단 + 긴급 알림
+    reconcile_interval_sec: float = 600.0
+    # 실거래 / 드라이런 DB (페이퍼 DB_PATH 와 따로)
+    live_db_path: str = "data/live.db"
+    dry_run_db_path: str = "data/dryrun.db"
+
+    # ------------------------------------------------------------------
+    # 자동 송금 (실거래, docs/live.md). 기본 꺼짐 = 알림만
+    # ------------------------------------------------------------------
+    auto_transfer_enabled: bool = False
+    # 보낼 네트워크 (업비트 net_type / 바이비트 chain). 예) TRX (수수료 싸고 빠름). 양쪽이 지원해야 함
+    transfer_network: str = "TRX"
+    # 이보다 적게는 안 보냄 (USDT). 수수료만 버리지 않게
+    transfer_min_usdt: float = 10.0
+    # 하루에 보낼 수 있는 최대 (USDT, 양방향 합)
+    transfer_max_usdt_per_day: float = 1_000.0
+    # 송금 요청 뒤 이 시간(분) 안에 입금이 안 보이면 긴급 알림
+    transfer_alert_minutes: float = 60.0
+    # 받는 주소 (비우면 거래소에서 내 입금 주소를 조회). 업비트·바이비트 출금 허용 주소에 미리 등록해야 함
+    bybit_deposit_address: str = ""
+    bybit_deposit_tag: str = ""
+    upbit_deposit_address: str = ""
+    upbit_deposit_tag: str = ""
+
+    # ------------------------------------------------------------------
+    # 텔레그램 알림 (비우면 알림 없음)
+    # ------------------------------------------------------------------
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     # ------------------------------------------------------------------
     # 대상 코인
@@ -205,6 +257,16 @@ class Settings:
 
     # 양쪽 자본 비율이 목표에서 이 %p 넘게 벗어나면 리밸런싱 알림 (청산 직후 확인)
     rebalance_threshold_percent: float = 10.0
+
+    # 진입 뒤 양쪽 금액(업비트 코인 값 vs 바이비트 숏 금액) 차이가 이 %보다 크면 큰 쪽을 줄여서 맞춘다
+    #   예) 숏 100 USDT, 코인 80 USDT 어치만 체결 → 숏 20 USDT 만큼 닫기 (비용 약 0.02 USDT)
+    #   1% 이하 차이는 그대로 둔다 (50 USDT 포지션이면 0.5 USDT. 가격 10% 움직여도 0.05 USDT)
+    hedge_tolerance_percent: float = 1.0
+
+    # 업비트 원화 마켓 최소 주문 금액 (원). 실거래·드라이런은 시작할 때 업비트에 마켓별 값을 물어보고
+    # (주문 가능 정보 API), 못 받으면 이 값을 쓴다. 페이퍼·시뮬레이션은 이 값.
+    # 바이비트 최소 주문(개수·금액)은 거래소 마켓 정보에서 읽는다 (예: XRP 0.1개, 5 USDT)
+    upbit_min_order_krw: float = 5_000.0
 
     # 리밸런싱 송금 한 번에 드는 출금 수수료 (USDT). 송금할 때만 한 번 든다 (거래마다 X)
     rebalance_transfer_fee_usdt: float = 1.0
@@ -339,12 +401,28 @@ class Settings:
         lev = self.bybit_leverage
         return lev / (lev + 1 + self.bybit_margin_buffer_percent / 100)
 
+    @property
+    def mode(self) -> str:
+        """실행 모드: 'paper' (가짜) / 'dry_run' (실제 잔고·호가, 주문 안 냄) / 'live' (실제 주문)"""
+        if self.paper_trading:
+            return "paper"
+        return "dry_run" if self.live_dry_run else "live"
+
+    @property
+    def active_db_path(self) -> str:
+        """김프 전략이 쓰는 DB (모드마다 따로라 기록이 섞이지 않는다)"""
+        return {"paper": self.db_path, "dry_run": self.dry_run_db_path, "live": self.live_db_path}[self.mode]
+
     def carry_size_usdt(self) -> float:
         """펀딩비 전략 포지션 하나 금액 (설정값, 없으면 자동). 예) 1배: 1,000 × 90% ÷ 3 ÷ 2 = 150"""
         if self.carry_position_size_usdt:
             return self.carry_position_size_usdt
         return (self.carry_capital_usdt * self.capital_usage_percent / 100 / self.carry_max_positions
                 / (1 + 1 / self.carry_leverage))
+
+
+LIVE_DEFAULT_MAX_POSITION_USDT = 50.0
+LIVE_DEFAULT_DAILY_LOSS_LIMIT_USDT = 10.0
 
 
 def load_settings(env_file: str | None = ".env") -> Settings:
@@ -369,6 +447,30 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     )
     settings = Settings(
         paper_trading=_env_bool("PAPER_TRADING", d.paper_trading),
+        upbit_access_key=_env_str("UPBIT_ACCESS_KEY", ""),
+        upbit_secret_key=_env_str("UPBIT_SECRET_KEY", ""),
+        bybit_api_key=_env_str("BYBIT_API_KEY", ""),
+        bybit_api_secret=_env_str("BYBIT_API_SECRET", ""),
+        live_confirm=_env_str("LIVE_CONFIRM", ""),
+        live_dry_run=_env_bool("LIVE_DRY_RUN", d.live_dry_run),
+        max_position_usdt=_env_optional_float("MAX_POSITION_USDT"),
+        daily_loss_limit_usdt=_env_optional_float("DAILY_LOSS_LIMIT_USDT"),
+        max_consecutive_failures=_env_int("MAX_CONSECUTIVE_FAILURES", d.max_consecutive_failures),
+        stop_file=_env_str("STOP_FILE", d.stop_file),
+        reconcile_interval_sec=_env_float("RECONCILE_INTERVAL_SEC", d.reconcile_interval_sec),
+        live_db_path=_env_str("LIVE_DB_PATH", d.live_db_path),
+        dry_run_db_path=_env_str("DRY_RUN_DB_PATH", d.dry_run_db_path),
+        auto_transfer_enabled=_env_bool("AUTO_TRANSFER_ENABLED", d.auto_transfer_enabled),
+        transfer_network=_env_str("TRANSFER_NETWORK", d.transfer_network).upper(),
+        transfer_min_usdt=_env_float("TRANSFER_MIN_USDT", d.transfer_min_usdt),
+        transfer_max_usdt_per_day=_env_float("TRANSFER_MAX_USDT_PER_DAY", d.transfer_max_usdt_per_day),
+        transfer_alert_minutes=_env_float("TRANSFER_ALERT_MINUTES", d.transfer_alert_minutes),
+        bybit_deposit_address=_env_str("BYBIT_DEPOSIT_ADDRESS", ""),
+        bybit_deposit_tag=_env_str("BYBIT_DEPOSIT_TAG", ""),
+        upbit_deposit_address=_env_str("UPBIT_DEPOSIT_ADDRESS", ""),
+        upbit_deposit_tag=_env_str("UPBIT_DEPOSIT_TAG", ""),
+        telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=_env_str("TELEGRAM_CHAT_ID", ""),
         coins=_env_list("COINS", ",".join(d.coins)),
         entry_premium_threshold_percent=_env_float("ENTRY_PREMIUM_THRESHOLD_PERCENT", d.entry_premium_threshold_percent),
         target_net_profit_percent=_env_float("TARGET_NET_PROFIT_PERCENT", d.target_net_profit_percent),
@@ -383,6 +485,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         bybit_mmr=_env_float("BYBIT_MMR", d.bybit_mmr),
         liquidation_warn_percent=_env_float("LIQUIDATION_WARN_PERCENT", d.liquidation_warn_percent),
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
+        hedge_tolerance_percent=_env_float("HEDGE_TOLERANCE_PERCENT", d.hedge_tolerance_percent),
+        upbit_min_order_krw=_env_float("UPBIT_MIN_ORDER_KRW", d.upbit_min_order_krw),
         rebalance_transfer_fee_usdt=_env_float("REBALANCE_TRANSFER_FEE_USDT", d.rebalance_transfer_fee_usdt),
         paper_auto_rebalance=_env_bool("PAPER_AUTO_REBALANCE", d.paper_auto_rebalance),
         fees=fees,
@@ -417,6 +521,11 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         carry_scan_interval_sec=_env_float("CARRY_SCAN_INTERVAL_SEC", d.carry_scan_interval_sec),
         carry_refresh_sec=_env_float("CARRY_REFRESH_SEC", d.carry_refresh_sec),
     )
+    # 실거래·드라이런에서 안전 한도를 비워두면 기본값 (페이퍼와 같은 로직, 값만 정해 줌)
+    if not settings.paper_trading:
+        settings = replace(settings,
+                           max_position_usdt=settings.max_position_usdt or LIVE_DEFAULT_MAX_POSITION_USDT,
+                           daily_loss_limit_usdt=settings.daily_loss_limit_usdt or LIVE_DEFAULT_DAILY_LOSS_LIMIT_USDT)
     # 공통값이 정해진 뒤에 코인별 덮어쓰기 적용 (frozen 이라 replace 로 새로 만든다)
     settings = replace(settings, coin_params=_load_coin_params(settings),
                        config_warnings=tuple(_find_unused_coin_keys(settings.coins)))
@@ -512,6 +621,20 @@ def validate_settings(s: Settings) -> None:
             errors.append(f"{name}={value} 는 소수 비율이어야 합니다 (예: 0.0005 = 0.05%)")
     if f.transfer_fee_usdt_per_cycle < 0:
         errors.append("TRANSFER_FEE_USDT_PER_CYCLE 는 0 이상이어야 합니다")
+
+    # 실거래
+    if not s.paper_trading:
+        if not (s.upbit_access_key and s.upbit_secret_key and s.bybit_api_key and s.bybit_api_secret):
+            errors.append("실거래(PAPER_TRADING=false)에는 UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY, "
+                          "BYBIT_API_KEY, BYBIT_API_SECRET 가 모두 필요합니다")
+        if not s.live_dry_run and s.live_confirm != "YES":
+            errors.append("실제 주문(LIVE_DRY_RUN=false)을 내려면 LIVE_CONFIRM=YES 를 적어야 합니다 (실수 방지)")
+    if s.max_position_usdt is not None and s.max_position_usdt <= 0:
+        errors.append("MAX_POSITION_USDT 는 0보다 커야 합니다")
+    if s.daily_loss_limit_usdt is not None and s.daily_loss_limit_usdt <= 0:
+        errors.append("DAILY_LOSS_LIMIT_USDT 는 0보다 커야 합니다")
+    if s.transfer_min_usdt <= s.rebalance_transfer_fee_usdt:
+        errors.append("TRANSFER_MIN_USDT 는 REBALANCE_TRANSFER_FEE_USDT(송금 수수료)보다 커야 합니다")
 
     # 펀딩비 전략
     if s.carry_capital_usdt <= 0:

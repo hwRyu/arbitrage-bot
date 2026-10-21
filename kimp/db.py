@@ -10,6 +10,7 @@ DB 테이블 정의 (SQLite 파일 하나에 저장)
 - paper_balances    : 페이퍼 트레이딩 잔고 (껐다 켜도 유지)
 - carry_positions   : 펀딩비 수익 전략 포지션 (바이비트 현물 + 바이비트 숏, kimp/carry.py)
 - carry_funding     : 펀딩비 전략 포지션이 받거나 낸 펀딩비 기록
+- transfers         : 거래소 간 USDT 송금 (리밸런싱). 요청 → 도착 확인까지
 
 시간은 모두 UTC(세계 표준시)로 저장한다. (한국 시간 = UTC + 9시간)
 old 봇은 저장할 때와 읽을 때 시간대가 달라서 날짜가 9시간 밀렸었다.
@@ -18,9 +19,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, create_engine
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -34,10 +35,22 @@ class Base(DeclarativeBase):
 
 
 class PositionStatus:
-    """포지션 상태"""
+    """
+    포지션 상태 (페이퍼·실거래 똑같이 이 순서로 움직인다)
 
+    OPENING → OPEN → CLOSING → CLOSED
+       └→ ABORTED (진입 중 한 단계가 실패해서 끝난 단계를 되돌림)
+       └→ ERROR   (되돌리기도 실패. 사람이 거래소에서 직접 정리해야 함, 신규 진입 중단)
+    """
+
+    OPENING = "OPENING"  # 진입 주문 중 (세 단계 중 일부만 끝남)
     OPEN = "OPEN"  # 양쪽 다 들어가 있음, 지켜보는 중
+    CLOSING = "CLOSING"  # 청산 주문 중 (일부 단계 실패 시 다음 스캔에 이어서)
     CLOSED = "CLOSED"  # 양쪽 다 정리함, 손익 확정
+    ABORTED = "ABORTED"  # 진입 실패 → 되돌림 완료 (손익은 수수료 정도)
+    ERROR = "ERROR"  # 되돌리기 실패 → 사람이 확인 필요
+
+    UNFINISHED = (OPENING, CLOSING, ERROR)  # 이 코인은 새로 진입하면 안 됨
 
 
 class ExitReason:
@@ -125,8 +138,21 @@ class Position(Base):
     net_pnl_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
 
+class FillState:
+    """
+    체결 기록 상태
+
+    주문을 내기 '전에' SENT 로 먼저 저장한다 (추적번호 client_id 와 함께).
+    → 주문 응답이 끊기거나 프로그램이 꺼져도, 다시 켤 때 추적번호로 거래소에 조회해서 결과를 채운다.
+    """
+
+    SENT = "SENT"  # 주문을 보냄, 결과 모름
+    DONE = "DONE"  # 체결 확인 (일부 체결 포함)
+    VOID = "VOID"  # 주문이 안 들어감 (거절 / 조회해도 없음)
+
+
 class Fill(Base):
-    """체결 한 건"""
+    """체결 한 건 (같은 단계가 여러 건일 수 있다: 일부 체결 뒤 남은 만큼 다시 주문)"""
 
     __tablename__ = "fills"
 
@@ -139,6 +165,10 @@ class Fill(Base):
     fee: Mapped[float] = mapped_column(Float)
     fee_currency: Mapped[str] = mapped_column(String(10))  # KRW / USDT
     slippage_percent: Mapped[float] = mapped_column(Float)  # 맨 앞 호가보다 얼마나 밀렸나
+    order_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)  # 거래소 주문 번호 (페이퍼는 paper-…)
+    cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 체결 금액 (업비트 원, 바이비트 USDT)
+    client_id: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)  # 우리가 붙인 추적번호
+    state: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # FillState (비어 있으면 DONE)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -181,6 +211,42 @@ class PremiumSnapshot(Base):
     upbit_mid_krw: Mapped[float] = mapped_column(Float)
     bybit_mid_usdt: Mapped[float] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class TransferStatus:
+    """송금 상태: REQUESTED(출금 요청) → CONFIRMED(받는 쪽 입금 확인) / FAILED"""
+
+    REQUESTED = "REQUESTED"
+    CONFIRMED = "CONFIRMED"
+    FAILED = "FAILED"
+
+
+class Transfer(Base):
+    """
+    거래소 간 USDT 송금 한 건 (리밸런싱)
+
+    direction: 'upbit->bybit' 또는 'bybit->upbit'
+    amount_usdt: 보내는 쪽에서 빠지는 양 / fee_usdt: 출금 수수료 (받는 양 ≈ amount − fee)
+    """
+
+    __tablename__ = "transfers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    direction: Mapped[str] = mapped_column(String(20))
+    amount_usdt: Mapped[float] = mapped_column(Float)
+    fee_usdt: Mapped[float] = mapped_column(Float)
+    network: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(12), index=True)
+    withdraw_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)  # 청산 후 / 진입 막힘 / 시작
+    note: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    alerted: Mapped[int] = mapped_column(Integer, default=0)  # 늦어서 긴급 알림을 보냈나
+
+    @property
+    def to_bybit(self) -> bool:
+        return self.direction == "upbit->bybit"
 
 
 class CarryPosition(Base):
@@ -283,5 +349,31 @@ def make_session_factory(db_path: str) -> sessionmaker[Session]:
             os.makedirs(directory, exist_ok=True)
     engine = create_engine(f"sqlite:///{db_path}")
     Base.metadata.create_all(engine)
+    add_missing_columns(engine, Base)
     # expire_on_commit=False: 저장한 뒤에도 값을 바로 읽을 수 있게 한다
     return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def add_missing_columns(engine, base) -> List[str]:
+    """
+    예전 DB 파일에 없는 '새 칸' 을 추가한다 (빈 값 허용 칸만)
+
+    create_all 은 없는 '테이블' 만 만들고, 이미 있는 테이블에 새로 생긴 칸은 안 만든다.
+    예) fills 테이블에 order_id 칸을 새로 만들었으면 → ALTER TABLE fills ADD COLUMN order_id
+    Returns:
+        추가한 칸 이름들 ('테이블.칸')
+    """
+    added = []
+    insp = inspect(engine)
+    for table in base.metadata.sorted_tables:
+        if not insp.has_table(table.name):
+            continue
+        have = {c["name"] for c in insp.get_columns(table.name)}
+        for col in table.columns:
+            if col.name in have or not col.nullable:
+                continue
+            ddl = col.type.compile(dialect=engine.dialect)
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN "{col.name}" {ddl}'))
+            added.append(f"{table.name}.{col.name}")
+    return added
