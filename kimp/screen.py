@@ -9,6 +9,7 @@
     python3 -m kimp.screen --days 14 --top 30
     python3 -m kimp.screen --coins XRP,SOL,DOGE # 정해둔 코인만 비교
     python3 -m kimp.screen --target 0.5         # 목표 순이익을 바꿔서 보기
+    python3 -m kimp.screen --end 2026-09-22     # 9/22 까지 30일로 고르기 (그다음 기간에 시뮬레이션해서 검증)
 
 어떻게 고르나 (코인마다)
 ------------------------------------------------------------------
@@ -698,6 +699,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--top", type=int, default=20, help="몇 위까지 보여줄지 (기본 20)")
     parser.add_argument("--timeframe", default="15m", choices=sorted(TIMEFRAME_MS), help="캔들 간격 (기본 15m)")
     parser.add_argument("--coins", default=None, help="이 코인들만 보기 예: XRP,SOL (안 적으면 전체)")
+    parser.add_argument("--end", default=None,
+                        help="이 날짜(한국 시간)까지의 데이터로 순위 매기기 예: 2026-09-22 (안 적으면 지금). "
+                             "과거 한 달로 고르고 다음 한 달에 시뮬레이션해 보는 검증용")
     parser.add_argument("--max-coins", type=int, default=80,
                         help="거래량 걸러낸 뒤 업비트 거래대금 상위 몇 개까지 볼지 (기본 80)")
     parser.add_argument("--min-upbit-krw", type=float, default=1e9, help="업비트 24시간 거래대금 최소 (원, 기본 10억)")
@@ -733,6 +737,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     now_ms = int(time.time() * 1000) // bar_ms * bar_ms - bar_ms  # 끝난 봉까지만
+    if args.end:
+        from kimp.simulate import parse_kst
+
+        now_ms = min(now_ms, parse_kst(args.end) // bar_ms * bar_ms)
+        print(f"{args.end} 까지의 데이터로 봅니다 (거래량·호가 간격·물량은 '지금' 값이라 참고만)")
     start_ms = now_ms - int(args.days * DAY_MS)
     store = HistoryStore(make_history_session_factory(settings.history_db_path))
     src = lambda s: f"{s}@{args.timeframe}"  # 1분봉(시뮬레이션용)과 따로 저장
@@ -780,7 +789,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             scores.append(s)
 
     ranked = rank(scores)
-    note = (f"최근 {args.days:g}일 · {args.timeframe}봉 · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
+    note = (f"{'~' + args.end + ' ' if args.end else '최근 '}{args.days:g}일 · {args.timeframe}봉 · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
             f"손절 {settings.stop_loss_percent:g}% · 포지션 {size:,.0f} USDT · "
             f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}%")
     print()

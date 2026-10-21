@@ -167,6 +167,18 @@ class HistoryStoreTest(unittest.TestCase):
         self.assertEqual(missing_ranges((0, 100), [(0, 100)]), [])
         self.assertEqual(missing_ranges((0, 100), []), [(0, 100)])
 
+    def test_funding_no_gaps_for_hourly_coin(self):
+        """1시간마다 정산하는 코인 400시간: 200시간 칸으로 나눠 받아서 빠짐없이 400개 (예전엔 끝 쪽만 받아 중간이 빔)"""
+        from kimp.history import FUNDING_WINDOW_MS, HOUR_MS
+        all_rows = [(h * HOUR_MS, 0.0001) for h in range(400)]
+
+        def fetch(since):  # 거래소 흉내: since ~ since+200시간 안의 정산만 준다
+            return [r for r in all_rows if since <= r[0] < since + FUNDING_WINDOW_MS]
+
+        store = HistoryStore(make_history_session_factory(":memory:"))
+        self.assertEqual(store.ensure_funding("ERA", 0, 400 * HOUR_MS, fetch), 400)
+        self.assertEqual(len(store.load_funding("ERA", 0, 400 * HOUR_MS)), 400)
+
     def test_candles_fetched_once(self):
         """한 번 받은 구간은 다시 받지 않고, 업비트처럼 빈 분이 있어도 끝없이 다시 받지 않는다"""
         calls = []

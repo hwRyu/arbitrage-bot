@@ -38,6 +38,11 @@ GAP_SKIP_MINUTES = 200
 # 하루 전부터만 받으면 비어 있게 된다. (실제로 겪은 문제) → 넉넉하게 7일
 FX_LOOKBACK_MS = 7 * 24 * HOUR_MS
 
+# 펀딩비 기록은 200시간씩 끊어서 받는다.
+# 바이비트에 '언제부터 200개' 만 주면, 1시간마다 정산하는 코인은 앞부분이 아니라 '끝 쪽 200개' 가 와서
+# 중간이 비었다 (ERA 9/22 부터 요청 → 9/30 부터만 받음). 200시간 칸이면 1시간 코인도 200개 안에 다 들어간다.
+FUNDING_WINDOW_MS = 200 * HOUR_MS
+
 # 캔들 출처 이름
 UPBIT = "upbit"  # 업비트 코인/KRW
 BYBIT = "bybit"  # 바이비트 코인/USDT 무기한
@@ -284,7 +289,7 @@ class HistoryStore:
         [start_ms, end_ms) 구간의 펀딩비 정산 이력이 저장돼 있게 만든다
 
         Args:
-            fetch: since_ms → [(정산 시각, 비율), ...] (since 이후 몇 건씩)
+            fetch: since_ms → [(정산 시각, 비율), ...]  since 부터 200시간(FUNDING_WINDOW_MS) 안의 정산
         """
         saved = 0
         with self.sf() as session:
@@ -292,15 +297,16 @@ class HistoryStore:
         for a, b in todo:
             since = a
             while since < b:
-                rows = [r for r in fetch(since) if since <= r[0] < b]
-                if not rows:
-                    break
-                with self.sf() as session:
-                    for ts, rate in rows:
-                        session.merge(FundingHistory(coin=coin, ts_ms=int(ts), rate=float(rate)))
-                    session.commit()
-                saved += len(rows)
-                since = int(rows[-1][0]) + 1
+                window_end = since + FUNDING_WINDOW_MS
+                rows = [r for r in fetch(since) if since <= r[0] < min(b, window_end)]
+                if rows:
+                    with self.sf() as session:
+                        for ts, rate in rows:
+                            session.merge(FundingHistory(coin=coin, ts_ms=int(ts), rate=float(rate)))
+                        session.commit()
+                    saved += len(rows)
+                # 다음 칸으로 (이 칸에 정산이 없어도: 상장 전 등)
+                since = window_end
             with self.sf() as session:
                 self._mark(session, "funding", coin, a, b)
                 session.commit()
@@ -346,7 +352,8 @@ def ccxt_funding_fetcher(exchange, symbol: str) -> Callable[[int], List[Tuple[in
     """ccxt 바이비트로 펀딩비 이력을 받아오는 함수 만들기"""
 
     def fetch(since_ms: int) -> List[Tuple[int, float]]:
-        rows = exchange.fetch_funding_rate_history(symbol, since=since_ms, limit=200)
+        until = since_ms + FUNDING_WINDOW_MS - 1  # 이 칸 안의 정산만 (설명: FUNDING_WINDOW_MS)
+        rows = exchange.fetch_funding_rate_history(symbol, since=since_ms, limit=200, params={"until": until})
         return [(int(r["timestamp"]), float(r["fundingRate"])) for r in rows if r.get("fundingRate") is not None]
 
     return fetch

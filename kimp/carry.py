@@ -46,6 +46,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from kimp.config import Settings
+from kimp.history import FUNDING_WINDOW_MS
 from kimp.db import CarryFunding, CarryPosition, ExitReason, PaperBalance, PositionStatus
 from kimp.pnl import liquidation_price
 from kimp.premium import OrderBook, estimate_fill
@@ -548,16 +549,15 @@ class LiveCarryMarket:
         hist = self._hist.setdefault(coin, [])
         keep_from = now_ms - (self.s.carry_entry_lookback_hours + 24) * HOUR_MS
         since = hist[-1][0] + 1 if hist else int(keep_from)
-        for _ in range(10):
-            rows = self.ex.fetch_funding_rate_history(perp_symbol(coin), since=since, limit=200)
+        # 200시간 칸씩 받는다 (그냥 '언제부터 200개' 면 1시간 정산 코인은 끝 쪽만 와서 중간이 빈다)
+        while since < now_ms:
+            until = since + FUNDING_WINDOW_MS - 1
+            rows = self.ex.fetch_funding_rate_history(perp_symbol(coin), since=since, limit=200,
+                                                      params={"until": until})
             new = sorted((int(r["timestamp"]), float(r["fundingRate"])) for r in rows
-                         if r.get("fundingRate") is not None and int(r["timestamp"]) >= since)
-            if not new:
-                break
+                         if r.get("fundingRate") is not None and since <= int(r["timestamp"]) <= until)
             hist.extend(new)
-            since = new[-1][0] + 1
-            if len(rows) < 200:
-                break
+            since = until + 1
         while hist and hist[0][0] < keep_from:
             hist.pop(0)
         return hist
