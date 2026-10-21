@@ -1,0 +1,8 @@
+# 거래소 API (업비트, 바이비트)
+ccxt>=4.5.0
+# .env 설정 로딩
+python-dotenv>=1.0.0
+# DB (SQLite)
+sqlalchemy>=2.0.0
+# 달러 환율 (USD/KRW)
+yfinance>=0.2.0
