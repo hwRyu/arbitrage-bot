@@ -2,10 +2,10 @@
 시뮬레이션: "이 기간에 지금 전략(.env 설정)을 돌렸다면 얼마 벌었을까?"
 
 실행:
-    python -m kimp.simulate --from 2026-10-01                 # 10월 1일 0시(한국 시간)부터 지금까지
-    python -m kimp.simulate --from 2026-10-01 --to 2026-10-15
-    python -m kimp.simulate --from "2026-10-20 09:00" --coins XRP,SOL
-    python -m kimp.simulate --from 2026-10-01 --verbose       # 진입/청산 하나하나 보기
+    python3 -m kimp.simulate --from 2026-10-01                 # 10월 1일 0시(한국 시간)부터 지금까지
+    python3 -m kimp.simulate --from 2026-10-01 --to 2026-10-15
+    python3 -m kimp.simulate --from "2026-10-20 09:00" --coins XRP,SOL
+    python3 -m kimp.simulate --from 2026-10-01 --verbose       # 진입/청산 하나하나 보기
 
 어떻게 계산하나?
 ------------------------------------------------------------------
@@ -241,6 +241,8 @@ class SimResult:
     trades: List[TradeResult] = field(default_factory=list)
     minutes_simulated: int = 0
     minutes_with_data: Dict[str, int] = field(default_factory=dict)
+    transfer_count: int = 0  # 리밸런싱 송금 횟수 (필요할 때만)
+    transfer_fee_usdt: float = 0.0  # 송금 수수료 합
 
     @property
     def closed(self) -> List[TradeResult]:
@@ -264,7 +266,8 @@ class SimResult:
 
     @property
     def total_net_usdt(self) -> float:
-        return self.realized_usdt + self.unrealized_usdt
+        """총 손익 = 확정 + 평가 − 리밸런싱 송금 수수료"""
+        return self.realized_usdt + self.unrealized_usdt - self.transfer_fee_usdt
 
     @property
     def return_percent(self) -> float:
@@ -330,6 +333,8 @@ def run_simulation(
             progress(i / max(total, 1))
     fxq = fx.get()
     result.fx_end = fxq.rate if fxq else None
+    result.transfer_count = len(engine.transfers)
+    result.transfer_fee_usdt = sum(fee for _, _, fee in engine.transfers)
 
     # 결과 모으기
     with session_factory() as session:
@@ -484,6 +489,7 @@ def format_result(r: SimResult, settings: Settings, verbose: bool = False) -> st
         avg_h = sum(t.hours for t in closed) / len(closed) if closed else 0
         lines.append(f"  평균 보유 {avg_h:.1f}시간 (닫은 거래) / 펀딩비 합계 {sum(t.funding_usdt for t in r.trades):+,.2f} / "
                      f"비용 합계 {sum(t.cost_usdt for t in r.trades):,.2f} USDT")
+    lines.append(f"  리밸런싱 송금 {r.transfer_count}번 (필요할 때만), 수수료 합계 {r.transfer_fee_usdt:,.2f} USDT")
 
     lines.append("")
     lines.append("■ 코인별")

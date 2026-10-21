@@ -5,9 +5,9 @@
 진입 기준을 정할 때, 펀딩비를 전략에 어떻게 쓸지 정할 때 참고하는 용도다.
 
 실행:
-    python -m kimp.report                 # 최근 7일 (DB 는 .env 의 DB_PATH)
-    python -m kimp.report --hours 24      # 최근 24시간
-    python -m kimp.report --db data/kimp.db
+    python3 -m kimp.report                 # 최근 7일 (DB 는 .env 의 DB_PATH)
+    python3 -m kimp.report --hours 24      # 최근 24시간
+    python3 -m kimp.report --db data/kimp.db
 
 보여주는 것 (코인마다)
 ------------------------------------------------------------------
@@ -224,7 +224,7 @@ def format_summary(s: CoinSummary) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """명령줄 실행 (python -m kimp.report)"""
+    """명령줄 실행 (python3 -m kimp.report)"""
     from kimp.config import load_settings
 
     parser = argparse.ArgumentParser(description="김프 기록 분석 리포트")

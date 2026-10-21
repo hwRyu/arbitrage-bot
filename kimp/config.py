@@ -80,10 +80,11 @@ class FeeSettings:
     # 바이비트 USDT 무기한 Taker 수수료율 (시장가 주문). 숏 열 때 1번, 닫을 때 1번
     bybit_taker_fee_rate: float = 0.00055
 
-    # 사이클(진입 → 청산 1번)마다 미리 떼어두는 전송비 (USDT)
-    # 봇은 송금하지 않지만, 리밸런싱하려고 USDT 를 옮길 때 드는 출금 수수료를 사이클 손익에 미리 반영한다.
-    # 예) 출금 수수료 1 USDT 를 매 사이클 한 번 → 1.0 / 다섯 사이클에 한 번 → 0.2 / 전송 안 함 → 0
-    transfer_fee_usdt_per_cycle: float = 1.0
+    # (선택) 사이클(진입 → 청산 1번)마다 손익에서 미리 떼어두는 전송비 (USDT). 기본 0
+    # 송금은 매 거래마다 하는 게 아니라 '잔고가 모자라거나 비율이 많이 깨졌을 때만' 한다.
+    # 그 실제 송금 비용은 REBALANCE_TRANSFER_FEE_USDT 로 송금할 때 한 번씩 뗀다.
+    # 그래도 거래 손익에 미리 나눠서 반영하고 싶을 때만 쓴다. 예) 다섯 사이클에 한 번 송금 → 0.2
+    transfer_fee_usdt_per_cycle: float = 0.0
 
     # "김프가 대략 몇 % 가 되면 청산되나" 를 로그에 보여줄 때만 쓰는 여유분 (%)
     # 실제 판단은 호가창으로 계산한 실제 체결가로 한다.
@@ -205,6 +206,15 @@ class Settings:
     # 양쪽 자본 비율이 목표에서 이 %p 넘게 벗어나면 리밸런싱 알림 (청산 직후 확인)
     rebalance_threshold_percent: float = 10.0
 
+    # 리밸런싱 송금 한 번에 드는 출금 수수료 (USDT). 송금할 때만 한 번 든다 (거래마다 X)
+    rebalance_transfer_fee_usdt: float = 1.0
+
+    # 페이퍼/시뮬레이션: 리밸런싱이 필요할 때 '사용자가 송금했다' 고 치고 자동으로 USDT 를 옮긴다
+    # (페이퍼 잔고는 사용자가 실제로 보낼 수 없으니까). 옮길 때마다 위 수수료를 뗀다.
+    #   송금하는 때: ① 청산 후 비율이 목표에서 REBALANCE_THRESHOLD_PERCENT 넘게 벗어났을 때
+    #               ② 진입하려는데 한쪽 USDT 가 모자랄 때
+    paper_auto_rebalance: bool = True
+
     # ------------------------------------------------------------------
     # 비용
     # ------------------------------------------------------------------
@@ -245,7 +255,7 @@ class Settings:
     log_dir: str = "logs"
 
     # ------------------------------------------------------------------
-    # 시뮬레이션 (python -m kimp.simulate)
+    # 시뮬레이션 (python3 -m kimp.simulate)
     # ------------------------------------------------------------------
     # 과거 캔들 / 환율 / 펀딩비 이력과 시뮬레이션 결과 DB (실시간 봇 DB 와 따로)
     history_db_path: str = "data/history.db"
@@ -254,6 +264,48 @@ class Settings:
     # 실시간 김프 기록에 측정값이 있으면 먼저 쓰고, 없으면 이 값. 호가 한 칸보다는 좁게 잡지 않는다.
     # 코인별로는 .env 에 <코인>_SIM_SPREAD_PERCENT
     sim_default_spread_percent: float = 0.1
+
+    # ------------------------------------------------------------------
+    # 펀딩비 수익 전략 (kimp/carry.py, 김프 전략과 따로 돈다. 기준: docs/carry.md)
+    #   바이비트 현물 매수 + 바이비트 무기한 같은 개수 숏 → 가격 변동은 상쇄, 펀딩비(+)를 숏이 받는다
+    # ------------------------------------------------------------------
+    carry_enabled: bool = True
+    # 대상 코인. 비워두면 자동: 바이비트 현물+무기한 둘 다 있고 거래대금이 충분한 코인 중 펀딩비 높은 순
+    carry_coins: List[str] = field(default_factory=list)
+    # 이 전략용 페이퍼 자본 (USDT, 처음 1번). 김프 전략 자본과 섞이지 않는다. 전부 바이비트에 있다고 본다
+    carry_capital_usdt: float = 1_000.0
+    # 숏 레버리지 (기본 1배, 김프 전략 BYBIT_LEVERAGE 와 같은 기본값). 포지션 금액 N 마다 현물 N + 증거금 N÷레버리지
+    #   1배 → 2N (강제청산 가격 약 2배) / 2배 → 1.5N (약 +49.5%) / 3배 → 1.33N (약 +32.8%)
+    #   레버리지를 올리면 같은 자본으로 더 크게 잡지만 강제청산이 가까워진다
+    carry_leverage: float = 1.0
+    carry_max_positions: int = 3
+    # 포지션 하나 금액 (USDT). 비우면 자동 = 자본 × 사용률 ÷ 최대 개수 ÷ (1 + 1/레버리지)
+    #   예) 1배: 1,000 × 90% ÷ 3 ÷ 2 = 150 USDT / 2배: ÷ 1.5 = 200 USDT
+    carry_position_size_usdt: Optional[float] = None
+    # 진입: 최근 72시간 평균과 최근 24시간 평균이 둘 다 '하루 0.03%' 이상 + 지금 펀딩비율이 + 일 때
+    carry_entry_min_daily_percent: float = 0.03
+    carry_entry_lookback_hours: float = 72.0
+    # 청산: 최근 24시간 평균이 '하루 0%' 아래로 떨어지면 (= 펀딩비를 내기 시작)
+    carry_exit_below_daily_percent: float = 0.0
+    carry_exit_lookback_hours: float = 24.0
+    # 진입 때 선물 매수1호가 ÷ 현물 매도1호가 − 1 이 이 값(%)보다 낮으면 진입 안 함 (들어가자마자 손해가 큼)
+    carry_min_entry_basis_percent: float = -0.1
+    # 바이비트 현물 수수료율 (Taker 0.1%). 선물은 BYBIT_TAKER_FEE_RATE
+    carry_spot_fee_rate: float = 0.001
+    # 강제청산 미리 피하기: 강제청산 가격까지 남은 상승폭이 이 %보다 작으면 양쪽을 같이 정리 (0 = 안 함)
+    #   현물과 숏을 같은 순간에 정리하면 가격 손익은 상쇄되고 수수료만 든다.
+    #   강제청산까지 가면 숏 증거금을 통째로 잃고, 현물은 그 뒤 가격에 팔게 된다.
+    #   예) 2배 → 강제청산 약 +49.5%. 15% 면 가격이 약 +30% 올랐을 때 정리
+    carry_liq_guard_percent: float = 15.0
+    # 청산한 코인은 이 시간 동안 다시 안 들어감 (나왔다 바로 들어가며 수수료만 내는 것 방지)
+    carry_reentry_cooldown_hours: float = 24.0
+    # 자동 선택 때 바이비트 무기한 24시간 거래대금 최소 (USDT)
+    carry_min_volume_usdt: float = 5_000_000.0
+    # 자동 선택 때 펀딩비 기록을 받아볼 후보 수 (지금 펀딩비율 높은 순)
+    carry_universe_max: int = 40
+    carry_scan_interval_sec: float = 60.0
+    # 펀딩비 기록 / 후보 새로 고침 주기 (초). 펀딩비는 1~8시간마다 정산이라 자주 볼 필요 없음
+    carry_refresh_sec: float = 600.0
 
     # ------------------------------------------------------------------
     # 코인별 설정 (load_settings 가 채운다)
@@ -286,6 +338,13 @@ class Settings:
         """
         lev = self.bybit_leverage
         return lev / (lev + 1 + self.bybit_margin_buffer_percent / 100)
+
+    def carry_size_usdt(self) -> float:
+        """펀딩비 전략 포지션 하나 금액 (설정값, 없으면 자동). 예) 1배: 1,000 × 90% ÷ 3 ÷ 2 = 150"""
+        if self.carry_position_size_usdt:
+            return self.carry_position_size_usdt
+        return (self.carry_capital_usdt * self.capital_usage_percent / 100 / self.carry_max_positions
+                / (1 + 1 / self.carry_leverage))
 
 
 def load_settings(env_file: str | None = ".env") -> Settings:
@@ -324,6 +383,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         bybit_mmr=_env_float("BYBIT_MMR", d.bybit_mmr),
         liquidation_warn_percent=_env_float("LIQUIDATION_WARN_PERCENT", d.liquidation_warn_percent),
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
+        rebalance_transfer_fee_usdt=_env_float("REBALANCE_TRANSFER_FEE_USDT", d.rebalance_transfer_fee_usdt),
+        paper_auto_rebalance=_env_bool("PAPER_AUTO_REBALANCE", d.paper_auto_rebalance),
         fees=fees,
         scan_interval_sec=_env_float("SCAN_INTERVAL_SEC", d.scan_interval_sec),
         snapshot_interval_sec=_env_float("SNAPSHOT_INTERVAL_SEC", d.snapshot_interval_sec),
@@ -337,6 +398,24 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         log_dir=_env_str("LOG_DIR", d.log_dir),
         history_db_path=_env_str("HISTORY_DB_PATH", d.history_db_path),
         sim_default_spread_percent=_env_float("SIM_DEFAULT_SPREAD_PERCENT", d.sim_default_spread_percent),
+        carry_enabled=_env_bool("CARRY_ENABLED", d.carry_enabled),
+        carry_coins=_env_list("CARRY_COINS", ""),
+        carry_capital_usdt=_env_float("CARRY_CAPITAL_USDT", d.carry_capital_usdt),
+        carry_leverage=_env_float("CARRY_LEVERAGE", d.carry_leverage),
+        carry_max_positions=_env_int("CARRY_MAX_POSITIONS", d.carry_max_positions),
+        carry_position_size_usdt=_env_optional_float("CARRY_POSITION_SIZE_USDT"),
+        carry_entry_min_daily_percent=_env_float("CARRY_ENTRY_MIN_DAILY_PERCENT", d.carry_entry_min_daily_percent),
+        carry_entry_lookback_hours=_env_float("CARRY_ENTRY_LOOKBACK_HOURS", d.carry_entry_lookback_hours),
+        carry_exit_below_daily_percent=_env_float("CARRY_EXIT_BELOW_DAILY_PERCENT", d.carry_exit_below_daily_percent),
+        carry_exit_lookback_hours=_env_float("CARRY_EXIT_LOOKBACK_HOURS", d.carry_exit_lookback_hours),
+        carry_min_entry_basis_percent=_env_float("CARRY_MIN_ENTRY_BASIS_PERCENT", d.carry_min_entry_basis_percent),
+        carry_spot_fee_rate=_env_float("CARRY_SPOT_FEE_RATE", d.carry_spot_fee_rate),
+        carry_liq_guard_percent=_env_float("CARRY_LIQ_GUARD_PERCENT", d.carry_liq_guard_percent),
+        carry_reentry_cooldown_hours=_env_float("CARRY_REENTRY_COOLDOWN_HOURS", d.carry_reentry_cooldown_hours),
+        carry_min_volume_usdt=_env_float("CARRY_MIN_VOLUME_USDT", d.carry_min_volume_usdt),
+        carry_universe_max=_env_int("CARRY_UNIVERSE_MAX", d.carry_universe_max),
+        carry_scan_interval_sec=_env_float("CARRY_SCAN_INTERVAL_SEC", d.carry_scan_interval_sec),
+        carry_refresh_sec=_env_float("CARRY_REFRESH_SEC", d.carry_refresh_sec),
     )
     # 공통값이 정해진 뒤에 코인별 덮어쓰기 적용 (frozen 이라 replace 로 새로 만든다)
     settings = replace(settings, coin_params=_load_coin_params(settings),
@@ -405,6 +484,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("BYBIT_MMR 는 소수 비율이어야 합니다 (예: 0.005 = 0.5%)")
     if s.liquidation_warn_percent <= 0:
         errors.append("LIQUIDATION_WARN_PERCENT 는 0 보다 커야 합니다")
+    if s.rebalance_transfer_fee_usdt < 0:
+        errors.append("REBALANCE_TRANSFER_FEE_USDT 는 0 이상이어야 합니다")
     if s.rebalance_threshold_percent <= 0:
         errors.append("REBALANCE_THRESHOLD_PERCENT 는 0 보다 커야 합니다")
     if s.reentry_cooldown_sec < 0:
@@ -431,6 +512,19 @@ def validate_settings(s: Settings) -> None:
             errors.append(f"{name}={value} 는 소수 비율이어야 합니다 (예: 0.0005 = 0.05%)")
     if f.transfer_fee_usdt_per_cycle < 0:
         errors.append("TRANSFER_FEE_USDT_PER_CYCLE 는 0 이상이어야 합니다")
+
+    # 펀딩비 전략
+    if s.carry_capital_usdt <= 0:
+        errors.append("CARRY_CAPITAL_USDT 는 0보다 커야 합니다")
+    if s.carry_leverage < 1:
+        errors.append("CARRY_LEVERAGE 는 1 이상이어야 합니다")
+    if s.carry_max_positions < 1:
+        errors.append("CARRY_MAX_POSITIONS 는 1 이상이어야 합니다")
+    if s.carry_exit_below_daily_percent >= s.carry_entry_min_daily_percent:
+        errors.append("CARRY_EXIT_BELOW_DAILY_PERCENT 는 CARRY_ENTRY_MIN_DAILY_PERCENT 보다 작아야 합니다 "
+                      "(같으면 들어가자마자 나왔다 다시 들어가기를 반복)")
+    if not 0 <= s.carry_spot_fee_rate < 0.01:
+        errors.append(f"CARRY_SPOT_FEE_RATE={s.carry_spot_fee_rate} 는 소수 비율이어야 합니다 (예: 0.001 = 0.1%)")
 
     if errors:
         raise ValueError("설정 오류:\n" + "\n".join(f"  - {e}" for e in errors))

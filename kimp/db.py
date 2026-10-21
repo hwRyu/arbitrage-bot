@@ -8,6 +8,8 @@ DB 테이블 정의 (SQLite 파일 하나에 저장)
 - funding_events    : 펀딩비를 받거나 낸 기록
 - premium_snapshots : 김프 기록 (나중에 분석/백테스트용. 코인마다 1분에 1건 정도)
 - paper_balances    : 페이퍼 트레이딩 잔고 (껐다 켜도 유지)
+- carry_positions   : 펀딩비 수익 전략 포지션 (바이비트 현물 + 바이비트 숏, kimp/carry.py)
+- carry_funding     : 펀딩비 전략 포지션이 받거나 낸 펀딩비 기록
 
 시간은 모두 UTC(세계 표준시)로 저장한다. (한국 시간 = UTC + 9시간)
 old 봇은 저장할 때와 읽을 때 시간대가 달라서 날짜가 9시간 밀렸었다.
@@ -44,6 +46,8 @@ class ExitReason:
     TAKE_PROFIT = "TAKE_PROFIT"  # 목표 수익 도달 (익절)
     STOP_LOSS = "STOP_LOSS"  # 손실 한도 도달 (손절)
     LIQUIDATION = "LIQUIDATION"  # 바이비트 숏 강제청산 → 업비트도 즉시 정리
+    FUNDING_DROP = "FUNDING_DROP"  # (펀딩비 전략) 펀딩비가 기준 아래로 떨어져서 정리
+    LIQ_GUARD = "LIQ_GUARD"  # (펀딩비 전략) 강제청산이 가까워서 미리 양쪽 정리
 
 
 class Position(Base):
@@ -179,6 +183,73 @@ class PremiumSnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class CarryPosition(Base):
+    """
+    펀딩비 수익 전략 포지션 하나
+
+    바이비트 현물 qty 개 매수 + 바이비트 무기한 qty 개 숏 (같은 거래소, 같은 개수)
+    → 가격이 올라도 내려도 두 쪽 손익이 서로 상쇄되고, 펀딩비(+)를 숏이 받는다.
+    손익 = 현물 손익 + 숏 손익 + 받은 펀딩비 − 수수료 (모두 USDT)
+    """
+
+    __tablename__ = "carry_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    coin: Mapped[str] = mapped_column(String(20), index=True)
+    status: Mapped[str] = mapped_column(String(10), default=PositionStatus.OPEN, index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    qty: Mapped[float] = mapped_column(Float)  # 현물 개수 = 숏 개수
+    entry_spot_price: Mapped[float] = mapped_column(Float)  # 현물 평균 매수가
+    entry_perp_price: Mapped[float] = mapped_column(Float)  # 숏 평균 진입가
+    entry_spot_fee: Mapped[float] = mapped_column(Float)  # USDT
+    entry_perp_fee: Mapped[float] = mapped_column(Float)  # USDT
+    entry_basis_percent: Mapped[float] = mapped_column(Float)  # 선물가 ÷ 현물가 − 1 (%)
+    entry_daily_funding_percent: Mapped[float] = mapped_column(Float)  # 진입 때 최근 평균 펀딩 (하루 %)
+    leverage: Mapped[float] = mapped_column(Float)
+    margin_usdt: Mapped[float] = mapped_column(Float)  # 숏 증거금
+    liquidation_price: Mapped[float] = mapped_column(Float)
+
+    funding_usdt: Mapped[float] = mapped_column(Float, default=0.0)  # 받은(+)/낸(−) 펀딩비 합
+    funding_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_funding_ms: Mapped[int] = mapped_column(Integer, default=0)  # 마지막으로 반영한 정산 시각
+
+    exit_spot_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    exit_perp_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    exit_spot_fee: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    exit_perp_fee: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    spot_leg_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 현물 (팔 때 − 살 때)
+    perp_leg_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 숏 (진입가 − 청산가) × 개수
+    total_fee_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    net_pnl_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    net_pnl_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 포지션 금액 대비
+
+    @property
+    def notional_usdt(self) -> float:
+        """포지션 금액 = 숏 개수 × 진입가"""
+        return self.qty * self.entry_perp_price
+
+    @property
+    def capital_used_usdt(self) -> float:
+        """이 포지션에 묶인 돈 = 현물 산 돈 + 증거금. 예) 200 USDT, 2배 → 200 + 100 = 300"""
+        return self.qty * self.entry_spot_price + self.margin_usdt
+
+
+class CarryFunding(Base):
+    """펀딩비 전략: 정산 한 번 (+ 받음 / − 냄)"""
+
+    __tablename__ = "carry_funding"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    position_id: Mapped[int] = mapped_column(ForeignKey("carry_positions.id"), index=True)
+    funding_time_ms: Mapped[int] = mapped_column(Integer)
+    rate: Mapped[float] = mapped_column(Float)
+    price: Mapped[float] = mapped_column(Float)
+    amount_usdt: Mapped[float] = mapped_column(Float)
+
+
 class PaperBalance(Base):
     """
     페이퍼 트레이딩 잔고 한 줄
@@ -186,6 +257,7 @@ class PaperBalance(Base):
     asset 이름 규칙: '<거래소>:<자산>'
         upbit:USDT (업비트 USDT), upbit:XRP (업비트 XRP 개수), bybit:USDT (바이비트 남은 USDT, 증거금 제외)
         upbit:KRW 는 매매 중 생기는 자투리 원화 (거의 0)
+        carry:USDT, carry:<코인> 은 펀딩비 전략 잔고 (바이비트, 김프 전략과 따로)
     """
 
     __tablename__ = "paper_balances"

@@ -20,7 +20,9 @@
   바이비트 청산: 증거금 + 숏 손익 - 수수료 가 돌아옴
   강제청산: 증거금을 잃는다 (돌아오는 것 없음)
   펀딩비는 정산 때마다 남은 USDT 에 바로 더하거나 뺀다
-- 전송비는 실제 잔고에서 빠지지 않는다 (봇이 송금을 안 하니까). 손익 계산에만 넣는다.
+- 송금(리밸런싱)은 필요할 때만: transfer() 가 한쪽 USDT 를 다른 쪽으로 옮기고 수수료(기본 1 USDT)를 한 번 뗀다.
+  (페이퍼 잔고는 사용자가 실제로 못 보내니, 엔진이 '사용자가 보냈다' 고 치고 부른다)
+- 사이클당 전송비(TRANSFER_FEE_USDT_PER_CYCLE, 기본 0)는 잔고에서 빠지지 않고 손익 계산에만 넣는다.
 """
 from __future__ import annotations
 
@@ -52,6 +54,21 @@ def coin_key(coin: str) -> str:
 
 class EntryRejected(Exception):
     """진입 못 함 (호가 부족, 잔고 부족, 너무 많이 밀림 등). 아무것도 바뀌지 않았다"""
+
+
+class InsufficientBalance(EntryRejected):
+    """
+    한쪽 USDT 가 모자라서 진입 못 함 → 리밸런싱(송금)하면 들어갈 수도 있다
+
+    Attributes:
+        side: 모자란 쪽 ('upbit' / 'bybit')
+        need_usdt: 그쪽에 필요한 USDT (지금 있는 것 포함한 전체)
+    """
+
+    def __init__(self, message: str, side: str, need_usdt: float):
+        super().__init__(message)
+        self.side = side
+        self.need_usdt = need_usdt
 
 
 @dataclass(frozen=True)
@@ -148,6 +165,26 @@ class PaperBroker:
             session.add(row)
         row.amount += delta
 
+    def transfer(self, session: Session, amount_usdt: float, fee_usdt: float) -> float:
+        """
+        페이퍼 송금: amount 가 + 면 업비트 → 바이비트, − 면 바이비트 → 업비트
+
+        보내는 쪽 '남는 USDT' (코인·증거금으로 묶이지 않은 것) 까지만 보낼 수 있다.
+        받는 쪽에는 출금 수수료를 뺀 만큼 들어간다.
+        예) 업비트 → 바이비트 30 USDT, 수수료 1 → 업비트 −30, 바이비트 +29
+
+        Returns:
+            실제로 보낸 양 (부호 포함). 보낼 게 수수료보다 적으면 0 (안 보냄)
+        """
+        src, dst = (UPBIT_USDT, BYBIT_USDT) if amount_usdt > 0 else (BYBIT_USDT, UPBIT_USDT)
+        send = min(abs(amount_usdt), self.balance(session, src))
+        if send <= fee_usdt:
+            return 0.0
+        self._add(session, src, -send)
+        self._add(session, dst, send - fee_usdt)
+        session.commit()
+        return send if amount_usdt > 0 else -send
+
     def capital_split(self, session: Session, positions: Iterable[Position],
                       quotes: Dict[str, Quote]) -> Tuple[float, float]:
         """
@@ -207,11 +244,13 @@ class PaperBroker:
         upbit_have = self.balance(session, UPBIT_USDT)
         bybit_have = self.balance(session, BYBIT_USDT)
         if upbit_have < plan.usdt_sold:
-            raise EntryRejected(f"업비트 USDT 부족 {upbit_have:,.2f} < {plan.usdt_sold:,.2f} "
-                                f"(업비트로 {plan.usdt_sold - upbit_have:,.2f} USDT 더 필요)")
+            raise InsufficientBalance(f"업비트 USDT 부족 {upbit_have:,.2f} < {plan.usdt_sold:,.2f} "
+                                      f"(업비트로 {plan.usdt_sold - upbit_have:,.2f} USDT 더 필요)",
+                                      side="upbit", need_usdt=plan.usdt_sold)
         if bybit_have < margin + by_fee:
-            raise EntryRejected(f"바이비트 USDT 부족 {bybit_have:,.2f} < {margin + by_fee:,.2f} "
-                                f"(바이비트로 {margin + by_fee - bybit_have:,.2f} USDT 더 필요)")
+            raise InsufficientBalance(f"바이비트 USDT 부족 {bybit_have:,.2f} < {margin + by_fee:,.2f} "
+                                      f"(바이비트로 {margin + by_fee - bybit_have:,.2f} USDT 더 필요)",
+                                      side="bybit", need_usdt=margin + by_fee)
 
         # 전부 괜찮으니 한 번에 저장
         upbit_qty = plan.upbit.filled_qty

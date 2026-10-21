@@ -1,10 +1,11 @@
 """
 봇 실행 진입점
 
-    python main.py
+    python3 main.py
 
 하는 일: 설정 읽기 → 거래소/환율/DB 준비 → 엔진 실행
-전략 기준: docs/concept.md
+  - 김프 헷지 엔진 (메인 스레드). 전략 기준: docs/concept.md
+  - 펀딩비 수익 엔진 (따로 스레드, CARRY_ENABLED=true 일 때). 전략 기준: docs/carry.md
 
 끄기: Ctrl+C. 하던 스캔을 마치고 안전하게 끝난다.
 열린 포지션은 DB 에 남아서 다음에 켜면 이어서 관리한다.
@@ -16,6 +17,7 @@ import signal
 import sys
 import threading
 
+from kimp.carry import CarryBroker, CarryEngine, LiveCarryMarket
 from kimp.config import load_settings
 from kimp.db import make_session_factory
 from kimp.engine import Engine
@@ -112,7 +114,20 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
+    # 펀딩비 수익 전략: 김프 전략과 자본·시세 객체·DB 연결을 따로 써서 다른 스레드로 돌린다
+    carry_thread = None
+    if settings.carry_enabled:
+        try:
+            carry = CarryEngine(settings, LiveCarryMarket(settings), CarryBroker(settings),
+                                make_session_factory(settings.db_path))
+            carry_thread = threading.Thread(target=carry.run, args=(stop_event,), name="carry", daemon=True)
+            carry_thread.start()
+        except Exception:
+            logger.exception("펀딩비 전략 시작 실패 (김프 전략은 계속)")
+
     engine.run(stop_event)
+    if carry_thread:
+        carry_thread.join(timeout=30)
     return 0
 
 

@@ -268,8 +268,8 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         self.assertTrue(any("증거금 약" in m for m in logs.output))
 
     def test_rebalance_alert_at_start(self):
-        """시작할 때 업비트에만 USDT 가 있으면 바이비트로 옮기라고 알린다"""
-        settings = make_settings()
+        """(자동 송금 끔) 시작할 때 업비트에만 USDT 가 있으면 바이비트로 옮기라고 알리기만 한다"""
+        settings = make_settings(paper_auto_rebalance=False)
         sf = make_session_factory(":memory:")
         broker = PaperBroker(FEES, 0.3)
         with sf() as s:
@@ -280,6 +280,61 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         msg = next(m for m in logs.output if "리밸런싱" in m)
         self.assertIn("업비트 → 바이비트", msg)
         self.assertIn(f"{10_000 * (1 - settings.upbit_target_share()):,.2f}", msg)
+
+    def _engine_all_on_upbit(self, **overrides):
+        """시작 자본 10,000 USDT 가 전부 업비트에 있는 엔진"""
+        settings = make_settings(**overrides)
+        market = FakeMarket()
+        sf = make_session_factory(":memory:")
+        broker = PaperBroker(FEES, 0.3)
+        with sf() as s:
+            broker.ensure_initial_balances(s, 10_000, 1.0)
+        return Engine(settings, market, None, broker, sf, ["XRP"]), market, sf, broker
+
+    def test_auto_transfer_at_start_once(self):
+        """(페이퍼 자동 송금) 시작 때 비율이 깨져 있으면 한 번 옮기고 수수료 1 USDT 를 한 번만 뗀다"""
+        engine, _, sf, broker = self._engine_all_on_upbit()
+        engine.startup()
+        move = 10_000 * (1 - engine.s.upbit_target_share())
+        with sf() as s:
+            self.assertAlmostEqual(broker.balance(s, UPBIT_USDT), 10_000 - move, places=6)
+            self.assertAlmostEqual(broker.balance(s, BYBIT_USDT), move - 1.0, places=6)
+        self.assertEqual(len(engine.transfers), 1)
+
+    def test_no_transfer_per_trade(self):
+        """비율이 괜찮으면 거래를 여러 번 해도 송금하지 않는다 (거래마다 송금 X)"""
+        market = FakeMarket()
+        engine, sf, _ = make_engine(make_settings(reentry_cooldown_sec=0), market)
+        for _ in range(3):
+            market.quotes = {"XRP": make_quote(-1.0)}
+            engine.step()
+            market.quotes = {"XRP": make_quote(1.5)}
+            engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).filter(Position.status == PositionStatus.CLOSED).count(), 3)
+        self.assertEqual(engine.transfers, [])
+
+    def test_transfer_when_entry_blocked(self):
+        """진입하려는데 바이비트가 모자라면 그때 송금하고 진입한다"""
+        engine, market, sf, _ = self._engine_all_on_upbit()
+        # 시작 송금은 일부러 건너뛰고(비율 확인 없이) 바로 진입 시도
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).count(), 1)
+        self.assertEqual(len(engine.transfers), 1)
+
+    def test_no_transfer_when_it_cannot_help(self):
+        """맞춰도 자리가 없으면(포지션이 자본에 비해 너무 큼) 송금하지 않는다 → 수수료를 버리지 않음"""
+        market = FakeMarket()
+        # 시작 자본 1,000 → 업비트 435. 포지션 500 은 맞춰도 못 들어감
+        engine, sf, _ = make_engine(make_settings(paper_initial_total_usdt=1_000), market)
+        for _ in range(5):
+            market.quotes = {"XRP": make_quote(-1.0)}
+            engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).count(), 0)
+        self.assertEqual(engine.transfers, [])
 
     def test_auto_position_size(self):
         """POSITION_SIZE_USDT 가 없으면 자본 × 업비트 비율 × 90% ÷ 최대 포지션 수"""

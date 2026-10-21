@@ -38,7 +38,7 @@ Engine.step()  (스캔 한 번)
 
 ### `kimp/config.py` — 설정
 - `.env` 를 읽어 `Settings` 하나로 만든다 (`load_settings()`)
-- `FeeSettings`: 업비트 수수료율(코인·USDT 매매 공통), 바이비트 수수료율, 사이클당 전송비, 표시용 여유분
+- `FeeSettings`: 업비트 수수료율(코인·USDT 매매 공통), 바이비트 수수료율, 사이클당 전송비(선택, 기본 0), 표시용 여유분. 송금 수수료는 `Settings.rebalance_transfer_fee_usdt`, 페이퍼 자동 송금은 `paper_auto_rebalance`
   - `round_trip_trade_fee_percent()`: 업비트 4번 + 바이비트 2번 = 0.31%
 - **코인별 덮어쓰기:** 진입 기준, 목표, 손절, 포지션 크기. `params_for(coin)` 으로 꺼내 쓴다
 - **레버리지 / 자본:** `bybit_leverage`, `bybit_margin_buffer_percent`, `bybit_mmr`, `liquidation_warn_percent`, `rebalance_threshold_percent`
@@ -107,18 +107,39 @@ Engine.step()  (스캔 한 번)
 - 시간은 모두 UTC. 구조가 바뀌면 예전 DB 파일과 맞지 않으니 DB 파일을 지우고 새로 시작 (아직 운영 데이터 없음)
 
 ### `kimp/report.py` — 김프 기록 분석 리포트
-- `python -m kimp.report [--hours 24] [--db 경로]`
+- `python3 -m kimp.report [--hours 24] [--db 경로]`
 - 코인별: 봇 김프 평균·최저·최고 (참고로 사이트식 김프·테더), 진입 김프 분포, 호가 간격 비용, 펀딩비율, 기준별 시간 비율, **김프 구간별 평균 펀딩비율**
 
 ### `kimp/history.py` — 과거 데이터 (시뮬레이션용)
-- 별도 DB `data/history.db`: `candles`(업비트 코인·업비트 USDT·바이비트 1분봉), `fx_hourly`, `funding_history`, `fetched_ranges`, `sim_runs`, `sim_trades`
+- 별도 DB `data/history.db`: `candles`(업비트 코인·업비트 USDT·바이비트 1분봉, 추천 코인 순위용 15분봉은 출처 이름에 `@15m`), `fx_hourly`, `funding_history`, `fetched_ranges`, `sim_runs`, `sim_trades`
 - 모자란 구간만 받고, 거래소 점검 같은 빈 구간은 건너뛰고 계속 받는다. 환율은 주말 대비 7일 앞부터
 
 ### `kimp/simulate.py` — 시뮬레이션
-- `python -m kimp.simulate --from 날짜 [--to 날짜] [--coins ...] [--verbose] [--no-save]`
+- `python3 -m kimp.simulate --from 날짜 [--to 날짜] [--coins ...] [--verbose] [--no-save]`
 - **실시간 봇과 같은 `Engine`, `PaperBroker`** 를 쓴다. `HistoricalMarket`(1분봉 종가 → 호가창, 바이비트 고가 → 강제청산 확인)와 `SimClock`(가짜 시계)만 다르다
 - 호가 간격: 코인은 `decide_spreads()`(실측 → 코인별 설정 → 기본값) + `apply_tick_floor()`(호가 한 칸 하한), USDT/KRW 는 호가 한 칸
 - 결과: 확정 손익과 평가 손익을 나눠서, USDT 로 (원화 참고값 포함)
+
+### `kimp/screen.py` — 추천 코인 순위
+- `python3 -m kimp.screen [--days 30] [--top 20] [--target 0.5] [--coins ...] [--timeframe 15m] [--cycle-hours 24]`
+- 양쪽 거래소에 다 있는 코인 전체 → 24시간 거래대금으로 거르기 → 15분봉으로 봇 김프 기록 만들기
+- 코인마다: 김프 통계(`premium_stats`: 중간값, 범위, 횡보 비율, 추세, 반감기), 지금 호가 간격·물량, 평균 펀딩비율
+- `run_swing()`: 진입 기준 하나로 '한 번에 포지션 1개' 백테스트 (펀딩비 포함, 진입·청산마다 호가 간격 한 번씩 손해)
+- `best_swing()`: 기준 후보(진입 김프 하위 1~50% 지점) 중 가장 좋은 것. 기본 점수 = min(전체 월수익, 앞 2/3 로 고른 기준의 뒤 1/3 월수익), 점수 = 기본 점수 × `cycle_weight()`(반복 주기) × `band_weight()`(띠 이동). 이상김프(±5%)는 맨 아래
+- 끝에 `.env` 에 붙여넣을 `COINS=` 와 코인별 진입 기준을 출력
+
+### `kimp/carry.py` — 펀딩비 수익 전략 (자세히: [carry.md](carry.md))
+- `funding_daily_percent()`, `make_stats()`: 펀딩비 기록 → 72시간·24시간 하루 평균 %
+- `entry_ok()` / `exit_due()`: 진입·청산 규칙
+- `CarryBroker`: 페이퍼 체결과 잔고 (`carry:USDT`, `carry:<코인>`), 펀딩비 반영, 강제청산
+- `CarryEngine`: 펀딩비 반영 → 강제청산·안전장치·청산 → 진입. `main.py` 가 따로 스레드로 돌린다
+- `LiveCarryMarket`: 바이비트 실시간 (전용 ccxt 객체, 후보 자동 선택, 펀딩비 기록 캐시)
+- DB 테이블: `carry_positions`, `carry_funding` (같은 `data/kimp.db`)
+
+### `kimp/carry_backtest.py` — 펀딩비 전략 순위 / 시뮬레이션
+- `HistoricalCarryMarket`: 1시간봉(바이비트 현물 `bybit_spot@1h`, 선물 `bybit@1h`) + 펀딩비 기록 → 같은 `CarryEngine` 으로 돌림
+- `screen`: 코인마다 1,000 USDT 하나로 돌린 결과 순위 (점수 = min(전체, 뒤 절반) 자본 대비 월 수익)
+- `run`: `.env` 설정 그대로 포트폴리오 시뮬레이션
 
 ### `tests/` — 테스트 (인터넷 필요 없음)
 | 파일 | 확인하는 것 |
@@ -129,8 +150,10 @@ Engine.step()  (스캔 한 번)
 | `test_fx.py` | 고정 환율, 갱신 간격, 실패 시 이전 값 |
 | `test_config.py` | 코인별 덮어쓰기, 레버리지 → 자본 비율, 잘못된 값 거부 |
 | `test_report.py` | 리포트 숫자 계산 |
+| `test_carry.py` | 펀딩비 평균, 진입·청산 규칙, 왕복 잔고 = 손익, 가격 변동 상쇄, 강제청산 안전장치, 강제청산, 자동 크기 |
+| `test_screen.py` | 추천 코인 순위: 김프 기록, 반감기, 스윙 백테스트(익절·손절·펀딩비·끝까지 보유), 순위 |
 
-실행: `python -m unittest discover -s tests -v`
+실행: `python3 -m unittest discover -s tests -v`
 
 ## 3. 단위 규칙
 - 수수료율: 소수 (`0.0005` = 0.05%) / 퍼센트: 숫자 그대로 (`1.0` = 1%)

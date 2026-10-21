@@ -189,12 +189,14 @@ class HistoryStore:
 
     # ---------------- 캔들 ----------------
     def ensure_candles(self, source: str, coin: str, start_ms: int, end_ms: int,
-                       fetch: Callable[[int, int], List[list]]) -> int:
+                       fetch: Callable[[int, int], List[list]], step_ms: int = MINUTE_MS) -> int:
         """
-        [start_ms, end_ms) 구간의 1분봉이 저장돼 있게 만든다 (없는 부분만 받음)
+        [start_ms, end_ms) 구간의 캔들이 저장돼 있게 만든다 (없는 부분만 받음)
 
         Args:
+            source: 캔들 출처 이름. 1분봉은 'upbit' 처럼, 다른 간격은 'upbit@15m' 처럼 간격을 붙인다
             fetch: (since_ms, limit) → [[ts, open, high, low, close, volume], ...] 를 돌려주는 함수
+            step_ms: 캔들 간격 (1분봉 60,000 / 15분봉 900,000)
         Returns:
             새로 저장한 캔들 개수
         """
@@ -210,7 +212,7 @@ class HistoryStore:
                 if not rows:
                     # 이 구간엔 캔들이 없다 (거래소 점검, 상장 전 등). 멈추지 말고 건너뛰고 계속 받는다.
                     # (업비트는 "기준 시각 이전 200개" 를 주는 방식이라, 빈 구간을 물으면 그 앞쪽 캔들만 온다)
-                    since += GAP_SKIP_MINUTES * MINUTE_MS
+                    since += GAP_SKIP_MINUTES * step_ms
                     continue
                 with self.sf() as session:
                     for ts, o, h, l, c, v in (r[:6] for r in rows):
@@ -218,7 +220,7 @@ class HistoryStore:
                                              low=float(l), close=float(c), volume=float(v or 0)))
                     session.commit()
                 saved += len(rows)
-                since = int(rows[-1][0]) + MINUTE_MS
+                since = int(rows[-1][0]) + step_ms
             with self.sf() as session:
                 self._mark(session, kind, coin, a, b)
                 session.commit()
@@ -330,12 +332,12 @@ def value_at(series: Sequence[Tuple[int, float]], ts_ms: int) -> Optional[float]
 # ----------------------------------------------------------------------
 # 실제로 받아오는 함수들 (인터넷 필요)
 # ----------------------------------------------------------------------
-def ccxt_candle_fetcher(exchange, symbol: str) -> Callable[[int, int], List[list]]:
-    """ccxt 거래소 객체로 1분봉을 받아오는 함수 만들기 (업비트는 한 번에 200개, 바이비트는 1000개까지)"""
+def ccxt_candle_fetcher(exchange, symbol: str, timeframe: str = "1m") -> Callable[[int, int], List[list]]:
+    """ccxt 거래소 객체로 캔들을 받아오는 함수 만들기 (업비트는 한 번에 200개, 바이비트는 1000개까지)"""
     limit = 200 if exchange.id == "upbit" else 1000
 
     def fetch(since_ms: int, _limit: int) -> List[list]:
-        return exchange.fetch_ohlcv(symbol, "1m", since=since_ms, limit=limit)
+        return exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
 
     return fetch
 

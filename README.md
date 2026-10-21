@@ -1,6 +1,8 @@
 # arbitrage-bot
 
-업비트 원화 마켓 + 바이비트 USDT 무기한 김프 헷지 봇 (현재: 페이퍼 트레이딩 전용)
+업비트 원화 마켓 + 바이비트 USDT 무기한 김프 헷지 봇 + 바이비트 펀딩비 수익 전략 (현재: 페이퍼 트레이딩 전용)
+
+> **명령어와 실행 방법은 [docs/commands.md](docs/commands.md)** 에 모아 두었습니다. 펀딩비 전략은 [docs/carry.md](docs/carry.md).
 
 > **전략의 기준은 [docs/concept.md](docs/concept.md)** 입니다. 다른 문서나 코드와 다르면 그 문서가 맞습니다.
 
@@ -29,7 +31,7 @@
 | 2배 | 60.6 : 39.4 | 약 +49.5% |
 | 3배 | 69.8 : 30.2 | 약 +32.8% |
 
-- **리밸런싱:** 봇은 송금하지 않습니다. 시작할 때와 청산 직후 비율이 목표에서 10%p 넘게 벗어나면 "어느 쪽으로 USDT 몇 개 옮기세요"라고 알립니다.
+- **리밸런싱:** 지금은 봇이 알리고 송금은 직접 합니다(실거래 단계에서 자동 송금 예정). 시작할 때와 청산 직후 비율이 목표에서 10%p 넘게 벗어나면 "어느 쪽으로 USDT 몇 개 옮기세요"라고 알립니다.
 - **강제청산 대비:** 강제청산이 가까워지면(남은 상승폭 15% 미만) 증거금 추가를 긴급 경고합니다. 실제로 닿으면 업비트 코인도 즉시 정리합니다.
 - **포지션 크기:** `POSITION_SIZE_USDT`를 비워두면 자동으로 정합니다(업비트 쪽 자본 × 90% ÷ 최대 포지션 수).
 
@@ -44,29 +46,49 @@ SOL_ENTRY_PREMIUM_THRESHOLD_PERCENT=-1.0    # SOL 만 -1.0%
 ```bash
 pip install -r requirements.txt
 cp .env.example .env      # 코인, 진입 기준, 레버리지, 비용 설정
-python main.py            # Ctrl+C 로 종료 (열린 포지션은 DB 에 남아 다음 실행 때 이어서 관리)
+python3 main.py            # Ctrl+C 로 종료 (열린 포지션은 DB 에 남아 다음 실행 때 이어서 관리)
 ```
 
 ## 시뮬레이션 (과거 기간에 지금 전략 돌려보기)
 ```bash
-python -m kimp.simulate --from 2026-10-01                    # 10/1 0시(한국 시간)부터 지금까지
-python -m kimp.simulate --from 2026-10-01 --to 2026-10-15
-python -m kimp.simulate --from 2026-10-01 --coins XRP,SOL --verbose
+python3 -m kimp.simulate --from 2026-10-01                    # 10/1 0시(한국 시간)부터 지금까지
+python3 -m kimp.simulate --from 2026-10-01 --to 2026-10-15
+python3 -m kimp.simulate --from 2026-10-01 --coins XRP,SOL --verbose
 ```
 - `.env` 설정을 그대로 쓰고, 실시간 봇과 **같은 엔진**으로 1분봉을 따라 돌립니다. 강제청산은 1분봉 고가로 확인합니다.
 - 과거 1분봉(업비트 코인·USDT, 바이비트), 펀딩비 이력, 달러 환율은 `data/history.db`에 저장해 두고 모자란 구간만 받습니다.
 - 결과는 **확정 손익**(닫은 거래)과 **평가 손익**(끝까지 들고 있는 포지션을 마지막에 판다면)을 나눠 보여줍니다.
 - 과거 호가창이 없어서 호가 간격은 가정값이고, 슬리피지는 없다고 봅니다. 대략적인 값으로 보세요.
 
+## 추천 코인 순위 (기회 넓히기)
+```bash
+python3 -m kimp.screen                       # 최근 30일, 전체 코인 중 거래량 상위 80개, 상위 20위
+python3 -m kimp.screen --target 0.5 --top 30 # 목표 순이익을 바꿔서 보기
+python3 -m kimp.screen --coins XRP,SOL,DOGE  # 정한 코인끼리만 비교
+```
+- 코인마다 15분봉으로 봇 김프 움직임(중간값, 범위, 횡보 비율, 추세, 반감기)과 지금 호가 간격, 거래량, 물량, 펀딩비율을 봅니다.
+- 진입 기준을 여러 개 넣어 백테스트해서 가장 잘 된 기준과 월 환산 수익을 보여줍니다. 지난 기간에만 맞춘 기준을 거르려고 **앞 2/3 로 고른 기준을 뒤 1/3 에 써본 결과**와 비교해 작은 값을 점수로 씁니다.
+- 우리 전략에 맞는 건 **같은 띠 안에서 김프가 자주 오르내리는 코인**이라, 점수에 두 가중치를 곱합니다.
+  - 반복 주기(기간 ÷ 왕복 횟수)가 24시간 이하면 1, 48시간이면 0.5, 1주면 0.14
+  - 띠 이동(기간 4등분 구간별 중간값의 최고 − 최저)이 0.3%p 이하면 1, 1.5%p 이상이면 0
+- 김프가 ±5% 를 넘은 적이 있는 코인(입출금 막힘 의심)은 `이상김프`로 맨 아래에 둡니다.
+- 끝에 `.env` 에 붙여넣을 `COINS=` 와 코인별 진입 기준이 나옵니다. 고른 코인은 `kimp.simulate` 로 1분봉 확인을 한 번 더 하세요.
+- 처음 실행은 2~3분 걸리고, 받은 캔들은 `data/history.db` 에 저장돼 다음부터 빠릅니다.
+
 ## 김프 기록 분석
 ```bash
-python -m kimp.report             # 최근 7일
+python3 -m kimp.report             # 최근 7일
 ```
 코인별 봇 김프 수준, 진입 기준별 시간 비율, 김프 구간별 평균 펀딩비율을 보여줍니다.
 
+## 펀딩비 수익 전략 (같이 돌아감)
+- 바이비트 현물 매수 + 같은 개수 숏 → 가격 변동은 상쇄, 펀딩비(+)를 숏이 받습니다. 자본은 `CARRY_CAPITAL_USDT` 로 따로.
+- `python3 -m kimp.carry_backtest screen` / `run --from 날짜` 로 코인 순위와 과거 결과를 봅니다.
+- 2026-09~10 확인 결과는 본전 근처입니다. 자세한 건 [docs/carry.md](docs/carry.md).
+
 ## 테스트
 ```bash
-python -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v
 ```
 
 ## 구조
@@ -83,6 +105,9 @@ python -m unittest discover -s tests -v
 | `kimp/report.py` | 김프 기록 분석 리포트 |
 | `kimp/history.py` | 과거 데이터 받기와 저장 (시뮬레이션용) |
 | `kimp/simulate.py` | 과거 기간 시뮬레이션 |
+| `kimp/screen.py` | 추천 코인 순위 (최근 김프 움직임 + 호가·거래량·펀딩 → 백테스트 점수) |
+| `kimp/carry.py` | 펀딩비 수익 전략 (바이비트 현물 + 숏): 엔진, 페이퍼 체결, 실시간 시세 |
+| `kimp/carry_backtest.py` | 펀딩비 전략 코인 순위 / 과거 시뮬레이션 |
 
 - 파일별 자세한 역할: [docs/architecture.md](docs/architecture.md)
 - 이전 버전 분석: [docs/old-analysis.md](docs/old-analysis.md)

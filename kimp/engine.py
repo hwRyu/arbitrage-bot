@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -34,7 +34,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from kimp.config import Settings
 from kimp.db import ExitReason, FundingEvent, Position, PremiumSnapshot
 from kimp.market_data import MarketData
-from kimp.paper_broker import BYBIT_USDT, UPBIT_USDT, EntryRejected, ExitValuation, PaperBroker
+from kimp.paper_broker import (
+    BYBIT_USDT,
+    UPBIT_USDT,
+    EntryRejected,
+    ExitValuation,
+    InsufficientBalance,
+    PaperBroker,
+)
 from kimp.pnl import estimated_exit_premium, margin_to_add_usdt
 from kimp.premium import Quote
 
@@ -83,6 +90,8 @@ class Engine:
         self._last_funding_check: Dict[str, float] = {}
         self._last_log: Dict[str, float] = {}
         self._reentry_allowed_at: Dict[str, float] = {}
+        # 페이퍼 자동 송금 기록 [(시각 초, 보낸 양 USDT(+ 업비트→바이비트), 수수료)]
+        self.transfers: List[Tuple[float, float, float]] = []
         self._last_status_log = 0.0
 
     # ------------------------------------------------------------------
@@ -280,15 +289,23 @@ class Engine:
     # 자본 비율 / 리밸런싱
     # ------------------------------------------------------------------
     def _check_rebalance(self, session: Session, positions: List[Position], quotes: Dict[str, Quote],
-                         when: str) -> Optional[float]:
+                         when: str, need: Optional[InsufficientBalance] = None) -> Optional[float]:
         """
-        양쪽 자본 비율을 목표와 비교해서, 많이 벗어났으면 옮길 USDT 를 알려준다 (송금은 사용자)
+        양쪽 자본 비율을 목표와 비교해서, 많이 벗어났으면 옮길 USDT 를 알려준다
+
+        송금은 '필요할 때만' 한다 (거래마다 하는 게 아님):
+          - 청산 후 비율이 목표에서 10%p 넘게 벗어났을 때
+          - 진입하려는데 한쪽이 모자랄 때 (need: 벗어난 정도와 상관없이 맞춘다)
+            단, 목표 비율로 맞춰도 여전히 모자라면 보내지 않는다 (수수료만 버림)
+            예) 250 USDT, 업비트 몫 108, 포지션 50 × 3개 → 3번째는 맞춰도 못 들어감 → 송금 안 함
+        실거래: 지금은 알림만 하고 송금은 사용자가 한다 (실주문 단계에서 자동 송금 예정, concept.md 11번).
+        페이퍼/시뮬레이션은 PAPER_AUTO_REBALANCE 이면 사용자가 보냈다고 치고 옮긴다 (수수료 1번).
 
         예) 목표 43.5 : 56.5, 지금 업비트 5,800 / 바이비트 4,200 (58 : 42) → 14.5%p 벗어남
             → "업비트 → 바이비트로 USDT 약 1,450 개 옮기세요"
 
         Returns:
-            옮겨야 할 양 (USDT, + 면 업비트 → 바이비트). 기준 안이면 None
+            옮겨야 할 양 (USDT, + 면 업비트 → 바이비트). 맞출 필요 없으면 None
         """
         upbit, bybit = self.broker.capital_split(session, positions, quotes)
         total = upbit + bybit
@@ -297,10 +314,31 @@ class Engine:
         target = self.s.upbit_target_share()
         share = upbit / total
         gap = (share - target) * 100  # %p
-        if abs(gap) <= self.s.rebalance_threshold_percent:
+        if need is None and abs(gap) <= self.s.rebalance_threshold_percent:
             return None
         move = (share - target) * total
         direction = "업비트 → 바이비트" if move > 0 else "바이비트 → 업비트"
+        if need is not None:
+            # 모자란 쪽으로 보내는 방향이고, 보내고 나면 진입할 만큼 되는지 확인
+            to_short_side = (move > 0) == (need.side == "bybit")
+            have = self.broker.balance(session, BYBIT_USDT if need.side == "bybit" else UPBIT_USDT)
+            if not to_short_side or have + abs(move) - self.s.rebalance_transfer_fee_usdt < need.need_usdt:
+                self._log_throttled(
+                    f"rebalance-useless", logging.INFO,
+                    "진입 보류: 양쪽 비율을 맞춰도 자리가 없음 (포지션 크기 × 최대 개수가 자본에 비해 큼) → 송금 안 함",
+                )
+                return None
+        if self.s.paper_auto_rebalance:
+            fee = self.s.rebalance_transfer_fee_usdt
+            sent = self.broker.transfer(session, move, fee)
+            if sent:
+                self.transfers.append((self._clock(), sent, fee))
+                logger.warning(
+                    "[송금 · 페이퍼 · %s] %s로 USDT %s 개 (수수료 %s) | 전: 업비트 %s / 바이비트 %s (%.1f : %.1f, 목표 %.1f : %.1f)",
+                    when, direction, f"{abs(sent):,.2f}", f"{fee:g}", f"{upbit:,.2f}", f"{bybit:,.2f}",
+                    share * 100, (1 - share) * 100, target * 100, (1 - target) * 100,
+                )
+            return sent or None
         self._log_throttled(
             f"rebalance-{when}", logging.WARNING,
             f"[리밸런싱 필요 · {when}] 업비트 {upbit:,.2f} / 바이비트 {bybit:,.2f} USDT "
@@ -365,7 +403,15 @@ class Engine:
         for _margin, coin, bybit_qty, quote in sorted(candidates)[:slots]:
             params = self.s.params_for(coin)
             try:
-                pos = self.broker.open_hedge(session, quote, bybit_qty)
+                try:
+                    pos = self.broker.open_hedge(session, quote, bybit_qty)
+                except InsufficientBalance as exc:
+                    # 한쪽이 모자람 → 리밸런싱 (페이퍼는 자동 송금 후 한 번 더 시도, 실거래는 알림만)
+                    self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
+                    if not self._check_rebalance(session, list(open_positions.values()), quotes,
+                                                 when="진입 막힘", need=exc) or not self.s.paper_auto_rebalance:
+                        continue
+                    pos = self.broker.open_hedge(session, quote, bybit_qty)
             except EntryRejected as exc:
                 self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
                 continue
