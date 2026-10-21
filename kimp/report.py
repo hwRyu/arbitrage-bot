@@ -11,7 +11,7 @@
 
 보여주는 것 (코인마다)
 ------------------------------------------------------------------
-1) 김프 수준: 평균 / 최저 / 최고, 테더 몫과 코인 몫 평균
+1) 봇 김프(코인 몫, 업비트 USDT 기준) 평균 / 최저 / 최고 + 참고로 사이트식 김프·테더 프리미엄 평균
 2) 진입 김프 분포: "하위 5% / 25% / 50% 일 때 진입 김프가 몇 % 였나"
    → 예) 하위 5% 가 -0.60% 면, 기록된 시간 중 5% 정도는 진입 김프가 -0.60% 이하였다는 뜻
 3) 호가 간격 비용: 진입 김프 - 청산 김프 평균 (바로 들어갔다 바로 나오면 이만큼 손해)
@@ -54,7 +54,7 @@ class Row:
     entry_premium: float
     exit_premium: float
     tether_premium: Optional[float]
-    coin_premium: Optional[float]
+    site_premium: Optional[float]
     funding_rate: Optional[float]
 
 
@@ -86,7 +86,7 @@ class CoinSummary:
     mid_min: float
     mid_max: float
     tether_avg: Optional[float]
-    coin_avg: Optional[float]
+    site_avg: Optional[float]
     entry_p5: float
     entry_p25: float
     entry_p50: float
@@ -154,7 +154,7 @@ def summarize_coin(coin: str, rows: Sequence[Row],
         mid_min=min(mids),
         mid_max=max(mids),
         tether_avg=_avg([r.tether_premium for r in rows if r.tether_premium is not None]),
-        coin_avg=_avg([r.coin_premium for r in rows if r.coin_premium is not None]),
+        site_avg=_avg([r.site_premium for r in rows if r.site_premium is not None]),
         entry_p5=_percentile(entries, 5),
         entry_p25=_percentile(entries, 25),
         entry_p50=_percentile(entries, 50),
@@ -185,7 +185,7 @@ def load_rows(db_path: str, hours: float) -> Tuple[Dict[str, List[Row]], Optiona
             by_coin.setdefault(s.coin, []).append(Row(
                 coin=s.coin, mid_premium=s.mid_premium, entry_premium=s.entry_premium_top,
                 exit_premium=s.exit_premium_top, tether_premium=s.tether_premium,
-                coin_premium=s.coin_premium, funding_rate=s.funding_rate,
+                site_premium=s.site_premium, funding_rate=s.funding_rate,
             ))
             first = first or s.created_at
             last = s.created_at
@@ -206,8 +206,8 @@ def format_summary(s: CoinSummary) -> str:
     """코인 하나의 결과를 읽기 쉬운 글로 만든다"""
     lines = [
         f"■ {s.coin}  (기록 {s.count:,}건)",
-        f"  김프(가운데 가격): 평균 {_pct(s.mid_avg)}  최저 {_pct(s.mid_min)}  최고 {_pct(s.mid_max)}",
-        f"    └ 평균 테더 몫 {_pct(s.tether_avg)} / 코인 몫 {_pct(s.coin_avg)}",
+        f"  봇 김프(코인 몫, 가운데 가격): 평균 {_pct(s.mid_avg)}  최저 {_pct(s.mid_min)}  최고 {_pct(s.mid_max)}",
+        f"    └ 참고: 평균 사이트식 김프 {_pct(s.site_avg)} / 테더 프리미엄 {_pct(s.tether_avg)}",
         f"  진입 김프 분포: 하위 5% {_pct(s.entry_p5)} / 하위 25% {_pct(s.entry_p25)} / 중간값 {_pct(s.entry_p50)}",
         f"  호가 간격 비용(진입 김프 - 청산 김프): 평균 {s.spread_cost_avg:.3f}%p",
         f"  펀딩비율: 평균 {_rate(s.funding_avg)}  (마이너스 = 숏이 냄, 비율 "
@@ -243,7 +243,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     kst = timedelta(hours=9)
     print(f"김프 기록 분석 (DB: {db_path})")
     print(f"기간: {(first + kst):%Y-%m-%d %H:%M} ~ {(last + kst):%Y-%m-%d %H:%M} (한국 시간)")
-    print("김프 = 달러 환율 기준 (테더 포함). 우리는 숏이라 펀딩비율 + 면 받고, - 면 낸다.")
+    print("봇 김프 = 업비트 USDT 가격 기준 코인 몫 (테더·환율 제외). 우리는 숏이라 펀딩비율 + 면 받고, - 면 낸다.")
     print("주의: 기록 기간이 짧으면 결과가 치우칠 수 있다. 최소 며칠은 쌓인 뒤에 판단할 것.\n")
     for coin in sorted(by_coin):
         print(format_summary(summarize_coin(coin, by_coin[coin])))

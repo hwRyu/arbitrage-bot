@@ -43,24 +43,26 @@ def main() -> int:
         return 2
 
     f = settings.fees
+    share = settings.upbit_target_share()
+    size_text = (f"{settings.position_size_usdt:,.0f} USDT 고정" if settings.position_size_usdt
+                 else f"자동 (업비트 자본 × {settings.capital_usage_percent:.0f}% ÷ {settings.max_open_positions})")
     logger.info("=" * 70)
-    logger.info("김프 헷지 봇 시작 (페이퍼 트레이딩) — 김프는 달러 환율 기준(테더 포함), 손익은 원화 기준")
-    logger.info(
-        "공통값: 진입 김프 ≤ %+.2f%% | 목표 순이익 %.2f%% | 손절 %.2f%% | 포지션 %.0f USDT | 최대 %d개",
-        settings.entry_premium_threshold_percent, settings.target_net_profit_percent,
-        settings.stop_loss_percent, settings.position_size_usdt, settings.max_open_positions,
-    )
-    logger.info(
-        "비용: 업비트 %.3f%% · 바이비트 %.3f%% (왕복 %.3f%%) · 전송 %.2f USDT/사이클",
-        f.upbit_trade_fee_rate * 100, f.bybit_taker_fee_rate * 100,
-        f.round_trip_trade_fee_percent(), f.transfer_fee_usdt_per_cycle,
-    )
+    logger.info("김프 헷지 봇 시작 (페이퍼 트레이딩) — 업비트·바이비트 모두 USDT 자본, "
+                "김프는 업비트 USDT 가격 기준(코인 몫), 손익은 USDT 기준")
+    logger.info("공통값: 진입 김프 ≤ %+.2f%% | 목표 순이익 %.2f%% | 손절 %.2f%% | 포지션 크기 %s | 최대 %d개",
+                settings.entry_premium_threshold_percent, settings.target_net_profit_percent,
+                settings.stop_loss_percent, size_text, settings.max_open_positions)
+    logger.info("바이비트 레버리지 %.0f배 → 목표 자본 비율 업비트 %.1f : 바이비트 %.1f (여유분 %.0f%%) | "
+                "강제청산 경고 %.0f%% 이내 | 리밸런싱 알림 %.0f%%p 이탈",
+                settings.bybit_leverage, share * 100, (1 - share) * 100, settings.bybit_margin_buffer_percent,
+                settings.liquidation_warn_percent, settings.rebalance_threshold_percent)
+    logger.info("비용: 업비트 %.3f%% (코인·USDT 매매 각각) · 바이비트 %.3f%% (왕복 %.2f%%) · 전송 %.2f USDT/사이클",
+                f.upbit_trade_fee_rate * 100, f.bybit_taker_fee_rate * 100,
+                f.round_trip_trade_fee_percent(), f.transfer_fee_usdt_per_cycle)
     if settings.fixed_usd_krw:
-        logger.info("달러 환율: %.2f원으로 고정 (FIXED_USD_KRW)", settings.fixed_usd_krw)
+        logger.info("달러 환율(표시용): %.2f원으로 고정", settings.fixed_usd_krw)
     else:
-        logger.info("달러 환율: yfinance 에서 %.0f초마다 갱신, %.0f분 넘게 갱신 안 되면 새 진입 중지",
-                    settings.fx_refresh_sec, settings.fx_max_stale_sec / 60)
-    # 설정 읽다가 발견한 경고 (COINS 에 없는 코인의 개별 설정 등)
+        logger.info("달러 환율(표시용): yfinance 에서 %.0f초마다. 못 받아도 매매에는 영향 없음", settings.fx_refresh_sec)
     for warning in settings.config_warnings:
         logger.warning(warning)
 
@@ -78,27 +80,23 @@ def main() -> int:
         def mark(name: str) -> str:
             return "*" if name in p.overridden else " "
 
-        logger.info(
-            "  %-6s 진입 ≤ %+6.2f%%%s | 목표 %5.2f%%%s | 손절 %6.2f%%%s | 포지션 %7.0f USDT%s",
-            coin,
-            p.entry_premium_threshold_percent, mark("entry_premium_threshold_percent"),
-            p.target_net_profit_percent, mark("target_net_profit_percent"),
-            p.stop_loss_percent, mark("stop_loss_percent"),
-            p.position_size_usdt, mark("position_size_usdt"),
-        )
+        size = f"{p.position_size_usdt:7.0f} USDT" if p.position_size_usdt else "   자동     "
+        logger.info("  %-6s 진입 ≤ %+6.2f%%%s | 목표 %5.2f%%%s | 손절 %6.2f%%%s | 포지션 %s%s", coin,
+                    p.entry_premium_threshold_percent, mark("entry_premium_threshold_percent"),
+                    p.target_net_profit_percent, mark("target_net_profit_percent"),
+                    p.stop_loss_percent, mark("stop_loss_percent"), size, mark("position_size_usdt"))
     logger.info("=" * 70)
 
-    # 달러 환율을 한 번 미리 받아본다. 실패해도 봇은 켜지고, 받아질 때까지 스캔만 쉰다.
-    fx = FxProvider(settings.fx_refresh_sec, settings.fx_max_stale_sec, settings.fixed_usd_krw)
-    first = fx.get()
-    if first is None:
-        logger.warning("달러 환율을 아직 못 받았습니다. 받아질 때까지 매매하지 않습니다.")
+    # 달러 환율은 표시용. 못 받아도 매매는 한다
+    fx = FxProvider(settings.fx_refresh_sec, fixed_rate=settings.fixed_usd_krw)
+    fx.get()
 
     engine = Engine(
         settings=settings,
         market=market,
         fx=fx,
-        broker=PaperBroker(settings.fees, settings.max_slippage_percent),
+        broker=PaperBroker(settings.fees, settings.max_slippage_percent,
+                           leverage=settings.bybit_leverage, mmr=settings.bybit_mmr),
         session_factory=make_session_factory(settings.db_path),
         coins=coins,
     )

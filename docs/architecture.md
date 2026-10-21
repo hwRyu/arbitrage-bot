@@ -10,134 +10,129 @@
 main.py
  ├─ load_settings()      .env 읽기 + 검사
  ├─ MarketData           거래소 마켓 정보 1번 받기, 양쪽에 다 있는 코인만 남기기
- ├─ FxProvider           달러 환율 공급기 (처음에 1번 받아봄)
- ├─ PaperBroker          가짜 체결 + 잔고
+ ├─ FxProvider           달러 환율 (표시용. 못 받아도 매매에 영향 없음)
+ ├─ PaperBroker          가짜 체결 + 잔고 (레버리지, 유지증거금률)
  ├─ make_session_factory DB 파일 열기
  └─ Engine.run()         Ctrl+C 전까지 SCAN_INTERVAL_SEC 마다 step() 반복
+      └─ startup()       페이퍼 시작 자본을 목표 비율대로 분배, 자본 비율 확인 (리밸런싱 알림)
 
 Engine.step()  (스캔 한 번)
- 1. FxProvider.get()                  달러 환율
-      없음 → 이번 스캔 쉼 / 오래됨 → 새 진입만 막음
- 2. MarketData.fetch_quotes(코인, 환율) 모든 코인 호가를 같은 순간으로 → Quote
- 3. 가진 포지션마다
-      _update_funding()               펀딩비 정산 시각이 지났으면 1번 반영
-      _manage_position()              "지금 청산하면?" 계산 → 목표 넘으면 익절, 손절선 아래면 손절
- 4. _try_entries()                    김프 ≤ 기준인 코인 진입 (기준보다 더 낮은 코인부터)
- 5. _save_snapshots() / _log_status() 김프 기록, 현황 한 줄 로그
+ 1. MarketData.fetch_quotes(코인, 환율)  업비트 코인 + 업비트 USDT/KRW + 바이비트 호가를 같은 순간으로 → Quote
+ 2. 가진 포지션마다
+      _update_funding()                  지난 펀딩비 정산 반영, 다음 정산 정보 받기
+      _check_liquidation()               강제청산 가격 도달 → 업비트도 즉시 정리 / 가까우면 증거금 추가 경고
+      _manage_position()                 "지금 청산하면?" → 목표 넘으면 익절, 손절선 아래면 손절
+ 3. 청산이 있었으면 _check_rebalance()    양쪽 비율이 목표에서 10%p 넘게 벗어나면 옮길 USDT 알림
+ 4. _try_entries()                       김프 ≤ 기준인 코인 진입 (크기: 설정값 또는 자동)
+ 5. _save_snapshots() / _log_status()    김프 기록, 현황 한 줄 로그
 ```
 
-파일끼리 부르는 방향: `engine → paper_broker / market_data / fx → pnl / premium → config`.
+파일끼리 부르는 방향: `engine → paper_broker / market_data → pnl / premium → config`.
 `premium.py`, `pnl.py`, `fx.py` 는 인터넷이나 DB 없이 계산만 해서 테스트하기 쉽다.
 
 ## 2. 파일별 역할
 
 ### `main.py` — 시작점
-- 설정을 읽고 준비한 다음 엔진을 돌린다.
-- `PAPER_TRADING=false` 면 거부한다. (실주문 코드가 없어서)
-- 시작할 때 보여주는 것: 공통 설정, 비용, 환율 설정, 코인별 적용값(따로 정한 값에 `*`), 설정 경고.
-- Ctrl+C 를 누르면 하던 스캔을 마치고 끝난다.
+- 설정 읽기 → 준비 → 엔진 실행. `PAPER_TRADING=false` 는 거부 (실주문 코드 없음)
+- 시작할 때 보여주는 것: 공통 설정, 레버리지와 목표 자본 비율, 비용, 코인별 적용값(따로 정한 값에 `*`), 설정 경고
 
 ### `kimp/config.py` — 설정
-- `.env` 를 읽어서 `Settings` 하나로 만든다. (`load_settings()`)
-- `FeeSettings`: 손익에 들어가는 비용 (업비트 수수료율, 바이비트 수수료율, 사이클당 전송비, 표시용 슬리피지 여유)
-- **코인별 덮어쓰기:** 진입 기준, 목표, 손절, 포지션 규모는 공통값이 기본이다. `.env` 에 `<코인>_<항목>` (예: `SOL_ENTRY_PREMIUM_THRESHOLD_PERCENT=-1.0`) 을 넣으면 그 코인만 바뀐다.
-  - `Settings.params_for(coin)`: 그 코인에 실제로 쓸 값. 엔진은 이것만 쓴다.
-  - `COINS` 에 없는 코인의 설정 키가 있으면 경고한다. (오타 방지)
-- **달러 환율 설정:** `FX_REFRESH_SEC`(갱신 간격), `FX_MAX_STALE_SEC`(이보다 오래되면 새 진입 중지), `FIXED_USD_KRW`(고정값)
-- `validate_settings()`: 잘못된 값을 시작할 때 한 번에 모아서 알려준다. 수수료를 % 로 잘못 넣는 실수(0.05 vs 0.0005)도 잡는다.
-- 모든 설정 설명은 [.env.example](../.env.example) 에 있다.
-
-### `kimp/fx.py` — 달러 환율
-- `FxProvider.get()` → `FxQuote(rate, age_sec, is_stale)`
-- yfinance `KRW=X` 에서 `FX_REFRESH_SEC` 마다 받아온다.
-- 실패하면 마지막 성공 값을 쓴다. 너무 오래되면 `is_stale=True` 로 알려준다.
-- 한 번도 못 받았으면 `None` 이다. 이때 엔진은 그 스캔을 쉰다.
-- `FIXED_USD_KRW` 가 있으면 조회 없이 그 값을 쓴다.
+- `.env` 를 읽어 `Settings` 하나로 만든다 (`load_settings()`)
+- `FeeSettings`: 업비트 수수료율(코인·USDT 매매 공통), 바이비트 수수료율, 사이클당 전송비, 표시용 여유분
+  - `round_trip_trade_fee_percent()`: 업비트 4번 + 바이비트 2번 = 0.31%
+- **코인별 덮어쓰기:** 진입 기준, 목표, 손절, 포지션 크기. `params_for(coin)` 으로 꺼내 쓴다
+- **레버리지 / 자본:** `bybit_leverage`, `bybit_margin_buffer_percent`, `bybit_mmr`, `liquidation_warn_percent`, `rebalance_threshold_percent`
+  - `upbit_target_share()`: 업비트 목표 비율 = 레버리지 ÷ (레버리지 + 1 + 여유분)
+- **포지션 크기:** `position_size_usdt` (None 이면 자동), `capital_usage_percent`
+- `validate_settings()`: 이상한 값을 한 번에 모아서 알려준다
 
 ### `kimp/premium.py` — 김프와 체결 계산
-- `premium_percent(업비트 원, 바이비트 USDT, 달러 환율)`: 김프(%)
-- `tether_premium_percent(업비트 USDT 가격, 달러 환율)`: 테더 프리미엄 (표시용)
-- `coin_premium_percent(전체 김프, 테더 몫)`: 테더 몫을 뺀 코인 몫 김프 (분석용). `Quote.split_premium()` 으로 한 번에 나눈다
-- `estimate_fill()`: **개수를 정해서** 시장가 주문할 때 평균 체결가 (바이비트 숏 열기/닫기, 업비트 팔기)
-- `estimate_fill_by_cost()`: **금액을 정해서** 시장가로 살 때 체결 개수 (업비트 사기)
-- `Quote`: 코인 하나의 한 순간 시세 (업비트 호가, 바이비트 호가, 달러 환율, 업비트 USDT 가격)
-  - `mid_premium`: 가운데 가격 김프 (사이트 숫자와 비슷)
+- `premium_percent(업비트 원, 바이비트 USDT, 원/USDT)`: 김프(%). 봇은 세 번째에 업비트 USDT 가격을 넣는다
+- `tether_premium_percent()`: 테더 프리미엄 (표시용)
+- `estimate_fill()` (개수 지정) / `estimate_fill_by_cost()` (금액 지정): 호가창을 긁은 평균가
+- `Quote`: 코인 하나의 한 순간 시세 (업비트 코인, 바이비트, **업비트 USDT/KRW**, 달러 환율, 시뮬레이션용 바이비트 고가)
+  - `mid_premium`: 봇 김프 (코인 몫, 가운데 가격)
   - `entry_premium_top` / `exit_premium_top`: 맨 앞 호가로 계산한 진입·청산 김프
-  - `entry_fills(bybit_qty)`: 바이비트 숏 개수만큼 bids 를 긁고, 그 금액 × 달러 환율 원어치만큼 업비트 asks 를 긁는다 (금액 헷징)
-  - `exit_fills(upbit_qty, bybit_qty)`: 가진 개수만큼 청산할 때
-  - `entry_premium_for(bybit_qty)`: **진입 판단 기준값**. 실제 체결가로 계산한 진입 김프
+  - `site_premium` / `tether_premium`: 사이트식 김프, 테더 프리미엄 (표시용)
+  - `entry_plan(바이비트 개수, 수수료율)` → `EntryPlan`: 바이비트 숏 → 그 금액만큼 USDT 매도 → 받은 원화로 코인 매수
+  - `exit_plan(업비트 개수, 바이비트 개수, 수수료율)` → `ExitPlan`: 코인 매도 → 받은 원화로 USDT 매수, 숏 닫기
+  - `entry_premium_for()`: **진입 판단 기준값** (실제 체결가로 계산한 진입 김프)
 
-### `kimp/pnl.py` — 손익 (원화 기준)
-- `EntryLegs` / `ExitLegs`: 진입·청산 값 (양쪽 개수, 가격, 달러 환율, 수수료)
+### `kimp/pnl.py` — 손익 (USDT)
+- `EntryLegs` / `ExitLegs`: 판·되산 USDT 개수와 가격, 코인 개수와 가격, 바이비트 값, 수수료
 - `compute_pnl()` → `PnLBreakdown`
-  - 업비트 손익(원) + 바이비트 손익(USDT × 청산 때 환율) + 펀딩비(원 환산) − 비용 = 순손익(원)
-  - 수익률 분모: 바이비트 숏 금액 × 진입 때 환율
-- `estimated_exit_premium()`: "김프가 대략 몇 % 가 되면 목표 수익인지" 추정 (로그용)
+  - 업비트 = 되산 USDT − 판 USDT (수수료·호가 간격 포함 실제 결과). 보여주기용으로 수수료를 따로 뺀다
+  - 바이비트 = 숏 손익 − 수수료 (강제청산이면 −증거금)
+  - 순손익 = 업비트 + 바이비트 + 펀딩비 − 전송비
+- `liquidation_price()`: 숏 강제청산 가격 ≈ 진입가 × (1 + 1/레버리지 − 유지증거금률)
+- `margin_to_add_usdt()`: 강제청산까지 거리를 되돌리려면 넣어야 할 증거금
+- `estimated_exit_premium()`: "김프가 대략 몇 % 가 되면 목표인지" (로그용)
 
 ### `kimp/market_data.py` — 거래소 시세 (ccxt)
-- `MarketData`: 거래소 연결과 마켓 정보를 처음에 한 번만 준비한다.
-  - `filter_supported()`: 양쪽에 다 있는 코인만 남긴다.
-  - `fetch_quotes(coins, fx_krw)`: 업비트는 모든 코인과 USDT 호가를 요청 1번에, 바이비트는 코인마다 받아서 `Quote` 를 만든다. 업비트 USDT 가격이 없어도 진행한다. (표시용이라서)
-  - `round_qty()` / `min_qty()`: 바이비트 주문 단위로 내림, 최소 주문 개수
-  - `fetch_funding()`: 펀딩비율, 다음 정산 시각, 기준 가격
-- API 키가 필요 없는 공개 시세만 쓴다.
+- `fetch_quotes(coins, fx_krw)`: 업비트 코인 + USDT/KRW 호가를 요청 1번에, 바이비트는 코인마다. **USDT/KRW 호가가 없으면 그 스캔은 건너뛴다** (김프 계산 기준이라서)
+- `filter_supported()`, `round_qty()`, `min_qty()`, `fetch_funding()`
 
 ### `kimp/paper_broker.py` — 가짜 체결과 잔고
-- `open_hedge()`: 바이비트 숏 + 같은 금액만큼 업비트 매수. 양쪽 다 되는지(호가, 잔고, 밀림)를 먼저 계산하고, 둘 다 될 때만 한 번에 저장한다. 안 되면 `EntryRejected` 를 내고 아무것도 바꾸지 않는다.
-- `value_exit()`: "지금 청산하면 얼마?" (아무것도 안 바꿈)
-- `close_hedge()`: 그 계산대로 양쪽 청산하고 손익을 저장한다.
-- `apply_funding()`: 펀딩비 1번 반영 (숏이라 비율이 + 면 받음)
-- 잔고 이름: `upbit:KRW`, `upbit:<코인>`, `bybit:USDT`
-- 전송비는 실제 잔고에서는 안 빠지고 손익 계산에만 들어간다.
+- 잔고 이름: `upbit:USDT`, `upbit:<코인>`, `upbit:KRW`(자투리), `bybit:USDT`(증거금 제외 남은 돈)
+- `ensure_initial_balances(총액, 업비트 비율)`: 처음 1번만 목표 비율대로 나눠 넣는다
+- `open_hedge()`: 세 가지(업비트 USDT 매도, 코인 매수, 바이비트 숏)가 다 될 때만 한 번에 저장. 안 되면 `EntryRejected` (부족한 금액 포함)
+- `value_exit()` / `close_hedge()`: 지금 청산하면 얼마 / 실제 청산
+- `value_liquidation()` / `close_hedge(liquidated=True)`: 강제청산 (증거금 손실 + 업비트 즉시 정리)
+- `capital_split()`: 지금 양쪽 자본 (USDT 환산, 보유 코인은 지금 팔아 되사면 받을 USDT 로)
+- `apply_funding()`: 펀딩비 1번 반영
 
 ### `kimp/engine.py` — 전략 엔진
 - `step()`: 스캔 한 번 (위 흐름 참고)
-- `_manage_position()`: 순손익률 ≥ 목표면 익절, ≤ 손절선이면 손절. 목표와 손절은 **진입 때 포지션에 저장한 값**을 쓴다(`_exit_rules`). 청산 후 재진입 대기 시작
-- `_split_text()`: 청산 로그에 "김프 변화 = 테더 몫 + 코인 몫" 을 보여준다
-- `_update_funding()`: 지난 정산을 딱 1번만 반영 (이미 반영한 정산 시각과 비교)
-- `_try_entries()` / `_plan_bybit_qty()`: 바이비트 숏 개수 = 포지션 규모 ÷ 바이비트 가격 → 주문 단위로 내림. 업비트 최소 주문 금액(5,000원) 확인
-- `_log_status()`: 달러 환율, 업비트 USDT 가격, 테더 프리미엄, 코인별 "지금 김프/기준" 또는 "보유 순손익/목표"
-- 루프 하나에서 모든 코인을 차례로 처리한다. (old 봇의 스레드 꼬임 문제 없음)
+- `_check_liquidation()`: 강제청산 감시와 처리
+- `_manage_position()` / `_exit_rules()`: 목표·손절은 진입 때 포지션에 저장한 값
+- `_check_rebalance()`: 목표 비율에서 많이 벗어났으면 옮길 USDT 를 알림 (시작할 때, 청산 직후)
+- `_position_size_usdt()`: 포지션 크기 (설정값 또는 자동)
+- `_try_entries()` / `_plan_bybit_qty()`: 진입
+- `_update_funding()`: 펀딩비
+- `_log_status()`: USDT 가격, 테더 프리미엄, 코인별 봇 김프(사이트식 김프)/기준, 자본 비율
+- `clock`: 시각 함수 (평소 진짜 시계, 시뮬레이션은 가짜 시계)
+
+### `kimp/fx.py` — 달러 환율 (표시용)
+- yfinance `KRW=X`. 실패하면 마지막 값. 못 받아도 매매에는 영향 없음. `FIXED_USD_KRW` 로 고정 가능
 
 ### `kimp/db.py` — DB 테이블 (SQLite)
 | 테이블 | 내용 |
 |---|---|
-| `positions` | 포지션 1개 = 진입~청산 1사이클. 양쪽 개수, 진입·청산 가격, 진입·청산 환율, 수수료, 김프(테더 몫·코인 몫 포함), **진입 때 정한 기준(진입 기준·목표·손절)**, 펀딩비(USDT·원), 확정 손익(원) |
-| `fills` | 체결 한 건씩 (평균가, 수수료, 밀린 정도) |
+| `positions` | 포지션 1개 = 진입~청산. 판/되산 USDT, 코인·숏 개수와 가격, 수수료, 김프(봇·사이트식·테더), 레버리지·증거금·강제청산 가격, 진입 때 기준, 펀딩비, 확정 손익(USDT) |
+| `fills` | 체결 한 건씩 (`sell_usdt`, `buy`, `open_short`, `sell`, `buy_usdt`, `close_short`, `liquidated`) |
 | `funding_events` | 펀딩비 받거나 낸 기록 |
-| `premium_snapshots` | 봇이 돌면서 코인마다 1분에 1번 저장하는 김프 기록 (김프, 테더 몫, 코인 몫, 달러 환율, 업비트 USDT 가격, 바이비트 펀딩비율·다음 정산 시각·정산 주기) |
+| `premium_snapshots` | 코인마다 1분에 1건: 봇 김프, 진입/청산 김프, USDT 가격과 호가 간격, 달러 환율, 테더 프리미엄, 사이트식 김프, 펀딩비율·다음 정산·주기 |
 | `paper_balances` | 페이퍼 잔고 |
 
-- 시간은 모두 UTC 로 저장한다.
-- 테이블 구조가 바뀌면 예전 DB 파일과 맞지 않는다. 아직 운영 데이터가 없으니 DB 파일을 지우고 새로 시작하면 된다.
+- 시간은 모두 UTC. 구조가 바뀌면 예전 DB 파일과 맞지 않으니 DB 파일을 지우고 새로 시작 (아직 운영 데이터 없음)
 
 ### `kimp/report.py` — 김프 기록 분석 리포트
-- 실행: `python -m kimp.report` (최근 7일), `--hours 24`, `--db 경로`
-- 코인마다 보여주는 것:
-  - 김프 평균, 최저, 최고와 테더 몫·코인 몫
-  - 진입 김프 분포(하위 5% / 25% / 중간값)
-  - 호가 간격 비용
-  - 펀딩비율 평균과 마이너스 비율
-  - 기준별로 "진입 김프가 기준 이하였던 시간 비율"과 그때의 펀딩비율
-  - **김프 구간별 평균 펀딩비율**
-- 계산 부분(`summarize_coin`)과 출력 부분(`format_summary`)이 나뉘어 있어서 계산 부분을 테스트할 수 있다.
+- `python -m kimp.report [--hours 24] [--db 경로]`
+- 코인별: 봇 김프 평균·최저·최고 (참고로 사이트식 김프·테더), 진입 김프 분포, 호가 간격 비용, 펀딩비율, 기준별 시간 비율, **김프 구간별 평균 펀딩비율**
 
-### `kimp/logging_setup.py` — 로그
-- 화면 + `logs/bot.log` (10MB × 5개 돌려쓰기)
+### `kimp/history.py` — 과거 데이터 (시뮬레이션용)
+- 별도 DB `data/history.db`: `candles`(업비트 코인·업비트 USDT·바이비트 1분봉), `fx_hourly`, `funding_history`, `fetched_ranges`, `sim_runs`, `sim_trades`
+- 모자란 구간만 받고, 거래소 점검 같은 빈 구간은 건너뛰고 계속 받는다. 환율은 주말 대비 7일 앞부터
+
+### `kimp/simulate.py` — 시뮬레이션
+- `python -m kimp.simulate --from 날짜 [--to 날짜] [--coins ...] [--verbose] [--no-save]`
+- **실시간 봇과 같은 `Engine`, `PaperBroker`** 를 쓴다. `HistoricalMarket`(1분봉 종가 → 호가창, 바이비트 고가 → 강제청산 확인)와 `SimClock`(가짜 시계)만 다르다
+- 호가 간격: 코인은 `decide_spreads()`(실측 → 코인별 설정 → 기본값) + `apply_tick_floor()`(호가 한 칸 하한), USDT/KRW 는 호가 한 칸
+- 결과: 확정 손익과 평가 손익을 나눠서, USDT 로 (원화 참고값 포함)
 
 ### `tests/` — 테스트 (인터넷 필요 없음)
 | 파일 | 확인하는 것 |
 |---|---|
-| `test_calc.py` | 김프 공식, 테더 프리미엄, 체결 계산, **concept.md 예시 A~H 숫자와 코드 계산이 같은지** |
-| `test_engine.py` | 왕복 후 잔고 = 계산 손익, 테더 상승 = 원화 이득, 실패 시 아무것도 안 바뀜, 진입/익절/손절/재진입 대기, 펀딩비 1번만, 환율 없음/오래됨 처리, 코인별 설정 |
-| `test_fx.py` | 고정 환율, 갱신 간격, 실패 시 이전 값, 오래된 값 표시 |
-| `test_config.py` | 코인별 덮어쓰기, 오타 경고, 잘못된 값 거부 |
-| `test_report.py` | 리포트 숫자 계산 (분위수, 기준별 시간 비율, 김프 구간별 펀딩비율) |
+| `test_calc.py` | 김프 공식, 체결 계산, **concept.md 예시 A~H 숫자와 코드 계산이 같은지**, 강제청산 가격 |
+| `test_engine.py` | 왕복 후 잔고 = 계산 손익, USDT 가격이 움직여도 손익 0, 진입/익절/손절, 진입 때 기준 고정, 펀딩비, 강제청산과 경고, 시작 리밸런싱 알림, 자동 포지션 크기, 코인별 설정 |
+| `test_simulate.py` | 시뮬레이션 흐름, 호가 단위 하한(DOGE 가짜 수익 방지), 모자란 구간만 받기, 점검 빈 구간 |
+| `test_fx.py` | 고정 환율, 갱신 간격, 실패 시 이전 값 |
+| `test_config.py` | 코인별 덮어쓰기, 레버리지 → 자본 비율, 잘못된 값 거부 |
+| `test_report.py` | 리포트 숫자 계산 |
 
 실행: `python -m unittest discover -s tests -v`
 
 ## 3. 단위 규칙
-- 수수료율: 소수 (`0.0005` = 0.05%)
-- 퍼센트: 숫자 그대로 (`1.0` = 1%)
-- 금액 변수 이름 끝에 단위를 붙인다: `_krw`(원), `_usdt`
-- 개수: 금액 헷징이라 양쪽 개수가 다르다. 포지션에 `upbit_qty`, `bybit_qty` 를 따로 저장한다.
+- 수수료율: 소수 (`0.0005` = 0.05%) / 퍼센트: 숫자 그대로 (`1.0` = 1%)
+- 금액 변수 이름 끝에 단위: `_krw`(원), `_usdt`. **손익과 자본은 USDT**
+- 개수: 금액 헷징이라 업비트 코인 개수와 바이비트 숏 개수가 다르다 (`upbit_qty`, `bybit_qty`)

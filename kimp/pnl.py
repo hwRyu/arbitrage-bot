@@ -1,32 +1,30 @@
 """
-헷지 포지션 손익 계산 (모든 비용 포함, 원화 기준)
+헷지 포지션 손익 계산 (모든 비용 포함, USDT 기준)
 
 이 파일은 계산만 한다. (테스트하기 쉬움) 기준 문서: docs/concept.md 5번
 
 포지션 구조
 ------------------------------------------------------------------
-    업비트: 원화로 코인 매수 (롱)
-    바이비트: 같은 금액만큼 USDT 무기한 숏 (레버리지 1배)
+    업비트: USDT 를 팔아 원화로 코인을 사고 → 청산 때 코인을 팔아 원화로 USDT 를 되산다
+    바이비트: 같은 금액만큼 USDT 무기한 숏
 
-손익은 어떻게 계산하나? (원화 기준)
+손익은 어떻게 계산하나? (전부 USDT)
 ------------------------------------------------------------------
-원화는 업비트에, USDT 는 바이비트에 그대로 남는다. 둘을 합쳐 보려고
-바이비트 쪽 USDT 손익만 달러 환율로 원화로 바꿔서 더한다.
+    업비트 (USDT)  = 되산 USDT 개수 - 판 USDT 개수   (수수료, 호가 간격까지 다 들어간 실제 개수)
+    바이비트 (USDT) = 숏 개수 × (숏 친 가격 - 숏 닫은 가격) - 바이비트 수수료
+    펀딩비 (USDT)  = 보유 중 받은(+)/낸(-) 펀딩비
+    순손익 (USDT)  = 업비트 + 바이비트 + 펀딩비 - 전송비
 
-    업비트 손익(원)   = 업비트 개수 × (판 가격 - 산 가격)
-    바이비트 손익(원) = 바이비트 개수 × (숏 친 가격 - 숏 닫은 가격) × 청산 때 달러 환율
-    비용(원)          = 업비트 수수료 + 바이비트 수수료 × 환율 + 전송비 × 환율
-    펀딩비(원)        = 받은(+)/낸(-) 펀딩비 USDT × 청산 때 달러 환율
-    순손익(원)        = 업비트 손익 + 바이비트 손익 + 펀딩비 - 비용
+예) USDT 1,000 개를 팔아 XRP 를 사고, 바이비트 1,000 USDT 숏 (김프 -1.5%)
+    김프가 +0.5% 가 되어 청산 → 업비트에서 USDT 1,020.3 개를 되삼, 바이비트 가격 그대로
+    → 업비트 +20.3 USDT, 바이비트 0 → 비용 빼기 전 +20.3 USDT (+2.03%)
 
-예) 진입: 업비트 748.28개를 1,770.7원에, 바이비트 740.74개를 1.35 USDT 에 숏 (달러 환율 1,325원)
-    청산: 업비트 1,806.7원, 바이비트 1.35 USDT (김프 -1.0% → +1.0%)
-    업비트 손익 = 748.28 × 36 = +26,904원, 바이비트 손익 = 0
-    → 비용 빼기 전 +26,904원 (+2.03%)
+업비트 USDT 가격(환율 × 테더 프리미엄)이 움직여도, 판 USDT 와 되산 USDT 로 계산하니 자동으로 상쇄된다.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 from kimp.config import FeeSettings
 
@@ -37,42 +35,31 @@ class EntryLegs:
     진입할 때 정해지는 값들
 
     Attributes:
-        upbit_qty: 업비트에서 산 개수
-        bybit_qty: 바이비트에서 숏 친 개수
-        upbit_price_krw: 업비트 평균 매수가 (원)
-        bybit_price_usdt: 바이비트 평균 숏 진입가 (USDT)
-        fx_krw: 진입 때 달러 환율
-        upbit_fee_krw: 업비트 매수 수수료 (원)
+        usdt_sold: 업비트에서 판 USDT 개수 (= 바이비트 숏 금액)
+        usdt_price_krw: USDT 판 평균가 (원)
+        usdt_fee_krw: USDT 팔 때 수수료 (원)
+        upbit_qty: 업비트에서 산 코인 개수
+        upbit_price_krw: 코인 평균 매수가 (원)
+        upbit_fee_krw: 코인 살 때 수수료 (원)
+        bybit_qty: 바이비트 숏 개수
+        bybit_price_usdt: 바이비트 평균 숏 가격 (USDT)
         bybit_fee_usdt: 바이비트 진입 수수료 (USDT)
     """
 
+    usdt_sold: float
+    usdt_price_krw: float
+    usdt_fee_krw: float
     upbit_qty: float
-    bybit_qty: float
     upbit_price_krw: float
-    bybit_price_usdt: float
-    fx_krw: float
     upbit_fee_krw: float
+    bybit_qty: float
+    bybit_price_usdt: float
     bybit_fee_usdt: float
 
     @property
     def notional_usdt(self) -> float:
-        """바이비트 숏 금액 (USDT) = 개수 × 진입가"""
+        """포지션 크기 = 바이비트 숏 금액 (USDT). 수익률(%)을 계산할 때 나누는 값"""
         return self.bybit_qty * self.bybit_price_usdt
-
-    @property
-    def notional_krw(self) -> float:
-        """
-        포지션 규모 (원) = 바이비트 숏 금액 × 진입 때 달러 환율
-
-        수익률(%)을 계산할 때 나누는 값이다.
-        금액 헷징이라 업비트에서 산 금액과 거의 같다.
-        """
-        return self.notional_usdt * self.fx_krw
-
-    @property
-    def upbit_cost_krw(self) -> float:
-        """업비트에서 실제로 쓴 원화 (수수료 제외)"""
-        return self.upbit_qty * self.upbit_price_krw
 
 
 @dataclass(frozen=True)
@@ -81,63 +68,66 @@ class ExitLegs:
     청산할 때의 값들 (실제로 청산했든, '지금 청산하면' 가정이든 같은 모양)
 
     Attributes:
-        upbit_price_krw: 업비트 평균 매도가 (원)
+        upbit_price_krw: 코인 평균 매도가 (원)
+        upbit_fee_krw: 코인 팔 때 수수료 (원)
+        usdt_price_krw: USDT 되산 평균가 (원)
+        usdt_fee_krw: USDT 살 때 수수료 (원)
+        usdt_bought: 되산 USDT 개수
         bybit_price_usdt: 바이비트 평균 숏 종료가 (USDT)
-        fx_krw: 청산 때 달러 환율
-        upbit_fee_krw: 업비트 매도 수수료 (원)
         bybit_fee_usdt: 바이비트 청산 수수료 (USDT)
     """
 
     upbit_price_krw: float
-    bybit_price_usdt: float
-    fx_krw: float
     upbit_fee_krw: float
+    usdt_price_krw: float
+    usdt_fee_krw: float
+    usdt_bought: float
+    bybit_price_usdt: float
     bybit_fee_usdt: float
 
 
 @dataclass(frozen=True)
 class PnLBreakdown:
     """
-    손익 상세 (모두 원화, 비용은 양수로 적는다)
+    손익 상세 (모두 USDT. 비용은 양수로 적는다)
 
     순손익 = 업비트 손익 + 바이비트 손익 + 펀딩비 - 비용 합계
     """
 
-    upbit_leg_krw: float  # 업비트 현물 손익 (판 가격 - 산 가격)
-    bybit_leg_usdt: float  # 바이비트 숏 손익 (USDT 그대로, 참고용)
-    bybit_leg_krw: float  # 바이비트 숏 손익 (원화 환산)
-    funding_krw: float  # 펀딩비 (+ 받음 / - 냄)
-    upbit_fee_krw: float  # 업비트 수수료 (산 것 + 판 것)
-    bybit_fee_krw: float  # 바이비트 수수료 (연 것 + 닫은 것)
-    transfer_fee_krw: float  # 사이클당 전송비
-    notional_krw: float  # 포지션 규모 (수익률 계산용)
+    upbit_leg_usdt: float  # 업비트 손익 (수수료 빼기 전. 호가 간격은 들어 있음)
+    bybit_leg_usdt: float  # 바이비트 숏 손익 (수수료 빼기 전)
+    funding_usdt: float  # 펀딩비 (+ 받음 / - 냄)
+    upbit_fee_usdt: float  # 업비트 수수료 4번 (USDT 매도, 코인 매수, 코인 매도, USDT 매수)
+    bybit_fee_usdt: float  # 바이비트 수수료 (열기 + 닫기)
+    transfer_fee_usdt: float  # 사이클당 전송비
+    notional_usdt: float  # 포지션 크기 (수익률 계산용)
 
     @property
-    def gross_krw(self) -> float:
-        """비용 빼기 전 손익 = 업비트 손익 + 바이비트 손익"""
-        return self.upbit_leg_krw + self.bybit_leg_krw
+    def gross_usdt(self) -> float:
+        """비용 빼기 전 손익 = 업비트 + 바이비트"""
+        return self.upbit_leg_usdt + self.bybit_leg_usdt
 
     @property
-    def total_cost_krw(self) -> float:
+    def total_cost_usdt(self) -> float:
         """비용 합계 = 업비트 수수료 + 바이비트 수수료 + 전송비"""
-        return self.upbit_fee_krw + self.bybit_fee_krw + self.transfer_fee_krw
+        return self.upbit_fee_usdt + self.bybit_fee_usdt + self.transfer_fee_usdt
 
     @property
-    def net_krw(self) -> float:
-        """최종 순손익 (원)"""
-        return self.gross_krw + self.funding_krw - self.total_cost_krw
+    def net_usdt(self) -> float:
+        """최종 순손익 (USDT)"""
+        return self.gross_usdt + self.funding_usdt - self.total_cost_usdt
 
     @property
     def net_percent(self) -> float:
-        """순손익률 (%) = 순손익 ÷ 포지션 규모"""
-        if self.notional_krw <= 0:
+        """순손익률 (%) = 순손익 ÷ 포지션 크기"""
+        if self.notional_usdt <= 0:
             return 0.0
-        return self.net_krw / self.notional_krw * 100
+        return self.net_usdt / self.notional_usdt * 100
 
 
-def upbit_fee_krw(price_krw: float, qty: float, fees: FeeSettings) -> float:
-    """업비트 수수료 (원) = 거래 금액 × 수수료율.  예) 1,325,000원 × 0.05% = 662.5원"""
-    return price_krw * qty * fees.upbit_trade_fee_rate
+def upbit_fee_krw(cost_krw: float, fees: FeeSettings) -> float:
+    """업비트 수수료 (원) = 거래 금액 × 수수료율.  예) 1,333,000원 × 0.05% = 666.5원"""
+    return cost_krw * fees.upbit_trade_fee_rate
 
 
 def bybit_fee_usdt(price_usdt: float, qty: float, fees: FeeSettings) -> float:
@@ -145,7 +135,8 @@ def bybit_fee_usdt(price_usdt: float, qty: float, fees: FeeSettings) -> float:
     return price_usdt * qty * fees.bybit_taker_fee_rate
 
 
-def compute_pnl(entry: EntryLegs, exit_: ExitLegs, funding_usdt: float, fees: FeeSettings) -> PnLBreakdown:
+def compute_pnl(entry: EntryLegs, exit_: ExitLegs, funding_usdt: float, fees: FeeSettings,
+                bybit_leg_override_usdt: Optional[float] = None) -> PnLBreakdown:
     """
     한 번의 진입~청산 손익 계산
 
@@ -154,56 +145,77 @@ def compute_pnl(entry: EntryLegs, exit_: ExitLegs, funding_usdt: float, fees: Fe
         exit_: 청산 값들 (실제 또는 '지금 청산하면')
         funding_usdt: 보유하는 동안 쌓인 펀딩비 (USDT, + 받음)
         fees: 비용 설정 (전송비를 여기서 가져온다)
+        bybit_leg_override_usdt: 바이비트 손익을 직접 정할 때 (강제청산: 증거금 전체 손실)
     """
-    # 업비트: 원화로 사고 원화로 판다 → 그대로 원화 손익
-    upbit_leg_krw = entry.upbit_qty * (exit_.upbit_price_krw - entry.upbit_price_krw)
+    # 업비트: 실제로 되산 USDT - 판 USDT = 수수료까지 다 빠진 업비트 손익
+    upbit_net = exit_.usdt_bought - entry.usdt_sold
 
-    # 바이비트: 숏이라 가격이 내려야 이익 → USDT 손익을 청산 때 환율로 원화 환산
-    bybit_leg_usdt = entry.bybit_qty * (entry.bybit_price_usdt - exit_.bybit_price_usdt)
-    bybit_leg_krw = bybit_leg_usdt * exit_.fx_krw
+    # 업비트 수수료 4번을 USDT 로 환산 (보여주기용으로 따로 뺀다)
+    #   진입: USDT 매도 수수료 + 코인 매수 수수료 → 판 가격으로 환산
+    #   청산: 코인 매도 수수료 + USDT 매수 수수료 → 산 가격으로 환산
+    upbit_fees = ((entry.usdt_fee_krw + entry.upbit_fee_krw) / entry.usdt_price_krw
+                  + (exit_.upbit_fee_krw + exit_.usdt_fee_krw) / exit_.usdt_price_krw)
 
-    # 바이비트 수수료는 각각 낸 시점의 환율로 원화 환산
-    bybit_fee_krw_total = entry.bybit_fee_usdt * entry.fx_krw + exit_.bybit_fee_usdt * exit_.fx_krw
+    # 바이비트: 숏이라 가격이 내려야 이익
+    if bybit_leg_override_usdt is not None:
+        bybit_leg = bybit_leg_override_usdt
+        bybit_fees = entry.bybit_fee_usdt  # 강제청산 땐 닫는 수수료 없이 증거금을 잃은 것으로 본다
+    else:
+        bybit_leg = entry.bybit_qty * (entry.bybit_price_usdt - exit_.bybit_price_usdt)
+        bybit_fees = entry.bybit_fee_usdt + exit_.bybit_fee_usdt
 
     return PnLBreakdown(
-        upbit_leg_krw=upbit_leg_krw,
-        bybit_leg_usdt=bybit_leg_usdt,
-        bybit_leg_krw=bybit_leg_krw,
-        funding_krw=funding_usdt * exit_.fx_krw,
-        upbit_fee_krw=entry.upbit_fee_krw + exit_.upbit_fee_krw,
-        bybit_fee_krw=bybit_fee_krw_total,
-        transfer_fee_krw=fees.transfer_fee_usdt_per_cycle * exit_.fx_krw,
-        notional_krw=entry.notional_krw,
+        upbit_leg_usdt=upbit_net + upbit_fees,  # 수수료 빼기 전 = 실제 결과 + 낸 수수료
+        bybit_leg_usdt=bybit_leg,
+        funding_usdt=funding_usdt,
+        upbit_fee_usdt=upbit_fees,
+        bybit_fee_usdt=bybit_fees,
+        transfer_fee_usdt=fees.transfer_fee_usdt_per_cycle,
+        notional_usdt=entry.notional_usdt,
     )
 
 
-def estimated_exit_premium(
-    entry_premium: float,
-    target_net_profit_percent: float,
-    notional_usdt: float,
-    funding_usdt: float,
-    fees: FeeSettings,
-) -> float:
+def liquidation_price(entry_price_usdt: float, leverage: float, mmr: float) -> float:
     """
-    "김프가 대략 몇 % 까지 올라야 목표 수익이 나나?" 를 추정 (로그에 보여주는 용도)
+    바이비트 숏 강제청산 가격 (격리 마진, 대략)
 
-    대략 이렇게 된다:
-        필요한 청산 김프 ≈ 진입 김프 + 목표 수익률 + 왕복 수수료율 + 전송비 비율 + 슬리피지 여유 - 펀딩 수익률
+        강제청산 가격 ≈ 진입가 × (1 + 1/레버리지 - 유지증거금률)
 
-    예) 진입 -1.0%, 목표 1.0%, 수수료 0.21%, 전송비 1 USDT / 1,000 USDT = 0.1%, 여유 0.05%
-        → 약 +0.36% 가 되면 청산
+    예) 1.35 USDT 숏, 3배, 유지증거금률 0.5% → 1.35 × (1 + 0.333 - 0.005) ≈ 1.793 (약 +32.8%)
+        1배면 1.35 × 1.995 ≈ 2.69 (약 2배)
+    """
+    return entry_price_usdt * (1 + 1 / leverage - mmr)
 
+
+def margin_to_add_usdt(entry_price: float, current_price: float, qty: float, margin_usdt: float,
+                       target_distance_percent: float, mmr: float) -> float:
+    """
+    강제청산까지 남은 상승폭을 target_distance_percent 로 되돌리려면 증거금을 얼마나 더 넣어야 하나 (USDT)
+
+    격리 마진 숏의 강제청산 가격 ≈ 진입가 × (1 + 증거금/숏금액 - 유지증거금률) 이므로
+        원하는 강제청산 가격 = 지금 가격 × (1 + 목표 거리)
+        필요한 증거금 = 숏금액 × (원하는 강제청산 가격 / 진입가 - 1 + 유지증거금률)
+    예) 이미 충분하면 0
+    """
+    notional = entry_price * qty
+    want_liq = current_price * (1 + target_distance_percent / 100)
+    needed = notional * (want_liq / entry_price - 1 + mmr)
+    return max(0.0, needed - margin_usdt)
+
+
+def estimated_exit_premium(entry_premium: float, target_net_profit_percent: float, notional_usdt: float,
+                           funding_usdt: float, fees: FeeSettings, usdt_spread_percent: float = 0.0) -> float:
+    """
+    "코인 몫 김프가 대략 몇 % 까지 올라야 목표 수익이 나나?" 추정 (로그에 보여주는 용도)
+
+        필요한 청산 김프 ≈ 진입 김프 + 목표 + 왕복 수수료(0.31%) + 전송비 비율 + USDT 호가 간격 + 여유 - 펀딩 수익률
+
+    예) 진입 -1.0%, 목표 1.0%, 전송비 1 USDT / 1,000 USDT = 0.1%, USDT 호가 간격 0.075%, 여유 0.05%
+        → -1 + 1 + 0.31 + 0.1 + 0.075 + 0.05 ≈ +0.54%
     실제 청산은 이 추정치가 아니라 compute_pnl 로 계산한 순이익으로 정한다.
     """
     if notional_usdt <= 0:
-        raise ValueError("포지션 규모는 0 보다 커야 합니다")
-    transfer_percent = fees.transfer_fee_usdt_per_cycle / notional_usdt * 100
-    funding_percent = funding_usdt / notional_usdt * 100
-    return (
-        entry_premium
-        + target_net_profit_percent
-        + fees.round_trip_trade_fee_percent()
-        + transfer_percent
-        + fees.slippage_buffer_percent
-        - funding_percent
-    )
+        raise ValueError("포지션 크기는 0 보다 커야 합니다")
+    return (entry_premium + target_net_profit_percent + fees.round_trip_trade_fee_percent()
+            + fees.transfer_fee_usdt_per_cycle / notional_usdt * 100 + usdt_spread_percent
+            + fees.slippage_buffer_percent - funding_usdt / notional_usdt * 100)

@@ -3,6 +3,7 @@
 
 실행: python -m unittest discover -s tests -v
 """
+import logging
 import time
 import unittest
 from typing import Dict, List, Optional
@@ -10,44 +11,41 @@ from typing import Dict, List, Optional
 from kimp.config import CoinParams, FeeSettings, Settings
 from kimp.db import ExitReason, Fill, FundingEvent, Position, PositionStatus, PremiumSnapshot, make_session_factory
 from kimp.engine import Engine
-from kimp.fx import FxProvider
 from kimp.market_data import FundingInfo
-from kimp.paper_broker import KRW, USDT, EntryRejected, PaperBroker, coin_key
+from kimp.paper_broker import BYBIT_USDT, UPBIT_USDT, EntryRejected, PaperBroker, coin_key
 from kimp.premium import OrderBook, Quote
 
 FEES = FeeSettings(upbit_trade_fee_rate=0.0005, bybit_taker_fee_rate=0.00055,
                    transfer_fee_usdt_per_cycle=1.0, slippage_buffer_percent=0.05)
-FX = 1400.0
+USDT_KRW = 1400.0
 
 
-def make_quote(premium: float, bybit_price: float = 1.0, fx: float = FX, depth: float = 1e6,
-               coin: str = "XRP", usdt_krw: Optional[float] = None) -> Quote:
+def make_quote(premium: float, bybit_price: float = 1.0, usdt_krw: float = USDT_KRW, depth: float = 1e9,
+               coin: str = "XRP", fx: Optional[float] = None, bybit_high: Optional[float] = None) -> Quote:
     """
-    원하는 김프(%)를 가진 가짜 시세 만들기 (호가 간격은 양쪽 ±0.01% 로 아주 좁게)
+    원하는 코인 몫 김프(%)를 가진 가짜 시세 (호가 간격은 세 군데 모두 ±0.01% 로 아주 좁게)
 
-    예) premium=-1.0, 바이비트 1.0, 환율 1,400 → 업비트 가운데 가격 1,386원
+    예) premium=-1.0, 바이비트 1.0, 업비트 USDT 1,400원 → 업비트 코인 가운데 가격 1,386원
     """
-    upbit_mid = bybit_price * fx * (1 + premium / 100)
+    upbit_mid = bybit_price * usdt_krw * (1 + premium / 100)
     s = 0.0001
-    return Quote(
-        coin=coin,
-        upbit=OrderBook(bids=[(upbit_mid * (1 - s), depth)], asks=[(upbit_mid * (1 + s), depth)]),
-        bybit=OrderBook(bids=[(bybit_price * (1 - s), depth)], asks=[(bybit_price * (1 + s), depth)]),
-        fx_krw=fx,
-        usdt_krw=usdt_krw,
-    )
+
+    def book(p):
+        return OrderBook(bids=[(p * (1 - s), depth)], asks=[(p * (1 + s), depth)])
+
+    return Quote(coin=coin, upbit=book(upbit_mid), bybit=book(bybit_price), usdt=book(usdt_krw), fx_krw=fx,
+                 bybit_high=bybit_high)
 
 
 class FakeMarket:
     """진짜 거래소 대신 쓰는 가짜: 테스트가 넣어둔 시세/펀딩비를 그대로 돌려준다"""
 
     def __init__(self):
-        """시세와 펀딩비는 테스트에서 직접 넣는다"""
         self.quotes: Dict[str, Quote] = {}
         self.funding: Optional[FundingInfo] = None
 
-    def fetch_quotes(self, coins: List[str], fx_krw: float) -> Dict[str, Quote]:
-        """넣어둔 시세 중 요청한 코인만 돌려준다 (환율은 시세를 만들 때 이미 넣었음)"""
+    def fetch_quotes(self, coins: List[str], fx_krw=None) -> Dict[str, Quote]:
+        """넣어둔 시세 중 요청한 코인만"""
         return {c: q for c, q in self.quotes.items() if c in coins}
 
     def fetch_funding(self, coin: str) -> Optional[FundingInfo]:
@@ -64,73 +62,72 @@ class FakeMarket:
 
 
 def make_settings(**overrides) -> Settings:
-    """테스트용 설정 (메모리 DB, 진입 기준 -0.5%, 포지션 1개)"""
+    """테스트용 설정 (진입 -0.5%, 목표 1%, 포지션 500 USDT 고정, 1개, 시작 자본 10,000 USDT)"""
     base = dict(coins=["XRP"], entry_premium_threshold_percent=-0.5, target_net_profit_percent=1.0,
                 stop_loss_percent=-5.0, position_size_usdt=500, max_open_positions=1,
-                fees=FEES, funding_refresh_sec=0, snapshot_interval_sec=0,
-                paper_initial_krw=10_000_000, paper_initial_usdt=5_000, db_path=":memory:")
+                fees=FEES, funding_refresh_sec=0, snapshot_interval_sec=0, paper_initial_total_usdt=10_000,
+                db_path=":memory:")
     base.update(overrides)
     return Settings(**base)
 
 
-def fixed_fx(rate: float = FX) -> FxProvider:
-    """항상 같은 환율을 주는 공급기"""
-    return FxProvider(fixed_rate=rate)
+def make_engine(settings: Settings, market: FakeMarket, fx=None):
+    """엔진 + 메모리 DB (시작 자본은 목표 비율대로 자동 분배)"""
+    sf = make_session_factory(":memory:")
+    broker = PaperBroker(FEES, 0.3, leverage=settings.bybit_leverage, mmr=settings.bybit_mmr)
+    engine = Engine(settings, market, fx, broker, sf, list(settings.coins))
+    engine.startup()
+    return engine, sf, broker
 
 
 class PaperBrokerTest(unittest.TestCase):
     """페이퍼 체결과 잔고"""
 
     def setUp(self):
-        """메모리 DB + 시작 잔고"""
+        """메모리 DB + 시작 자본 10,000 USDT 를 50:50 으로"""
         self.sf = make_session_factory(":memory:")
         self.broker = PaperBroker(FEES, max_slippage_percent=0.3)
         with self.sf() as s:
-            self.broker.ensure_initial_balances(s, 10_000_000, 5_000)
+            self.broker.ensure_initial_balances(s, 10_000, 0.5)
+
+    def test_initial_split_by_ratio(self):
+        """시작 자본을 목표 비율대로 나눠 넣고, 두 번째부터는 안 넣는다"""
+        with self.sf() as s:
+            self.assertAlmostEqual(self.broker.balance(s, UPBIT_USDT), 5_000)
+            self.assertAlmostEqual(self.broker.balance(s, BYBIT_USDT), 5_000)
+            self.assertFalse(self.broker.ensure_initial_balances(s, 99, 0.5))
 
     def test_round_trip_balances_match_pnl(self):
-        """진입 → 청산 후 실제 잔고 변화가 계산한 손익과 같은지"""
+        """진입 → 청산 후 실제 USDT 잔고 변화가 계산한 손익과 같은지 (전송비는 잔고에서 안 빠짐)"""
         with self.sf() as s:
             pos = self.broker.open_hedge(s, make_quote(-1.0), 500)
-            # 금액 헷징: 역프라 업비트 개수가 더 많고, 업비트 쓴 원화 = 숏 금액 × 환율
-            self.assertGreater(pos.upbit_qty, pos.bybit_qty)
-            self.assertAlmostEqual(pos.upbit_qty * pos.entry_upbit_price_krw,
-                                   pos.bybit_qty * pos.entry_bybit_price_usdt * FX)
+            self.assertAlmostEqual(pos.usdt_sold, 500 * 0.9999)  # 숏 금액만큼 USDT 를 판다
             self.assertAlmostEqual(self.broker.balance(s, coin_key("XRP")), pos.upbit_qty)
 
             val = self.broker.value_exit(pos, make_quote(+1.0))
             pnl = self.broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
 
-            krw_change = self.broker.balance(s, KRW) - 10_000_000
-            usdt_change = self.broker.balance(s, USDT) - 5_000
-            # 원화 변화 + USDT 변화 × 환율 = 손익 (전송비는 실제 잔고에서 안 빠지니 더해서 비교)
-            self.assertAlmostEqual(krw_change + usdt_change * FX, pnl.net_krw + pnl.transfer_fee_krw, places=4)
+            change = self.broker.balance(s, UPBIT_USDT) + self.broker.balance(s, BYBIT_USDT) - 10_000
+            self.assertLess(abs(self.broker.balance(s, "upbit:KRW")), 1e-6)  # 자투리 원화 거의 0
+            self.assertAlmostEqual(change, pnl.net_usdt + pnl.transfer_fee_usdt, places=6)
             self.assertAlmostEqual(self.broker.balance(s, coin_key("XRP")), 0)
-            self.assertEqual(pos.status, PositionStatus.CLOSED)
-            self.assertEqual(s.query(Fill).count(), 4)
+            self.assertEqual(s.query(Fill).count(), 6)  # USDT 매도·코인 매수·숏 / 코인 매도·USDT 매수·숏 닫기
 
-    def test_tether_rise_is_real_krw_gain(self):
-        """
-        보유 중 테더 프리미엄만 1% 올라 업비트 가격이 1% 오르면
-        원화가 늘고 USDT 는 그대로 → 봇도 이익으로 계산해야 한다 (concept.md 4번)
-        """
+    def test_usdt_price_move_does_not_matter(self):
+        """업비트 USDT 가격이 3% 떨어져도(환율 하락) 코인 김프가 그대로면 손익 ≈ 0 (호가 간격만큼)"""
         with self.sf() as s:
             pos = self.broker.open_hedge(s, make_quote(-1.0), 500)
-            # 바이비트 가격·달러 환율 그대로, 업비트만 1% 오름 = 김프 -1% → 약 0%
-            val = self.broker.value_exit(pos, make_quote(-1.0 + 1.0 * 0.99))
-            self.assertGreater(val.pnl.upbit_leg_krw, 0)
-            # 바이비트 가격은 그대로라 호가 간격(±0.01%)만큼만 손해: 500개 × 0.0002 = 약 -0.1 USDT
-            self.assertLess(abs(val.pnl.bybit_leg_usdt), 0.11)
-            self.assertGreater(val.pnl.gross_krw, 0)
+            val = self.broker.value_exit(pos, make_quote(-1.0, usdt_krw=USDT_KRW * 0.97))
+            self.assertAlmostEqual(val.pnl.gross_usdt, 0.0, delta=0.5)
 
     def test_rejects_without_side_effects(self):
-        """잔고가 모자라면 아무것도 바뀌면 안 된다"""
+        """잔고가 모자라면 아무것도 안 바뀌고, 얼마나 더 필요한지 알려준다"""
         with self.sf() as s:
-            with self.assertRaises(EntryRejected):
-                self.broker.open_hedge(s, make_quote(-1.0), 100_000)  # 100,000 USDT 어치 → 부족
+            with self.assertRaises(EntryRejected) as ctx:
+                self.broker.open_hedge(s, make_quote(-1.0), 20_000)
+            self.assertIn("더 필요", str(ctx.exception))
             self.assertEqual(s.query(Position).count(), 0)
-            self.assertAlmostEqual(self.broker.balance(s, KRW), 10_000_000)
-            self.assertAlmostEqual(self.broker.balance(s, USDT), 5_000)
+            self.assertAlmostEqual(self.broker.balance(s, UPBIT_USDT), 5_000)
 
     def test_rejects_thin_orderbook(self):
         """호가가 얇으면 진입 안 함"""
@@ -138,21 +135,31 @@ class PaperBrokerTest(unittest.TestCase):
             with self.assertRaises(EntryRejected):
                 self.broker.open_hedge(s, make_quote(-1.0, depth=10), 500)
 
+    def test_leverage_margin_and_liquidation_price(self):
+        """3배면 증거금은 숏 금액의 1/3, 강제청산 가격은 약 +32.8%"""
+        broker = PaperBroker(FEES, 0.3, leverage=3, mmr=0.005)
+        with self.sf() as s:
+            pos = broker.open_hedge(s, make_quote(-1.0), 500)
+            self.assertAlmostEqual(pos.bybit_margin_usdt, pos.bybit_qty * pos.entry_bybit_price_usdt / 3)
+            self.assertAlmostEqual(pos.liquidation_price / pos.entry_bybit_price_usdt - 1, 1 / 3 - 0.005)
+
 
 class EngineTest(unittest.TestCase):
-    """엔진: 진입 / 익절 / 손절 / 펀딩비"""
+    """엔진: 진입 / 익절 / 손절 / 펀딩비 / 진입 때 기준 고정"""
 
     def setUp(self):
-        """메모리 DB + 고정 환율 1,400원"""
         self.market = FakeMarket()
-        self.sf = make_session_factory(":memory:")
-        self.engine = Engine(make_settings(), self.market, fixed_fx(), PaperBroker(FEES, 0.3), self.sf, ["XRP"])
-        self.engine.startup()
+        self.engine, self.sf, self.broker = make_engine(make_settings(), self.market)
 
     def _positions(self):
-        """DB 의 모든 포지션"""
         with self.sf() as s:
             return s.query(Position).all()
+
+    def test_no_fx_still_trades(self):
+        """달러 환율이 없어도(표시용) 매매한다"""
+        self.market.quotes = {"XRP": make_quote(-1.0)}
+        self.engine.step()
+        self.assertEqual(len(self._positions()), 1)
 
     def test_no_entry_above_threshold(self):
         """김프 -0.2% 는 기준 -0.5% 보다 높으니 진입 안 함"""
@@ -161,205 +168,168 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(self._positions(), [])
 
     def test_entry_then_take_profit(self):
-        """진입 → 목표 못 미치면 유지 → 목표 넘으면 청산"""
+        """진입 → 목표 못 미치면 유지 → 넘으면 청산 (비용 약 0.55%: 수수료 0.31 + 전송 0.2 + 호가)"""
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
         [pos] = self._positions()
-        self.assertEqual(pos.status, PositionStatus.OPEN)
-        self.assertAlmostEqual(pos.bybit_qty, 500.0)  # 500 ÷ 0.9999 = 500.05 → 0.1개 단위 내림
+        self.assertEqual(pos.bybit_qty, 500.0)
 
-        # -0.2%: 김프 0.8%p 올랐지만 비용(약 0.41%) 빼면 목표 1% 안 됨 → 유지
-        self.market.quotes = {"XRP": make_quote(-0.2)}
+        self.market.quotes = {"XRP": make_quote(0.2)}  # 1.2%p 올랐지만 비용 빼면 1% 안 됨
         self.engine.step()
         self.assertEqual(self._positions()[0].status, PositionStatus.OPEN)
 
-        # +0.6%: 1.6%p 올라서 비용 빼도 1% 넘음 → 청산
-        self.market.quotes = {"XRP": make_quote(+0.6)}
+        self.market.quotes = {"XRP": make_quote(0.8)}  # 1.8%p → 넘음
         self.engine.step()
         [pos] = self._positions()
-        self.assertEqual(pos.status, PositionStatus.CLOSED)
         self.assertEqual(pos.exit_reason, ExitReason.TAKE_PROFIT)
         self.assertGreaterEqual(pos.net_pnl_percent, 1.0)
-        self.assertGreater(pos.net_pnl_krw, 0)
+        self.assertGreater(pos.usdt_bought, pos.usdt_sold)
 
     def test_stop_loss_and_no_immediate_reentry(self):
-        """김프 급락 → 손절. 손절 직후엔 김프가 낮아도 다시 안 들어간다"""
+        """김프 급락 → 손절, 손절 직후엔 다시 안 들어감"""
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
         self.market.quotes = {"XRP": make_quote(-7.0)}
         self.engine.step()
-        self.engine.step()  # 재진입 대기 시간 중
+        self.engine.step()
         [pos] = self._positions()
         self.assertEqual(pos.exit_reason, ExitReason.STOP_LOSS)
 
     def test_entry_rules_saved_and_fixed(self):
-        """진입 때 기준을 포지션에 저장하고, 나중에 설정을 바꿔도 그 기준으로 청산한다"""
+        """진입 때 기준을 저장하고, 나중에 설정을 바꿔도 그 기준으로 청산"""
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
         [pos] = self._positions()
         self.assertEqual((pos.entry_threshold_percent, pos.target_net_profit_percent, pos.stop_loss_percent),
                          (-0.5, 1.0, -5.0))
-
-        # 들고 있는 중에 목표를 5% 로 바꿈 → 이 포지션은 여전히 목표 1% 로 청산돼야 한다
         self.engine.s = make_settings(target_net_profit_percent=5.0)
-        self.market.quotes = {"XRP": make_quote(+0.6)}
+        self.market.quotes = {"XRP": make_quote(0.8)}
         self.engine.step()
-        [pos] = self._positions()
-        self.assertEqual(pos.exit_reason, ExitReason.TAKE_PROFIT)
-        self.assertLess(pos.net_pnl_percent, 5.0)
-
-    def test_premium_split_and_funding_krw_saved(self):
-        """업비트 USDT 가격이 있으면 김프를 테더 몫/코인 몫으로 나눠 저장, 펀딩비도 원화로 저장"""
-        usdt = FX * 1.005  # 테더 +0.5%
-        self.market.quotes = {"XRP": make_quote(-1.0, usdt_krw=usdt)}
-        self.engine.step()
-        [pos] = self._positions()
-        self.assertAlmostEqual(pos.entry_tether_premium, 0.5, places=6)
-        self.assertAlmostEqual((1 + pos.entry_tether_premium / 100) * (1 + pos.entry_coin_premium / 100),
-                               1 + pos.entry_premium / 100)
-
-        # 펀딩비 1번 받은 뒤 청산
-        now_ms = int(time.time() * 1000)
-        self.market.funding = FundingInfo(rate=0.0001, next_funding_ms=now_ms - 1000, mark_price=1.0,
-                                          interval_hours=8.0)
-        self.engine.step()
-        self.engine.step()
-        self.market.quotes = {"XRP": make_quote(+0.6, usdt_krw=usdt)}
-        self.engine.step()
-        [pos] = self._positions()
-        self.assertEqual(pos.status, PositionStatus.CLOSED)
-        self.assertAlmostEqual(pos.funding_krw, pos.funding_usdt * FX)
-        self.assertIsNotNone(pos.exit_coin_premium)
-
-        # 김프 기록에도 테더 몫 / 코인 몫 / 펀딩비율이 남는다
-        with self.sf() as s:
-            snap = s.query(PremiumSnapshot).order_by(PremiumSnapshot.id.desc()).first()
-            self.assertAlmostEqual(snap.tether_premium, 0.5, places=6)
-            self.assertIsNotNone(snap.coin_premium)
-            self.assertEqual(snap.funding_rate, 0.0001)
-            self.assertEqual(snap.funding_interval_hours, 8.0)
-            self.assertEqual(snap.next_funding_ms, now_ms - 1000)
+        self.assertEqual(self._positions()[0].exit_reason, ExitReason.TAKE_PROFIT)
 
     def test_funding_applied_once(self):
-        """펀딩비는 정산 한 번에 딱 한 번만 반영"""
+        """펀딩비는 정산 한 번에 딱 한 번만"""
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
-
         now_ms = int(time.time() * 1000)
-        # 1) 다음 정산 정보 저장
         self.market.funding = FundingInfo(rate=0.0001, next_funding_ms=now_ms - 1000, mark_price=1.0)
         self.engine.step()
-        # 2) 정산 시각이 지났으니 반영
         self.engine.step()
-        # 3) 거래소가 같은 시각을 또 줘도 다시 반영하면 안 됨
         self.engine.step()
         with self.sf() as s:
             self.assertEqual(s.query(FundingEvent).count(), 1)
-            pos = s.query(Position).one()
-            self.assertAlmostEqual(pos.funding_usdt, 500.0 * 1.0 * 0.0001)
+            self.assertAlmostEqual(s.query(Position).one().funding_usdt, 500 * 1.0 * 0.0001, delta=1e-4)
+
+    def test_snapshot_has_bot_and_site_premium(self):
+        """김프 기록에 봇 김프(코인 몫)와 사이트식 김프·테더 프리미엄이 같이 남는다"""
+        self.market.quotes = {"XRP": make_quote(-0.2, fx=USDT_KRW / 1.005)}  # 테더 +0.5%
+        self.engine.step()
+        with self.sf() as s:
+            snap = s.query(PremiumSnapshot).one()
+            self.assertAlmostEqual(snap.mid_premium, -0.2, places=6)
+            self.assertAlmostEqual(snap.tether_premium, 0.5, places=6)
+            self.assertAlmostEqual(snap.site_premium, (1.005 * 0.998 - 1) * 100, places=6)
 
 
-class FxGuardTest(unittest.TestCase):
-    """달러 환율이 없거나 오래됐을 때의 동작"""
+class LeverageAndRebalanceTest(unittest.TestCase):
+    """레버리지 / 강제청산 / 리밸런싱 / 자동 포지션 크기"""
 
-    def _engine(self, fx: FxProvider):
-        """주어진 환율 공급기로 엔진 만들기"""
+    def test_target_share(self):
+        """업비트 목표 비율: 1배 43.5%, 3배 69.8% (여유분 30%)"""
+        self.assertAlmostEqual(make_settings().upbit_target_share(), 1 / 2.3)
+        self.assertAlmostEqual(make_settings(bybit_leverage=3).upbit_target_share(), 3 / 4.3)
+
+    def test_liquidation_closes_both_legs(self):
+        """3배: 바이비트 고가가 강제청산 가격에 닿으면 증거금을 잃고 업비트 코인도 즉시 정리"""
         market = FakeMarket()
-        sf = make_session_factory(":memory:")
-        engine = Engine(make_settings(), market, fx, PaperBroker(FEES, 0.3), sf, ["XRP"])
-        engine.startup()
-        return engine, market, sf
-
-    def test_no_fx_no_trading(self):
-        """환율을 한 번도 못 받았으면 아무것도 안 한다"""
-        def fail():
-            raise RuntimeError("네트워크 오류")
-
-        engine, market, sf = self._engine(FxProvider(fetcher=fail))
-        market.quotes = {"XRP": make_quote(-3.0)}
-        engine.step()
-        with sf() as s:
-            self.assertEqual(s.query(Position).count(), 0)
-
-    def test_stale_fx_blocks_entry_but_allows_exit(self):
-        """환율이 오래되면 새 진입은 막고, 이미 가진 포지션 청산은 계속한다"""
-        now = [0.0]
-        ok = [True]
-
-        def fetcher():
-            if not ok[0]:
-                raise RuntimeError("조회 실패")
-            return FX
-
-        fx = FxProvider(refresh_sec=10, max_stale_sec=100, fetcher=fetcher, clock=lambda: now[0])
-        engine, market, sf = self._engine(fx)
-
-        # 환율 정상 → 진입
+        engine, sf, broker = make_engine(make_settings(bybit_leverage=3), market)
         market.quotes = {"XRP": make_quote(-1.0)}
         engine.step()
-
-        # 이후 조회가 계속 실패하고 200초 지남 → 오래된 값
-        ok[0] = False
-        now[0] = 200.0
-        self.assertTrue(fx.get().is_stale)
-
-        # 청산 조건이 되면 청산은 된다
-        market.quotes = {"XRP": make_quote(+1.0)}
+        with sf() as s:
+            pos = s.query(Position).one()
+            liq, margin = pos.liquidation_price, pos.bybit_margin_usdt
+        market.quotes = {"XRP": make_quote(-1.0, bybit_price=1.30, bybit_high=liq * 1.001)}
         engine.step()
         with sf() as s:
-            self.assertEqual(s.query(Position).filter_by(status=PositionStatus.CLOSED).count(), 1)
+            pos = s.query(Position).one()
+            self.assertEqual(pos.exit_reason, ExitReason.LIQUIDATION)
+            self.assertAlmostEqual(pos.bybit_leg_usdt, -margin)
+            self.assertAlmostEqual(broker.balance(s, coin_key("XRP")), 0)
 
-        # 재진입 대기 시간이 없어도, 오래된 환율이면 새 진입은 안 된다
-        engine._reentry_allowed_at.clear()
-        market.quotes = {"XRP": make_quote(-3.0)}
+    def test_liquidation_warning(self):
+        """강제청산까지 15% 안쪽이면 증거금 추가 경고"""
+        market = FakeMarket()
+        engine, sf, _ = make_engine(make_settings(bybit_leverage=3), market)
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
+            market.quotes = {"XRP": make_quote(-1.0, bybit_price=1.20)}  # 강제청산(약 1.328)까지 약 10.6%
+            engine.step()
+        self.assertTrue(any("증거금 약" in m for m in logs.output))
+
+    def test_rebalance_alert_at_start(self):
+        """시작할 때 업비트에만 USDT 가 있으면 바이비트로 옮기라고 알린다"""
+        settings = make_settings()
+        sf = make_session_factory(":memory:")
+        broker = PaperBroker(FEES, 0.3)
+        with sf() as s:
+            broker.ensure_initial_balances(s, 10_000, 1.0)  # 전부 업비트
+        engine = Engine(settings, FakeMarket(), None, broker, sf, ["XRP"])
+        with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
+            engine.startup()
+        msg = next(m for m in logs.output if "리밸런싱" in m)
+        self.assertIn("업비트 → 바이비트", msg)
+        self.assertIn(f"{10_000 * (1 - settings.upbit_target_share()):,.2f}", msg)
+
+    def test_auto_position_size(self):
+        """POSITION_SIZE_USDT 가 없으면 자본 × 업비트 비율 × 90% ÷ 최대 포지션 수"""
+        market = FakeMarket()
+        settings = make_settings(position_size_usdt=None, max_open_positions=3)
+        engine, sf, _ = make_engine(settings, market)
+        market.quotes = {"XRP": make_quote(-1.0)}
         engine.step()
         with sf() as s:
-            self.assertEqual(s.query(Position).count(), 1)
+            pos = s.query(Position).one()
+        expected = 10_000 * settings.upbit_target_share() * 0.9 / 3
+        self.assertAlmostEqual(pos.bybit_qty * pos.entry_bybit_price_usdt, expected, delta=1)
 
 
 class CoinParamsEngineTest(unittest.TestCase):
-    """코인별 설정(진입 기준, 포지션 규모, 목표)이 실제로 쓰이는지"""
+    """코인별 설정이 실제로 쓰이는지"""
 
     def setUp(self):
-        """XRP 는 공통값(기준 -0.5%), SOL 은 기준 -2.0% · 규모 200 USDT · 목표 0.5%"""
+        """XRP 는 공통값, SOL 은 기준 -2.0% · 크기 200 USDT · 목표 0.5%"""
         self.market = FakeMarket()
-        self.sf = make_session_factory(":memory:")
         base = make_settings(coins=["XRP", "SOL"], max_open_positions=2)
         sol = CoinParams(entry_premium_threshold_percent=-2.0, target_net_profit_percent=0.5,
                          stop_loss_percent=-5.0, position_size_usdt=200,
                          overridden=("entry_premium_threshold_percent", "target_net_profit_percent",
                                      "position_size_usdt"))
         settings = Settings(**{**base.__dict__, "coin_params": {"XRP": base.default_params(), "SOL": sol}})
-        self.engine = Engine(settings, self.market, fixed_fx(), PaperBroker(FEES, 0.3), self.sf, ["XRP", "SOL"])
-        self.engine.startup()
+        self.engine, self.sf, _ = make_engine(settings, self.market)
 
     def _open(self):
-        """열린 포지션을 {코인: 포지션} 으로"""
         with self.sf() as s:
             return {p.coin: p for p in s.query(Position).filter_by(status=PositionStatus.OPEN)}
 
-    def test_per_coin_entry_threshold(self):
-        """김프 -1%: XRP(기준 -0.5%) 진입, SOL(기준 -2.0%) 미진입"""
+    def test_per_coin_entry_threshold_and_size(self):
+        """김프 -1%: XRP 진입, SOL 미진입 → SOL 이 -2.5% 가 되면 200 USDT 로 진입"""
         self.market.quotes = {"XRP": make_quote(-1.0), "SOL": make_quote(-1.0, coin="SOL")}
         self.engine.step()
         self.assertEqual(set(self._open()), {"XRP"})
-
-        # SOL 이 -2.5% 가 되면 진입, 규모는 SOL 설정(200 USDT)
         self.market.quotes = {"XRP": make_quote(-1.0), "SOL": make_quote(-2.5, coin="SOL")}
         self.engine.step()
         sol = self._open()["SOL"]
         self.assertAlmostEqual(sol.bybit_qty * sol.entry_bybit_price_usdt, 200, delta=1)
 
     def test_per_coin_target(self):
-        """SOL 은 목표 0.5% 라서, 공통 목표 1% 에 못 미쳐도 청산된다"""
+        """SOL 은 목표 0.5% (비용: 수수료 0.31 + 전송 1/200 = 0.5 + 호가 → 약 0.85%)"""
         self.market.quotes = {"SOL": make_quote(-2.5, coin="SOL")}
         self.engine.step()
-        # -2.5% → -1.5%: 1%p 올랐지만 비용(수수료 0.21% + 전송비 1/200=0.5% + 호가) 빼면 약 0.27% → 유지
-        self.market.quotes = {"SOL": make_quote(-1.5, coin="SOL")}
+        self.market.quotes = {"SOL": make_quote(-1.5, coin="SOL")}  # 1%p → 순 약 0.15% → 유지
         self.engine.step()
         self.assertIn("SOL", self._open())
-        # -1.2%: 1.3%p - 비용 ≈ 0.57% → SOL 목표 0.5% 넘음 → 청산
-        self.market.quotes = {"SOL": make_quote(-1.2, coin="SOL")}
+        self.market.quotes = {"SOL": make_quote(-1.0, coin="SOL")}  # 1.5%p → 순 약 0.65% → 청산
         self.engine.step()
         self.assertNotIn("SOL", self._open())
 

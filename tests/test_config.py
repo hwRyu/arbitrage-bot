@@ -53,5 +53,34 @@ class CoinOverrideTest(unittest.TestCase):
             self._load({"COINS": "SOL", "SOL_POSITION_SIZE_USDT": "abc"})
 
 
+class CapitalSettingsTest(unittest.TestCase):
+    """레버리지 / 자본 비율 / 포지션 크기 설정"""
+
+    def _load(self, env: dict):
+        with mock.patch.dict(os.environ, env, clear=True):
+            return load_settings(env_file=None)
+
+    def test_defaults(self):
+        """기본: 1배, 여유분 30% → 업비트 43.5%, 포지션 크기 자동, 시작 자본 10,000 USDT"""
+        s = self._load({"COINS": "XRP"})
+        self.assertEqual(s.bybit_leverage, 1.0)
+        self.assertAlmostEqual(s.upbit_target_share(), 1 / 2.3)
+        self.assertIsNone(s.position_size_usdt)
+        self.assertEqual(s.paper_initial_total_usdt, 10_000)
+
+    def test_leverage_changes_ratio(self):
+        """레버리지 3배 → 업비트 69.8% (여유분 30%), 여유분 0 이면 75%"""
+        self.assertAlmostEqual(self._load({"COINS": "XRP", "BYBIT_LEVERAGE": "3"}).upbit_target_share(), 3 / 4.3)
+        s = self._load({"COINS": "XRP", "BYBIT_LEVERAGE": "3", "BYBIT_MARGIN_BUFFER_PERCENT": "0"})
+        self.assertAlmostEqual(s.upbit_target_share(), 0.75)
+
+    def test_invalid_capital_settings(self):
+        """레버리지 범위, 사용률 범위를 검사한다"""
+        with self.assertRaisesRegex(ValueError, "BYBIT_LEVERAGE"):
+            self._load({"COINS": "XRP", "BYBIT_LEVERAGE": "20"})
+        with self.assertRaisesRegex(ValueError, "CAPITAL_USAGE_PERCENT"):
+            self._load({"COINS": "XRP", "CAPITAL_USAGE_PERCENT": "150"})
+
+
 if __name__ == "__main__":
     unittest.main()

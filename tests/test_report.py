@@ -11,7 +11,7 @@ from kimp.report import Row, _percentile, summarize_coin
 def row(entry: float, funding: float = 0.0001, tether: float = 0.5) -> Row:
     """테스트용 기록 한 줄 (가운데 김프 = 진입 김프 - 0.05, 청산 김프 = 진입 김프 - 0.1)"""
     return Row(coin="XRP", mid_premium=entry - 0.05, entry_premium=entry, exit_premium=entry - 0.1,
-               tether_premium=tether, coin_premium=entry - tether, funding_rate=funding)
+               tether_premium=tether, site_premium=entry + tether, funding_rate=funding)
 
 
 class ReportTest(unittest.TestCase):

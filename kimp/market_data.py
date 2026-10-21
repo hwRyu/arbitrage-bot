@@ -25,7 +25,7 @@ from kimp.premium import OrderBook, Quote
 
 logger = logging.getLogger(__name__)
 
-# 업비트 USDT 가격 (테더 프리미엄 표시용으로만 쓴다. 김프 계산에는 안 씀)
+# 업비트 USDT/KRW: 김프 계산 기준이자, 진입/청산 때 실제로 USDT 를 사고파는 마켓
 USDT_KRW_SYMBOL = "USDT/KRW"
 
 
@@ -66,7 +66,7 @@ class MarketData:
     사용법:
         md = MarketData(depth=30)
         coins = md.filter_supported(["XRP", "SOL"])   # 양쪽에 다 있는 코인만 남김
-        quotes = md.fetch_quotes(coins, fx_krw=1325)  # 매 스캔마다 호출
+        quotes = md.fetch_quotes(coins, fx_krw=1325)  # 매 스캔마다 호출 (환율은 표시용, 없어도 됨)
     """
 
     def __init__(self, depth: int = 30):
@@ -134,20 +134,20 @@ class MarketData:
             timestamp_ms=raw.get("timestamp") or int(time.time() * 1000),
         )
 
-    def fetch_quotes(self, coins: List[str], fx_krw: float) -> Dict[str, Quote]:
+    def fetch_quotes(self, coins: List[str], fx_krw: Optional[float] = None) -> Dict[str, Quote]:
         """
         코인별 시세 묶음(Quote) 가져오기
 
-        1) 업비트: 모든 코인 + USDT 호가를 요청 1번에
+        1) 업비트: 모든 코인 + USDT/KRW 호가를 요청 1번에
         2) 바이비트: 코인마다 호가 요청 (한 번에 받는 기능이 없음)
 
         Args:
             coins: 조회할 코인 목록
-            fx_krw: 이번 스캔에 쓸 달러 환율 (김프 계산 기준)
+            fx_krw: 달러 환율 (표시용: 사이트식 김프, 테더 프리미엄). 없어도 매매에는 상관없음
 
         Returns:
-            {코인: Quote}. 조회에 실패한 코인은 빠진다. (다른 코인은 계속 진행)
-            업비트 USDT 가격이 없어도 괜찮다. (표시용이라 김프 계산에는 영향 없음)
+            {코인: Quote}. 조회에 실패한 코인은 빠진다.
+            업비트 USDT/KRW 호가가 없으면 김프를 계산할 수 없어서 이번 스캔은 비어 있는 결과를 돌려준다.
         """
         symbols = [upbit_symbol(c) for c in coins] + [USDT_KRW_SYMBOL]
         try:
@@ -157,7 +157,10 @@ class MarketData:
             return {}
 
         usdt_raw = upbit_books.get(USDT_KRW_SYMBOL)
-        usdt_krw = self._to_orderbook(usdt_raw).mid if usdt_raw else None
+        usdt_book = self._to_orderbook(usdt_raw) if usdt_raw else None
+        if usdt_book is None or usdt_book.mid is None:
+            logger.error("업비트 USDT/KRW 호가가 없어서 이번 스캔은 건너뜁니다")
+            return {}
 
         quotes: Dict[str, Quote] = {}
         for coin in coins:
@@ -176,7 +179,7 @@ class MarketData:
             if upbit_book.mid is None or bybit_book.mid is None:
                 logger.warning("%s 호가가 비어 있어서 건너뜀", coin)
                 continue
-            quotes[coin] = Quote(coin=coin, upbit=upbit_book, bybit=bybit_book, fx_krw=fx_krw, usdt_krw=usdt_krw)
+            quotes[coin] = Quote(coin=coin, upbit=upbit_book, bybit=bybit_book, usdt=usdt_book, fx_krw=fx_krw)
         return quotes
 
     def fetch_funding(self, coin: str) -> Optional[FundingInfo]:
