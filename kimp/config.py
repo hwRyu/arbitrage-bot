@@ -178,8 +178,10 @@ class Settings:
     # 자동 송금 (실거래, docs/live.md). 기본 꺼짐 = 알림만
     # ------------------------------------------------------------------
     auto_transfer_enabled: bool = False
-    # 보낼 네트워크 (업비트 net_type / 바이비트 chain). 예) TRX (수수료 싸고 빠름). 양쪽이 지원해야 함
-    transfer_network: str = "TRX"
+    # 보낼 네트워크. 같은 체인도 거래소마다 이름이 다르다 → 따로 적는다 (live_check 가 양쪽 목록을 보여줌)
+    #   예) 트론: 업비트 'TRX' / 바이비트 'TRC20',  이더리움: 업비트 'ETH' / 바이비트 'ERC20'
+    upbit_transfer_network: str = "TRX"
+    bybit_transfer_network: str = "TRC20"
     # 이보다 적게는 안 보냄 (USDT). 수수료만 버리지 않게
     transfer_min_usdt: float = 10.0
     # 하루에 보낼 수 있는 최대 (USDT, 양방향 합)
@@ -402,6 +404,11 @@ class Settings:
         return lev / (lev + 1 + self.bybit_margin_buffer_percent / 100)
 
     @property
+    def transfer_network_label(self) -> str:
+        """기록용 네트워크 이름. 예) 'TRX/TRC20' (업비트/바이비트)"""
+        return f"{self.upbit_transfer_network}/{self.bybit_transfer_network}"
+
+    @property
     def mode(self) -> str:
         """실행 모드: 'paper' (가짜) / 'dry_run' (실제 잔고·호가, 주문 안 냄) / 'live' (실제 주문)"""
         if self.paper_trading:
@@ -461,7 +468,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         live_db_path=_env_str("LIVE_DB_PATH", d.live_db_path),
         dry_run_db_path=_env_str("DRY_RUN_DB_PATH", d.dry_run_db_path),
         auto_transfer_enabled=_env_bool("AUTO_TRANSFER_ENABLED", d.auto_transfer_enabled),
-        transfer_network=_env_str("TRANSFER_NETWORK", d.transfer_network).upper(),
+        upbit_transfer_network=_env_str("UPBIT_TRANSFER_NETWORK", d.upbit_transfer_network).upper(),
+        bybit_transfer_network=_env_str("BYBIT_TRANSFER_NETWORK", d.bybit_transfer_network).upper(),
         transfer_min_usdt=_env_float("TRANSFER_MIN_USDT", d.transfer_min_usdt),
         transfer_max_usdt_per_day=_env_float("TRANSFER_MAX_USDT_PER_DAY", d.transfer_max_usdt_per_day),
         transfer_alert_minutes=_env_float("TRANSFER_ALERT_MINUTES", d.transfer_alert_minutes),

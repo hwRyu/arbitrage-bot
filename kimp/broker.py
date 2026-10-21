@@ -856,7 +856,7 @@ class HedgeBroker:
 
 def broker_kwargs(settings, safety: Optional[Safety] = None) -> dict:
     """설정 → HedgeBroker 공통 옵션 (실시간 봇과 시뮬레이션이 같은 값을 쓰게)"""
-    return dict(safety=safety, network=settings.transfer_network, transfer_min_usdt=settings.transfer_min_usdt,
+    return dict(safety=safety, network=settings.transfer_network_label, transfer_min_usdt=settings.transfer_min_usdt,
                 transfer_max_usdt_per_day=settings.transfer_max_usdt_per_day,
                 transfer_alert_minutes=settings.transfer_alert_minutes,
                 reconcile_interval_sec=settings.reconcile_interval_sec,

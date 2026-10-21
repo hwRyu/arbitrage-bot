@@ -376,27 +376,32 @@ class LiveExecutor:
     # ------------------------------------------------------------------
     # 송금
     # ------------------------------------------------------------------
-    def _deposit_address(self, to_bybit: bool, network: str):
-        """받는 주소 (설정값이 있으면 그것, 없으면 받는 거래소에서 내 입금 주소 조회)"""
+    def _deposit_address(self, to_bybit: bool):
+        """
+        받는 주소 (설정값이 있으면 그것, 없으면 받는 거래소에서 내 입금 주소 조회)
+
+        네트워크 이름은 받는 거래소의 이름으로 (바이비트 BYBIT_TRANSFER_NETWORK, 업비트 UPBIT_TRANSFER_NETWORK)
+        """
         if to_bybit and self.s.bybit_deposit_address:
             return self.s.bybit_deposit_address, self.s.bybit_deposit_tag or None
         if not to_bybit and self.s.upbit_deposit_address:
             return self.s.upbit_deposit_address, self.s.upbit_deposit_tag or None
         if to_bybit:
-            got = self.by.fetch_deposit_address("USDT", {"network": network})
+            got = self.by.fetch_deposit_address("USDT", {"network": self.s.bybit_transfer_network})
         else:
-            got = self.up.fetch_deposit_address("USDT", {"network": network})
+            got = self.up.fetch_deposit_address("USDT", {"network": self.s.upbit_transfer_network})
         return got["address"], got.get("tag") or None
 
     def withdraw(self, session: Session, to_bybit: bool, amount_usdt: float, network: str) -> str:
+        """출금 (네트워크 이름은 보내는 거래소의 이름: 업비트 net_type 'TRX' / 바이비트 chain 'TRC20')"""
         try:
-            address, tag = self._deposit_address(to_bybit, network)
+            address, tag = self._deposit_address(to_bybit)
             if to_bybit:
-                r = self.up.withdraw("USDT", amount_usdt, address, tag, {"net_type": network})
+                r = self.up.withdraw("USDT", amount_usdt, address, tag, {"net_type": self.s.upbit_transfer_network})
             else:
                 # 바이비트는 거래(통합) 계좌 → 펀딩 계좌로 옮긴 뒤 출금
                 self.by.transfer("USDT", amount_usdt, "unified", "funding")
-                r = self.by.withdraw("USDT", amount_usdt, address, tag, {"network": network})
+                r = self.by.withdraw("USDT", amount_usdt, address, tag, {"network": self.s.bybit_transfer_network})
         except Exception as exc:
             raise OrderFailed(f"출금 실패: {exc}") from exc
         self.refresh()

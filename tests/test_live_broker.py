@@ -253,7 +253,7 @@ class FakeBybit(FakeExchange):
 def settings(**kw) -> Settings:
     base = dict(coins=["XRP"], fees=FEES, paper_trading=False, live_dry_run=False, live_confirm="YES",
                 upbit_access_key="k", upbit_secret_key="s", bybit_api_key="k", bybit_api_secret="s",
-                transfer_network="TRX")
+                upbit_transfer_network="TRX", bybit_transfer_network="TRC20")
     base.update(kw)
     return Settings(**base)
 

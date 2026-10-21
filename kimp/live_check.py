@@ -9,7 +9,8 @@
 1) 설정: 모드, 키 4개, LIVE_CONFIRM, 안전 한도
 2) 업비트: 키로 잔고 조회 (IP 허용 확인), 키 만료일, USDT 출금 허용 주소에 바이비트 입금 주소가 있는지
 3) 바이비트: 키로 잔고 조회, 키 권한(선물 거래·출금), 통합계좌인지, 코인별 포지션 모드·마진 모드·레버리지
-4) 송금 네트워크(TRANSFER_NETWORK) 로 양쪽 입금 주소 조회
+4) 송금 네트워크: 양쪽이 지원하는 USDT 네트워크 목록, 설정한 네트워크로 양쪽 입금 주소 조회
+   (같은 체인도 이름이 다르다: 트론 = 업비트 TRX / 바이비트 TRC20)
 5) 포지션 크기가 업비트 최소 주문(5,000원)보다 큰지
 6) 텔레그램 테스트 메시지
 """
@@ -55,7 +56,7 @@ def run_checks(settings, upbit=None, bybit=None) -> List[Tuple[str, str, str]]:
         except Exception as exc:
             add(FAIL, "거래소 연결", _short(exc))
             return rows
-    net = settings.transfer_network
+    up_net, by_net = settings.upbit_transfer_network, settings.bybit_transfer_network
 
     # 2) 업비트
     try:
@@ -72,20 +73,44 @@ def run_checks(settings, upbit=None, bybit=None) -> List[Tuple[str, str, str]]:
     except Exception as exc:
         add(WARN, "업비트 키 만료일", _short(exc))
 
-    # 4) 입금 주소 (송금 네트워크)
+    # 4) 송금 네트워크: 양쪽이 같이 지원하는 USDT 네트워크
+    by_nets, up_nets = set(), set()
+    try:
+        cur = (bybit.fetch_currencies() or {}).get("USDT") or {}
+        by_nets = {str(n).upper() for n, info in (cur.get("networks") or {}).items()
+                   if (info or {}).get("deposit") is not False}
+    except Exception as exc:
+        add(WARN, "바이비트 USDT 네트워크", _short(exc))
+    try:
+        for w in upbit.private_get_status_wallet() or []:
+            if w.get("currency") == "USDT" and w.get("wallet_state") in ("working", "withdraw_only", "deposit_only"):
+                up_nets.add(str(w.get("net_type")).upper())
+    except Exception as exc:
+        add(WARN, "업비트 USDT 네트워크", _short(exc))
+    bad = FAIL if settings.auto_transfer_enabled else WARN
+    if by_nets:
+        add(OK if by_net in by_nets else bad, f"바이비트 송금 네트워크 BYBIT_TRANSFER_NETWORK={by_net}",
+            ("지원함" if by_net in by_nets else "지원 안 함") + f" (바이비트 목록: {', '.join(sorted(by_nets))})")
+    if up_nets:
+        add(OK if up_net in up_nets else bad, f"업비트 송금 네트워크 UPBIT_TRANSFER_NETWORK={up_net}",
+            ("지원함" if up_net in up_nets else "지원 안 함") + f" (업비트 목록: {', '.join(sorted(up_nets))})")
+    add(OK, "송금 네트워크 짝", f"업비트 {up_net} ↔ 바이비트 {by_net} — 같은 체인인지 꼭 확인 (다르면 돈을 잃음)")
+
+    # 입금 주소 (송금 네트워크)
     bybit_addr = settings.bybit_deposit_address
     try:
         if not bybit_addr:
-            bybit_addr = bybit.fetch_deposit_address("USDT", {"network": net})["address"]
-        add(OK, f"바이비트 USDT 입금 주소 ({net})", bybit_addr)
+            bybit_addr = bybit.fetch_deposit_address("USDT", {"network": by_net})["address"]
+        add(OK, f"바이비트 USDT 입금 주소 ({by_net})", bybit_addr)
     except Exception as exc:
-        add(FAIL if settings.auto_transfer_enabled else WARN, f"바이비트 USDT 입금 주소 ({net})", _short(exc))
+        add(FAIL if settings.auto_transfer_enabled else WARN, f"바이비트 USDT 입금 주소 ({by_net})", _short(exc))
     try:
-        upbit_addr = settings.upbit_deposit_address or upbit.fetch_deposit_address("USDT", {"network": net})["address"]
-        add(OK, f"업비트 USDT 입금 주소 ({net})",
+        upbit_addr = settings.upbit_deposit_address or upbit.fetch_deposit_address(
+            "USDT", {"network": up_net})["address"]
+        add(OK, f"업비트 USDT 입금 주소 ({up_net})",
             f"{upbit_addr} → 바이비트 출금 화이트리스트에 등록 (자동 송금 쓸 때)")
     except Exception as exc:
-        add(FAIL if settings.auto_transfer_enabled else WARN, f"업비트 USDT 입금 주소 ({net})", _short(exc))
+        add(FAIL if settings.auto_transfer_enabled else WARN, f"업비트 USDT 입금 주소 ({up_net})", _short(exc))
     try:
         allowed = upbit.private_get_withdraws_coin_addresses()
         usdt = [a for a in allowed if a.get("currency") == "USDT"]
@@ -120,11 +145,11 @@ def run_checks(settings, upbit=None, bybit=None) -> List[Tuple[str, str, str]]:
         try:
             ps = bybit.fetch_positions([bybit_symbol(coin)])
             p = ps[0] if ps else {}
-            mode = p.get("marginMode") or "?"
+            mode = p.get("marginMode")
             lev = p.get("leverage")
-            good = mode == "isolated" and (lev is None or float(lev) == float(settings.bybit_leverage))
+            good = mode in (None, "isolated") and (lev is None or float(lev) == float(settings.bybit_leverage))
             add(OK if good else WARN, f"바이비트 {coin} 마진·레버리지",
-                f"{mode}, {lev}배 (실거래 시작 때 격리·{settings.bybit_leverage:g}배로 자동 설정)")
+                f"{mode or '포지션 없음'}, {lev}배 → 실거래 시작 때 격리·{settings.bybit_leverage:g}배로 자동 설정")
         except Exception as exc:
             add(WARN, f"바이비트 {coin} 포지션 정보", _short(exc))
 
