@@ -52,7 +52,11 @@ python -m kimp.live_check      # 키·IP·권한·출금 주소·텔레그램 �
 PAPER_TRADING=false python main.py                                   # 드라이런 (주문 안 냄)
 PAPER_TRADING=false LIVE_DRY_RUN=false LIVE_CONFIRM=YES python main.py  # 실제 주문
 ```
+```bash
+ONE_SHOT=true ONE_SHOT_MAX_HOURS=6 python main.py   # 한 번만: 포지션 1개 잡고 청산되면 종료 + 점검 요약
+```
 페이퍼·드라이런·실거래는 **같은 엔진·브로커**를 쓰고 주문 실행기만 다릅니다. 순서는 [docs/live.md](docs/live.md) 5번.
+**첫 실거래는 `ONE_SHOT=true`(기본 꺼짐) 로 한 바퀴만 돌려보는 것을 권합니다.**
 
 ## 실행
 가상환경(venv)을 씁니다. 터미널별 설치·접속 명령은 [docs/commands.md 0번](docs/commands.md) 에 있습니다.
