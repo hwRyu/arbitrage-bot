@@ -5,6 +5,7 @@
 
 > **실거래 준비는 [docs/live.md](docs/live.md)**, 서버 배포는 [docs/deploy.md](docs/deploy.md).
 
+> **이어서 작업한다면 [HANDOFF.md](HANDOFF.md) 부터.**
 > **명령어와 실행 방법은 [docs/commands.md](docs/commands.md)** 에 모아 두었습니다. 펀딩비 전략은 [docs/carry.md](docs/carry.md).
 
 > **전략의 기준은 [docs/concept.md](docs/concept.md)** 입니다. 다른 문서나 코드와 다르면 그 문서가 맞습니다.
