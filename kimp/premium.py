@@ -194,17 +194,19 @@ def estimate_fill_by_cost(levels: Sequence[Level], cost: float) -> Optional[Fill
     for price, size in levels:
         if remaining <= 0:
             break
+        # 이 호가 줄을 전부 먹을 수도 있고(price x size), 남은 금액만큼만 먹을 수도 있다
         take_cost = min(price * size, remaining)  # 이 줄에서 쓸 금액
-        filled += take_cost / price
+        filled += take_cost / price               # 금액 ÷ 그 줄의 가격 = 받는 개수
         spent += take_cost
         remaining -= take_cost
 
     if filled <= 0:
         return None
     return FillEstimate(
-        avg_price=spent / filled,
+        avg_price=spent / filled,      # 금액 가중 평균가 (단순 평균이 아니다)
         filled_qty=filled,
-        best_price=levels[0][0],
+        best_price=levels[0][0],       # 맨 앞 호가 — 여기와 비교해 밀림(slippage)을 낸다
+        # 부동소수 오차 때문에 딱 맞아도 cost 보다 조금 작게 나올 수 있어 _EPS 만큼 여유를 둔다
         is_complete=spent >= cost * (1 - _EPS),
     )
 
@@ -237,7 +239,12 @@ class EntryPlan:
 
     @property
     def premium(self) -> float:
-        """실제 체결가로 계산한 진입 김프 (%)"""
+        """
+        실제 체결가로 계산한 진입 김프 (%) — 세 평균 체결가를 공식에 넣는다
+
+        가운데 가격으로 낸 김프보다 **항상 불리하다**(높다). 세 군데 모두 불리한 쪽
+        호가를 쓰기 때문이다. 그 차이가 호가 간격 비용이다.
+        """
         return premium_percent(self.upbit.avg_price, self.bybit.avg_price, self.usdt.avg_price)
 
 
@@ -264,11 +271,17 @@ class ExitPlan:
 
     @property
     def is_complete(self) -> bool:
+        """세 군데 모두 호가가 충분한지. 하나라도 모자라면 청산 판단을 보류한다"""
         return self.bybit.is_complete and self.usdt.is_complete and self.upbit.is_complete
 
     @property
     def premium(self) -> float:
-        """실제 체결가로 계산한 청산 김프 (%)"""
+        """
+        실제 체결가로 계산한 청산 김프 (%)
+
+        가운데 가격보다 **항상 낮다.** '진입 김프 − 청산 김프' 가 바로 왕복 호가 간격 비용이고,
+        김프가 그만큼은 올라야 본전이다.
+        """
         return premium_percent(self.upbit.avg_price, self.bybit.avg_price, self.usdt.avg_price)
 
 
@@ -365,16 +378,22 @@ class Quote:
         Returns:
             EntryPlan. 어느 단계든 호가가 비어 있으면 None. 다 못 채우면 is_complete=False
         """
+        # 1) 바이비트 숏: 파는 쪽이니 매수 호가(bids)를 소진한다
         by = estimate_fill(self.bybit.bids, bybit_qty)
         if not by:
             return None
+        # 금액 헷징의 핵심: 숏 '금액'(개수 x 가격)이 업비트에서 팔 USDT 개수가 된다.
+        # 개수를 맞추는 게 아니라 금액을 맞추기 때문에 양쪽 코인 개수는 달라진다.
         usdt_sold = by.cost
-        us = estimate_fill(self.usdt.bids, usdt_sold)
+        us = estimate_fill(self.usdt.bids, usdt_sold)  # USDT 를 판다 → bids
         if not us:
             return None
         usdt_fee = us.cost * upbit_fee_rate
+        # 받은 원화에서 코인을 살 때, 업비트는 **주문 금액과 별도로** 수수료를 더 떼어 간다.
+        # 그래서 원화를 그대로 주문하면 수수료만큼 잔고가 모자라 거절된다.
+        #   주문금액 x (1 + 수수료율) <= 가진 원화  →  주문금액 = 가진 원화 ÷ (1 + 수수료율)
         krw_for_coin = (us.cost - usdt_fee) / (1 + upbit_fee_rate)
-        up = estimate_fill_by_cost(self.upbit.asks, krw_for_coin)
+        up = estimate_fill_by_cost(self.upbit.asks, krw_for_coin)  # 코인을 산다 → asks
         if not up:
             return None
         return EntryPlan(bybit=by, usdt=us, upbit=up, usdt_sold=usdt_sold, usdt_fee_krw=usdt_fee,
@@ -404,7 +423,12 @@ class Quote:
         """
         실제로 진입하면 받게 될 김프 (%) ← 진입 여부는 이 값으로 정한다
 
-        호가가 모자라서 어느 한 군데라도 다 못 채우면 None (= 진입 불가)
+        **주문 수량만큼 호가를 실제로 소진해서** 나온 평균 체결가로 계산한다. 그래서 수량이
+        크면 호가가 밀린 만큼 김프가 불리하게 나오고, 진입 기준을 그만큼 못 넘긴다.
+        '호가 간격을 상수로 더하는' 방식(백테스트용)과 달리 근사가 없다.
+
+        호가가 모자라서 어느 한 군데라도 다 못 채우면 None (= 진입 불가).
+        반만 사고 끝내면 한쪽만 열린 포지션이 되므로 아예 진입하지 않는다.
         """
         plan = self.entry_plan(bybit_qty, upbit_fee_rate)
         if plan is None or not plan.is_complete:

@@ -148,6 +148,11 @@ def compute_pnl(entry: EntryLegs, exit_: ExitLegs, funding_usdt: float, fees: Fe
         bybit_leg_override_usdt: 바이비트 손익을 직접 정할 때 (강제청산: 증거금 전체 손실)
     """
     # 업비트: 실제로 되산 USDT - 판 USDT = 수수료까지 다 빠진 업비트 손익
+    #
+    # 이 한 줄이 '자본을 USDT 로 재는' 설계의 핵심이다. 중간에 원화와 코인을 거쳤지만
+    # **시작도 USDT, 끝도 USDT** 라서 그 차이가 곧 손익이다.
+    # 업비트 USDT 가격(테더 프리미엄 포함)은 팔 때와 되살 때 양쪽에 똑같이 들어가 약분되므로,
+    # 테더 프리미엄과 달러 환율이 아무리 움직여도 이 값에 섞이지 않는다 (docs/concept.md 3~4번).
     upbit_net = exit_.usdt_bought - entry.usdt_sold
 
     # 업비트 수수료 4번을 USDT 로 환산 (보여주기용으로 따로 뺀다)
@@ -161,10 +166,16 @@ def compute_pnl(entry: EntryLegs, exit_: ExitLegs, funding_usdt: float, fees: Fe
         bybit_leg = bybit_leg_override_usdt
         bybit_fees = entry.bybit_fee_usdt  # 강제청산 땐 닫는 수수료 없이 증거금을 잃은 것으로 본다
     else:
+        # 숏 손익 = (진입가 − 청산가) x 개수. 가격이 내려가야 이익이다.
+        # 김프가 좁혀질 때 보통 바이비트가 오르므로 이 몫은 손실이고, 업비트 몫이 그보다
+        # 더 벌어서 합이 플러스가 되는 구조다 (양쪽이 서로 상쇄하며 가격 위험을 지운다).
         bybit_leg = entry.bybit_qty * (entry.bybit_price_usdt - exit_.bybit_price_usdt)
         bybit_fees = entry.bybit_fee_usdt + exit_.bybit_fee_usdt
 
     return PnLBreakdown(
+        # 수수료를 '업비트 몫' 에 되돌려 더해서 보여주기용으로 따로 뺀다 —
+        # upbit_net 에는 이미 수수료가 빠져 있으므로, 더해 주면 '수수료 전' 금액이 된다.
+        # 최종 순손익은 PnLBreakdown.net_usdt 에서 다시 빼므로 이중 계산이 아니다.
         upbit_leg_usdt=upbit_net + upbit_fees,  # 수수료 빼기 전 = 실제 결과 + 낸 수수료
         bybit_leg_usdt=bybit_leg,
         funding_usdt=funding_usdt,

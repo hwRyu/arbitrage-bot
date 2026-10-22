@@ -574,6 +574,9 @@ class Engine:
         if self.s.one_shot and self._one_shot_opened:
             return  # 한 번만 돌리기: 이미 하나 잡았으면 더 잡지 않는다
         busy = {p.coin for p in self.broker.unfinished_positions(session)}  # 진입 중·청산 중·확인 필요
+        # 남은 자리 = 최대치 − 보유 중 − (덜 끝난 것 중 보유로 안 세어진 것).
+        # 덜 끝난 포지션도 자리를 차지한 것으로 봐야 한다 — 청산이 끝나지 않았는데 새로 잡으면
+        # 자본이 모자라 양쪽 중 한쪽만 들어가는 사고가 난다.
         slots = self.s.max_open_positions - len(open_positions) - len(busy - set(open_positions))
         if slots <= 0:
             return
@@ -584,6 +587,9 @@ class Engine:
             if coin in open_positions or coin in busy or self._clock() < self._reentry_allowed_at.get(coin, 0.0):
                 continue
             threshold = self.s.params_for(coin).entry_premium_threshold_percent
+            # 1차 걸러내기: 맨 앞 호가 한 칸만 보고 판단한다 (수량만큼 소진하는 계산은 비싸다).
+            # 맨 앞 호가 김프는 실제 체결 김프보다 **항상 유리하므로**, 여기서 떨어지면
+            # 수량을 넣고 계산해도 절대 통과할 수 없다 → 안전하게 건너뛸 수 있다.
             top = quote.entry_premium_top
             if top is None or top > threshold:
                 continue  # 맨 앞 호가로도 조건이 안 되면 더 볼 필요 없음
@@ -604,12 +610,17 @@ class Engine:
             bybit_qty = self._plan_bybit_qty(coin, quote, size)
             if bybit_qty is None:
                 continue
+            # 2차: 실제 주문 수량만큼 호가를 소진한 평균 체결가로 다시 계산한다.
+            # 수량이 크면 호가가 밀려서 1차는 통과했어도 여기서 떨어질 수 있다 — 그게 맞는 동작이다.
             premium = quote.entry_premium_for(bybit_qty, fee_rate)
             if premium is None:
                 self._log_throttled(f"reject-{coin}", logging.INFO,
                                     f"{coin} 진입 보류: 호가가 모자라서 정한 크기를 다 못 채움")
                 continue
             if premium <= threshold:
+                # 정렬 기준으로 '기준보다 얼마나 더 낮은가'(음수, 작을수록 좋음)를 맨 앞에 둔다.
+                # 김프 절댓값으로 줄 세우면 기준이 느슨한 코인이 늘 이긴다 — 코인마다 기준이
+                # 다르므로 '자기 기준 대비 얼마나 유리한가' 로 비교해야 공평하다.
                 candidates.append((premium - threshold, coin, bybit_qty, quote))
 
         for _margin, coin, bybit_qty, quote in sorted(candidates)[:slots]:
@@ -630,6 +641,7 @@ class Engine:
                 self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
                 continue
             # 진입 때 기준을 포지션에 적어둔다 (나중에 설정을 바꿔도 이 포지션은 이 값으로 청산)
+            # 이게 없으면 들고 있는 중에 .env 목표를 올리면 이미 목표에 닿은 포지션이 안 팔린다.
             pos.entry_threshold_percent = params.entry_premium_threshold_percent
             pos.target_net_profit_percent = params.target_net_profit_percent
             pos.stop_loss_percent = params.stop_loss_percent

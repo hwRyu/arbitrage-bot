@@ -97,18 +97,21 @@ def run(settings: Settings, coins: Sequence[str], interval_sec: float, stop: thr
         적은 줄 수
     """
     md = md or MarketData(depth=5)  # 맨 앞 호가만 쓰므로 깊이는 얕게
+    # 달러 환율은 테더 프리미엄·사이트식 김프를 '표시' 하는 데만 쓴다 (봇 김프 계산에는 안 들어간다).
+    # 고정값이 설정돼 있으면 조회하지 않는다.
     fx = None
     if settings.fixed_usd_krw:
         fx = settings.fixed_usd_krw
+    # 봇 DB 가 아니라 수집 전용 DB(기본 data/market.db) 에 적는다 → 봇과 같이 돌려도 안 섞인다
     sf = make_session_factory(settings.snapshot_db_path)
     started = time.monotonic()
     written = rounds = 0
     logger.info("수집 시작: 코인 %d개, %.0f초마다 기록 → %s", len(coins), interval_sec, settings.snapshot_db_path)
     logger.info("코인: %s", ", ".join(coins))
     while not stop.is_set():
-        begin = time.monotonic()
+        begin = time.monotonic()  # 한 바퀴에 걸린 시간을 빼서 주기를 맞추려고 (아래 stop.wait)
         if fx is None or not settings.fixed_usd_krw:
-            fx = _fx_or_none(fx)
+            fx = _fx_or_none(fx)  # 실패하면 이전 값을 그대로 쓴다 (표시용이라 멈출 이유가 없다)
         try:
             tops = fetch_tops(md, list(coins), fx_krw=fx)
             rows = snapshot_rows(tops)
@@ -127,12 +130,16 @@ def run(settings: Settings, coins: Sequence[str], interval_sec: float, stop: thr
                             f" (진입 {sample.entry_premium_top:+.3f} / 청산 {sample.exit_premium_top:+.3f})"
                             if sample else "")
         except Exception:
+            # 한 바퀴가 실패해도 **절대 멈추지 않는다.** 며칠 돌려야 의미가 있는 작업이라,
+            # 거래소 한 번 끊김으로 종료되면 그동안 쌓을 기록을 다 놓친다.
             logger.exception("기록 실패 (다음 차례에 다시 시도)")
         if once:
             break
         if max_hours and (time.monotonic() - started) >= max_hours * 3600:
             logger.info("정해진 %g시간이 지나 종료합니다", max_hours)
             break
+        # 조회에 걸린 시간을 빼고 기다린다 → 코인이 많아도 주기가 밀리지 않는다.
+        # stop.wait 을 쓰는 이유: sleep 과 달리 Ctrl+C 신호에 바로 깨어난다.
         stop.wait(max(0.0, interval_sec - (time.monotonic() - begin)))
     logger.info("수집 종료: %d회 · %d줄 (%s)", rounds, written, settings.snapshot_db_path)
     return written
