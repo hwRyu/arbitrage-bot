@@ -4,14 +4,20 @@
 > **먼저 이 문서 → `docs/concept.md` → `docs/live.md` 순서로 읽을 것.** 전략의 기준은 항상 `docs/concept.md`.
 
 ## 0. 새 PC 에서 바로 시작하기
-```bash
-git clone https://github.com/hwRyu/arbitrage-bot.git && cd arbitrage-bot
-pip3 install -r requirements.txt          # python3 3.14 에서 개발. 이 사용자 맥에는 `python` 없이 `python3` 만 있었음
-python3 -m unittest discover -s tests     # 134개 통과해야 정상 (인터넷 필요 없음)
+**지금 쓰는 PC: 윈도우 11, Python 3.14.2 (`python`·`python3`·`py` 다 됨). 가상환경 `.venv/` 를 쓴다.**
+```powershell
+git clone https://github.com/hwRyu/arbitrage-bot.git; cd arbitrage-bot
+python -m venv .venv                      # 처음 한 번
+.\.venv\Scripts\Activate.ps1              # 터미널 열 때마다 (Git Bash: source .venv/Scripts/activate)
+pip install -r requirements.txt
+python -m unittest discover -s tests      # 134개 통과해야 정상 (인터넷 필요 없음)
 ```
+- 터미널별 접속 명령·PowerShell 에서 설정 넣는 법(`$env:`)은 `docs/commands.md` 0번과 5번.
+- **윈도우 venv 에는 `python3.exe` 가 없다.** 켜고도 `python3` 를 치면 전역 파이썬이 돌아가니 `python` 으로 쓸 것.
+- 맥에서는 `python3 -m venv .venv` → `source .venv/bin/activate`.
 - **`.env` 는 git 에 없다** (`.gitignore`). 키가 들어 있으니 사용자가 직접 안전하게 옮기거나, `cp .env.example .env` 로 새로 만들고 키를 다시 넣어야 한다. 절대 커밋하지 말 것.
 - **`data/` 도 git 에 없다.** `data/history.db`(과거 캔들·펀딩비 캐시, 약 256MB)는 없어도 되고, 시뮬레이션·스크리너를 돌리면 모자란 구간만 다시 받는다 (처음엔 몇 분). `data/kimp.db` 등 봇 DB 는 아직 운영 기록이 없어서 옮길 필요 없음.
-- 실거래 점검: `python3 -m kimp.live_check` (읽기만 함). 명령 전체는 `docs/commands.md`.
+- 실거래 점검: `python -m kimp.live_check` (읽기만 함). 명령 전체는 `docs/commands.md`.
 
 ## 1. 사용자 / 일하는 방식 (꼭 지킬 것)
 - 사용자는 한국어로 대화한다. 답도 한국어로, 쉬운 말로. 반말 섞인 짧은 질문이 많다 ("~냐?", "~해").
@@ -85,7 +91,7 @@ python3 -m unittest discover -s tests     # 134개 통과해야 정상 (인터�
    MEW_ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.10
    MEGA_ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.15
    ```
-   (적용 여부는 사용자에게 물어볼 것. 매달 `python3 -m kimp.screen` 으로 다시 고르는 게 원칙)
+   (적용 여부는 사용자에게 물어볼 것. 매달 `python -m kimp.screen` 으로 다시 고르는 게 원칙)
 5. **드라이런** (`PAPER_TRADING=false`) 하루 이상 → 로그·텔레그램 확인
 6. 바이비트에 USDT 입금 → **소액 실거래** (`LIVE_DRY_RUN=false`, `LIVE_CONFIRM=YES`, `MAX_POSITION_USDT=20~50`, `MAX_OPEN_POSITIONS=1`) → 체결 내역을 거래소 앱과 비교
 7. 자동 송금은 소액 수동 송금으로 트래블룰·네트워크 확인 뒤에만 `AUTO_TRANSFER_ENABLED=true` (출금 허용 주소 등록, 바이비트 출금 권한 필요)
@@ -106,7 +112,7 @@ ROOT=$PWD
 for d in $SP/old $ROOT; do (cd $d && PAPER_INITIAL_TOTAL_USDT=250 POSITION_SIZE_USDT=50 \
   CAP_ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.20 ERA_ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.05 \
   MEW_ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.10 MEGA_ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.15 COINS=CAP,ERA,MEW,MEGA \
-  HISTORY_DB_PATH=$ROOT/data/history.db python3 -m kimp.simulate --from 2026-09-22 --to 2026-10-22 \
+  HISTORY_DB_PATH=$ROOT/data/history.db python -m kimp.simulate --from 2026-09-22 --to 2026-10-22 \
   --coins CAP,ERA,MEW,MEGA --no-save --verbose 2>&1 | tr '\r' '\n' \
   | grep -E "^■ 총|^  확정|^  평가|^  리밸런싱|^  (CAP|ERA|MEW|MEGA) +2026" > $SP/$(basename $d).txt); done
 git worktree remove --force $SP/old; diff $SP/old.txt $SP/$(basename $ROOT).txt && echo 같음

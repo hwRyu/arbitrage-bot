@@ -338,12 +338,41 @@ def value_at(series: Sequence[Tuple[int, float]], ts_ms: int) -> Optional[float]
 # ----------------------------------------------------------------------
 # 실제로 받아오는 함수들 (인터넷 필요)
 # ----------------------------------------------------------------------
+# 거래소가 "요청이 너무 많다"(429) 고 끊을 때 기다렸다 다시 받는 횟수와 대기 시간
+RETRY_TIMES = 5
+RETRY_WAIT_SEC = 2.0
+
+
+def _retry(call, what: str):
+    """
+    거래소 요청을 하다가 막히면 잠깐 기다렸다 다시 해본다.
+
+    과거 1분봉은 한 달 치가 코인당 4만 개라 요청을 수백 번 보낸다.
+    업비트는 초당 요청 수가 넘으면 429 를 주는데, 그때 그냥 멈추면 받던 구간이 날아간다.
+    그래서 2초 → 4초 → 6초 → 8초 → 10초 로 기다리며 최대 5번 다시 해본다.
+    5번 다 실패하면 그때는 멈춘다 (키가 잘못됐거나 인터넷이 끊긴 경우).
+    """
+    import time
+
+    for attempt in range(1, RETRY_TIMES + 1):
+        try:
+            return call()
+        except Exception as exc:  # 429(요청 과다), 일시적인 네트워크 오류 등
+            if attempt == RETRY_TIMES:
+                raise
+            wait = RETRY_WAIT_SEC * attempt
+            logger.warning("%s 받기 실패(%d/%d), %.0f초 뒤 다시: %s",
+                           what, attempt, RETRY_TIMES, wait, type(exc).__name__)
+            time.sleep(wait)
+
+
 def ccxt_candle_fetcher(exchange, symbol: str, timeframe: str = "1m") -> Callable[[int, int], List[list]]:
     """ccxt 거래소 객체로 캔들을 받아오는 함수 만들기 (업비트는 한 번에 200개, 바이비트는 1000개까지)"""
     limit = 200 if exchange.id == "upbit" else 1000
 
     def fetch(since_ms: int, _limit: int) -> List[list]:
-        return exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+        return _retry(lambda: exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit),
+                      f"{exchange.id} {symbol} 캔들")
 
     return fetch
 
@@ -353,7 +382,8 @@ def ccxt_funding_fetcher(exchange, symbol: str) -> Callable[[int], List[Tuple[in
 
     def fetch(since_ms: int) -> List[Tuple[int, float]]:
         until = since_ms + FUNDING_WINDOW_MS - 1  # 이 칸 안의 정산만 (설명: FUNDING_WINDOW_MS)
-        rows = exchange.fetch_funding_rate_history(symbol, since=since_ms, limit=200, params={"until": until})
+        rows = _retry(lambda: exchange.fetch_funding_rate_history(
+            symbol, since=since_ms, limit=200, params={"until": until}), f"{symbol} 펀딩비")
         return [(int(r["timestamp"]), float(r["fundingRate"])) for r in rows if r.get("fundingRate") is not None]
 
     return fetch

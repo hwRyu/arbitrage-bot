@@ -292,14 +292,55 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         return Engine(settings, market, None, broker, sf, ["XRP"]), market, sf, broker
 
     def test_auto_transfer_at_start_once(self):
-        """(페이퍼 자동 송금) 시작 때 비율이 깨져 있으면 한 번 옮기고 수수료 1 USDT 를 한 번만 뗀다"""
+        """
+        (페이퍼 자동 송금) 시작 때 비율이 깨져 있으면 한 번만 옮긴다
+
+        업비트 → 바이비트는 업비트 USDT(TRX) 출금이 무료라 수수료 0 이다.
+        예) 10,000 USDT 가 전부 업비트에 있으면 5,652.17 을 보내고 바이비트에 그대로 5,652.17 이 찍힌다.
+        """
         engine, _, sf, broker = self._engine_all_on_upbit()
         engine.startup()
         move = 10_000 * (1 - engine.s.upbit_target_share())
+        fee = engine.s.transfer_fee_usdt(True)
+        self.assertEqual(fee, 0.0)
         with sf() as s:
             self.assertAlmostEqual(broker.balance(s, UPBIT_USDT), 10_000 - move, places=6)
-            self.assertAlmostEqual(broker.balance(s, BYBIT_USDT), move - 1.0, places=6)
+            self.assertAlmostEqual(broker.balance(s, BYBIT_USDT), move - fee, places=6)
         self.assertEqual(len(engine.transfers), 1)
+
+    def test_transfer_fee_differs_by_direction(self):
+        """
+        송금 수수료는 보내는 거래소가 떼니까 방향마다 다르다
+
+        업비트 → 바이비트: 업비트 USDT(TRX) 출금 무료      → 0
+        바이비트 → 업비트: 바이비트 USDT(TRC20) 출금 수수료 → 1.3
+        """
+        settings = make_settings()
+        self.assertEqual(settings.transfer_fee_usdt(True), 0.0)
+        self.assertEqual(settings.transfer_fee_usdt(False), 1.3)
+        # 설정으로 바꿀 수도 있다 (거래소가 수수료를 바꿨을 때)
+        changed = make_settings(transfer_fee_upbit_to_bybit_usdt=0.5, transfer_fee_bybit_to_upbit_usdt=2.0)
+        self.assertEqual(changed.transfer_fee_usdt(True), 0.5)
+        self.assertEqual(changed.transfer_fee_usdt(False), 2.0)
+
+    def test_auto_transfer_back_to_upbit_charges_bybit_fee(self):
+        """
+        반대 방향(바이비트 → 업비트)으로 옮길 때는 바이비트 출금 수수료 1.3 을 뗀다
+
+        예) 10,000 USDT 가 전부 바이비트에 있으면 4,347.83 을 업비트로 보내고
+            업비트에는 1.3 을 뺀 4,346.53 이 들어온다.
+        """
+        settings = make_settings()
+        sf = make_session_factory(":memory:")
+        broker = PaperBroker(FEES, 0.3)
+        with sf() as s:
+            broker.ensure_initial_balances(s, 10_000, 0.0)  # 전부 바이비트에
+        engine = Engine(settings, FakeMarket(), None, broker, sf, ["XRP"])
+        engine.startup()
+        move = 10_000 * settings.upbit_target_share()
+        with sf() as s:
+            self.assertAlmostEqual(broker.balance(s, BYBIT_USDT), 10_000 - move, places=6)
+            self.assertAlmostEqual(broker.balance(s, UPBIT_USDT), move - 1.3, places=6)
 
     def test_no_transfer_per_trade(self):
         """비율이 괜찮으면 거래를 여러 번 해도 송금하지 않는다 (거래마다 송금 X)"""

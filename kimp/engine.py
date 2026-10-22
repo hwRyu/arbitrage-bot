@@ -335,7 +335,7 @@ class Engine:
             # 모자란 쪽으로 보내는 방향이고, 보내고 나면 진입할 만큼 되는지 확인
             to_short_side = (move > 0) == (need.side == "bybit")
             have = self.broker.balance(session, BYBIT_USDT if need.side == "bybit" else UPBIT_USDT)
-            if not to_short_side or have + abs(move) - self.s.rebalance_transfer_fee_usdt < need.need_usdt:
+            if not to_short_side or have + abs(move) - self.s.transfer_fee_usdt(move > 0) < need.need_usdt:
                 self._log_throttled(
                     f"rebalance-useless", logging.INFO,
                     "진입 보류: 양쪽 비율을 맞춰도 자리가 없음 (포지션 크기 × 최대 개수가 자본에 비해 큼) → 송금 안 함",
@@ -344,7 +344,7 @@ class Engine:
         if self.auto_transfer:
             if self.broker.pending_transfers(session):
                 return None  # 송금 중 → 도착할 때까지 기다림
-            fee = self.s.rebalance_transfer_fee_usdt
+            fee = self.s.transfer_fee_usdt(move > 0)  # 보내는 거래소가 떼므로 방향별로 다르다
             sent = self.broker.transfer(session, move, fee, reason=when)
             if sent:
                 logger.warning(

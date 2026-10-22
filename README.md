@@ -48,24 +48,27 @@ SOL_ENTRY_PREMIUM_THRESHOLD_PERCENT=-1.0    # SOL 만 -1.0%
 
 ## 실거래
 ```bash
-python3 -m kimp.live_check      # 키·IP·권한·출금 주소·텔레그램 점검 (읽기만)
-PAPER_TRADING=false python3 main.py                                   # 드라이런 (주문 안 냄)
-PAPER_TRADING=false LIVE_DRY_RUN=false LIVE_CONFIRM=YES python3 main.py  # 실제 주문
+python -m kimp.live_check      # 키·IP·권한·출금 주소·텔레그램 점검 (읽기만)
+PAPER_TRADING=false python main.py                                   # 드라이런 (주문 안 냄)
+PAPER_TRADING=false LIVE_DRY_RUN=false LIVE_CONFIRM=YES python main.py  # 실제 주문
 ```
 페이퍼·드라이런·실거래는 **같은 엔진·브로커**를 쓰고 주문 실행기만 다릅니다. 순서는 [docs/live.md](docs/live.md) 5번.
 
 ## 실행
+가상환경(venv)을 씁니다. 터미널별 설치·접속 명령은 [docs/commands.md 0번](docs/commands.md) 에 있습니다.
 ```bash
+python -m venv .venv                  # 처음 한 번
+source .venv/bin/activate             # 맥/리눅스 (윈도우: .\.venv\Scripts\Activate.ps1)
 pip install -r requirements.txt
-cp .env.example .env      # 코인, 진입 기준, 레버리지, 비용 설정
-python3 main.py            # Ctrl+C 로 종료 (열린 포지션은 DB 에 남아 다음 실행 때 이어서 관리)
+cp .env.example .env                  # 코인, 진입 기준, 레버리지, 비용 설정
+python main.py                        # Ctrl+C 로 종료 (열린 포지션은 DB 에 남아 다음 실행 때 이어서 관리)
 ```
 
 ## 시뮬레이션 (과거 기간에 지금 전략 돌려보기)
 ```bash
-python3 -m kimp.simulate --from 2026-10-01                    # 10/1 0시(한국 시간)부터 지금까지
-python3 -m kimp.simulate --from 2026-10-01 --to 2026-10-15
-python3 -m kimp.simulate --from 2026-10-01 --coins XRP,SOL --verbose
+python -m kimp.simulate --from 2026-10-01                    # 10/1 0시(한국 시간)부터 지금까지
+python -m kimp.simulate --from 2026-10-01 --to 2026-10-15
+python -m kimp.simulate --from 2026-10-01 --coins XRP,SOL --verbose
 ```
 - `.env` 설정을 그대로 쓰고, 실시간 봇과 **같은 엔진**으로 1분봉을 따라 돌립니다. 강제청산은 1분봉 고가로 확인합니다.
 - 과거 1분봉(업비트 코인·USDT, 바이비트), 펀딩비 이력, 달러 환율은 `data/history.db`에 저장해 두고 모자란 구간만 받습니다.
@@ -74,9 +77,9 @@ python3 -m kimp.simulate --from 2026-10-01 --coins XRP,SOL --verbose
 
 ## 추천 코인 순위 (기회 넓히기)
 ```bash
-python3 -m kimp.screen                       # 최근 30일, 전체 코인 중 거래량 상위 80개, 상위 20위
-python3 -m kimp.screen --target 0.5 --top 30 # 목표 순이익을 바꿔서 보기
-python3 -m kimp.screen --coins XRP,SOL,DOGE  # 정한 코인끼리만 비교
+python -m kimp.screen                       # 최근 30일, 전체 코인 중 거래량 상위 80개, 상위 20위
+python -m kimp.screen --target 0.5 --top 30 # 목표 순이익을 바꿔서 보기
+python -m kimp.screen --coins XRP,SOL,DOGE  # 정한 코인끼리만 비교
 ```
 - 코인마다 15분봉으로 봇 김프 움직임(중간값, 범위, 횡보 비율, 추세, 반감기)과 지금 호가 간격, 거래량, 물량, 펀딩비율을 봅니다.
 - 진입 기준을 여러 개 넣어 백테스트해서 가장 잘 된 기준과 월 환산 수익을 보여줍니다. 지난 기간에만 맞춘 기준을 거르려고 **앞 2/3 로 고른 기준을 뒤 1/3 에 써본 결과**와 비교해 작은 값을 점수로 씁니다.
@@ -89,18 +92,18 @@ python3 -m kimp.screen --coins XRP,SOL,DOGE  # 정한 코인끼리만 비교
 
 ## 김프 기록 분석
 ```bash
-python3 -m kimp.report             # 최근 7일
+python -m kimp.report             # 최근 7일
 ```
 코인별 봇 김프 수준, 진입 기준별 시간 비율, 김프 구간별 평균 펀딩비율을 보여줍니다.
 
 ## 펀딩비 수익 전략 (같이 돌아감)
 - 바이비트 현물 매수 + 같은 개수 숏 → 가격 변동은 상쇄, 펀딩비(+)를 숏이 받습니다. 자본은 `CARRY_CAPITAL_USDT` 로 따로.
-- `python3 -m kimp.carry_backtest screen` / `run --from 날짜` 로 코인 순위와 과거 결과를 봅니다.
+- `python -m kimp.carry_backtest screen` / `run --from 날짜` 로 코인 순위와 과거 결과를 봅니다.
 - 2026-09~10 확인 결과는 본전 근처입니다. 자세한 건 [docs/carry.md](docs/carry.md).
 
 ## 테스트
 ```bash
-python3 -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
 ## 구조

@@ -82,7 +82,8 @@ class FeeSettings:
 
     # (선택) 사이클(진입 → 청산 1번)마다 손익에서 미리 떼어두는 전송비 (USDT). 기본 0
     # 송금은 매 거래마다 하는 게 아니라 '잔고가 모자라거나 비율이 많이 깨졌을 때만' 한다.
-    # 그 실제 송금 비용은 REBALANCE_TRANSFER_FEE_USDT 로 송금할 때 한 번씩 뗀다.
+    # 그 실제 송금 비용은 TRANSFER_FEE_UPBIT_TO_BYBIT_USDT / TRANSFER_FEE_BYBIT_TO_UPBIT_USDT 로
+    # 송금할 때 한 번씩 뗀다.
     # 그래도 거래 손익에 미리 나눠서 반영하고 싶을 때만 쓴다. 예) 다섯 사이클에 한 번 송금 → 0.2
     transfer_fee_usdt_per_cycle: float = 0.0
 
@@ -271,7 +272,12 @@ class Settings:
     upbit_min_order_krw: float = 5_000.0
 
     # 리밸런싱 송금 한 번에 드는 출금 수수료 (USDT). 송금할 때만 한 번 든다 (거래마다 X)
-    rebalance_transfer_fee_usdt: float = 1.0
+    # 보내는 거래소가 떼기 때문에 방향마다 다르다. (2026-10-22 확인: 실제 송금 + 바이비트 API 조회)
+    #   업비트 → 바이비트: 업비트 USDT(TRX) 출금 무료      → 0
+    #   바이비트 → 업비트: 바이비트 USDT(TRC20) 출금 수수료 → 1.3
+    # 거래소가 언제든 바꿀 수 있다. `python -m kimp.live_check` 가 지금 값과 설정을 비교해서 알려준다.
+    transfer_fee_upbit_to_bybit_usdt: float = 0.0
+    transfer_fee_bybit_to_upbit_usdt: float = 1.3
 
     # 페이퍼/시뮬레이션: 리밸런싱이 필요할 때 '사용자가 송금했다' 고 치고 자동으로 USDT 를 옮긴다
     # (페이퍼 잔고는 사용자가 실제로 보낼 수 없으니까). 옮길 때마다 위 수수료를 뗀다.
@@ -391,6 +397,15 @@ class Settings:
         """코인에 실제로 쓸 설정 (코인별 값이 있으면 그 값, 없으면 공통값)"""
         return self.coin_params.get(coin) or self.default_params()
 
+    def transfer_fee_usdt(self, to_bybit: bool) -> float:
+        """
+        송금 한 번에 드는 출금 수수료 (USDT). 보내는 거래소가 뗀다.
+
+        예) to_bybit=True  (업비트 → 바이비트): 0 (업비트 USDT TRX 출금 무료)
+            to_bybit=False (바이비트 → 업비트): 1.3 (바이비트 TRC20 출금)
+        """
+        return self.transfer_fee_upbit_to_bybit_usdt if to_bybit else self.transfer_fee_bybit_to_upbit_usdt
+
     def upbit_target_share(self) -> float:
         """
         전체 자본 중 업비트에 둘 목표 비율 (0~1)
@@ -495,7 +510,10 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
         hedge_tolerance_percent=_env_float("HEDGE_TOLERANCE_PERCENT", d.hedge_tolerance_percent),
         upbit_min_order_krw=_env_float("UPBIT_MIN_ORDER_KRW", d.upbit_min_order_krw),
-        rebalance_transfer_fee_usdt=_env_float("REBALANCE_TRANSFER_FEE_USDT", d.rebalance_transfer_fee_usdt),
+        transfer_fee_upbit_to_bybit_usdt=_env_float("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT",
+                                                    d.transfer_fee_upbit_to_bybit_usdt),
+        transfer_fee_bybit_to_upbit_usdt=_env_float("TRANSFER_FEE_BYBIT_TO_UPBIT_USDT",
+                                                    d.transfer_fee_bybit_to_upbit_usdt),
         paper_auto_rebalance=_env_bool("PAPER_AUTO_REBALANCE", d.paper_auto_rebalance),
         fees=fees,
         scan_interval_sec=_env_float("SCAN_INTERVAL_SEC", d.scan_interval_sec),
@@ -536,7 +554,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
                            daily_loss_limit_usdt=settings.daily_loss_limit_usdt or LIVE_DEFAULT_DAILY_LOSS_LIMIT_USDT)
     # 공통값이 정해진 뒤에 코인별 덮어쓰기 적용 (frozen 이라 replace 로 새로 만든다)
     settings = replace(settings, coin_params=_load_coin_params(settings),
-                       config_warnings=tuple(_find_unused_coin_keys(settings.coins)))
+                       config_warnings=tuple(_find_unused_coin_keys(settings.coins)) + tuple(_find_old_keys()))
     validate_settings(settings)
     return settings
 
@@ -561,6 +579,25 @@ def _load_coin_params(settings: Settings) -> Dict[str, CoinParams]:
     return result
 
 
+# 이름이 바뀐 설정: {옛 이름: 새 이름 안내}
+OLD_KEYS = {
+    "REBALANCE_TRANSFER_FEE_USDT":
+        "송금 수수료가 방향별로 나뉘었습니다 → TRANSFER_FEE_UPBIT_TO_BYBIT_USDT(기본 0) / "
+        "TRANSFER_FEE_BYBIT_TO_UPBIT_USDT(기본 1.3). 업비트 USDT(TRX) 출금은 무료이고 "
+        "바이비트 USDT(TRC20) 출금만 수수료가 있어서 하나로 두면 한쪽이 틀립니다. 이 줄은 지워 주세요",
+}
+
+
+def _find_old_keys() -> List[str]:
+    """옛 설정 이름이 .env 에 남아 있으면 경고한다 (값은 쓰지 않는다. 실행은 막지 않음)"""
+    return [f"{key} 는 이제 쓰이지 않습니다: {hint}" for key, hint in OLD_KEYS.items() if os.getenv(key, "").strip()]
+
+
+# 코인 이름이 아니라서 '코인별 설정' 으로 착각하면 안 되는 앞머리
+# 예) CARRY_POSITION_SIZE_USDT 는 펀딩비 전략 설정이지 'CARRY 코인' 설정이 아니다
+NOT_COIN_PREFIXES = ("CARRY",)
+
+
 def _find_unused_coin_keys(coins: List[str]) -> List[str]:
     """COINS 에 없는 코인의 개별 설정 키를 찾아 경고로 돌려준다 (오타 방지. 실행은 막지 않음)"""
     suffixes = "|".join(suffix for _, suffix in COIN_OVERRIDE_FIELDS)
@@ -568,7 +605,7 @@ def _find_unused_coin_keys(coins: List[str]) -> List[str]:
     warnings: List[str] = []
     for key in sorted(os.environ):
         match = pattern.match(key)
-        if match and match.group(1) not in coins:
+        if match and match.group(1) not in coins and match.group(1) not in NOT_COIN_PREFIXES:
             warnings.append(f"{key} 는 COINS 에 없는 코인({match.group(1)})의 설정이라 무시됩니다")
     return warnings
 
@@ -601,8 +638,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("BYBIT_MMR 는 소수 비율이어야 합니다 (예: 0.005 = 0.5%)")
     if s.liquidation_warn_percent <= 0:
         errors.append("LIQUIDATION_WARN_PERCENT 는 0 보다 커야 합니다")
-    if s.rebalance_transfer_fee_usdt < 0:
-        errors.append("REBALANCE_TRANSFER_FEE_USDT 는 0 이상이어야 합니다")
+    if s.transfer_fee_upbit_to_bybit_usdt < 0 or s.transfer_fee_bybit_to_upbit_usdt < 0:
+        errors.append("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT / TRANSFER_FEE_BYBIT_TO_UPBIT_USDT 는 0 이상이어야 합니다")
     if s.rebalance_threshold_percent <= 0:
         errors.append("REBALANCE_THRESHOLD_PERCENT 는 0 보다 커야 합니다")
     if s.reentry_cooldown_sec < 0:
@@ -641,8 +678,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("MAX_POSITION_USDT 는 0보다 커야 합니다")
     if s.daily_loss_limit_usdt is not None and s.daily_loss_limit_usdt <= 0:
         errors.append("DAILY_LOSS_LIMIT_USDT 는 0보다 커야 합니다")
-    if s.transfer_min_usdt <= s.rebalance_transfer_fee_usdt:
-        errors.append("TRANSFER_MIN_USDT 는 REBALANCE_TRANSFER_FEE_USDT(송금 수수료)보다 커야 합니다")
+    if s.transfer_min_usdt <= max(s.transfer_fee_upbit_to_bybit_usdt, s.transfer_fee_bybit_to_upbit_usdt):
+        errors.append("TRANSFER_MIN_USDT 는 송금 수수료(TRANSFER_FEE_*)보다 커야 합니다")
 
     # 펀딩비 전략
     if s.carry_capital_usdt <= 0:

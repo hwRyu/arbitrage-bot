@@ -76,7 +76,9 @@ class MarketData:
         """
         self.depth = depth
         # enableRateLimit: 거래소 요청 간격을 ccxt 가 알아서 지켜준다
-        self.upbit = ccxt.upbit({"enableRateLimit": True})
+        # 업비트 시세 조회는 초당 10회까지인데 ccxt 기본값은 50ms(초당 20회)라 너무 빠르다.
+        # 그대로 두면 과거 캔들을 많이 받을 때 429(요청 과다)로 끊긴다 → 110ms(초당 약 9회)로 늘린다.
+        self.upbit = ccxt.upbit({"enableRateLimit": True, "rateLimit": 110})
         # defaultType=swap: 바이비트 무기한 선물을 기본으로
         self.bybit = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
 

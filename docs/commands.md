@@ -1,39 +1,86 @@
 # 명령어와 실행 방법
 
-> 이 맥에는 `python` 이 없고 `python3` 만 있다. 모든 명령은 `python3` 로 실행한다.
-> (`python` 으로 치고 싶으면 `~/.zshrc` 에 `alias python=python3`)
+> **아래 모든 명령은 가상환경(venv)을 켠 상태로 실행한다.** 켜는 법은 0-2 번.
+> 가상환경을 켜면 윈도우·맥 모두 `python` 으로 쓸 수 있다.
+> (맥에서 가상환경을 안 켜면 `python` 이 없고 `python3` 만 있다 → 명령마다 `python3` 로 바꿔 쓸 것)
 
-## 0. 처음 한 번
+## 0-1. 처음 한 번 (PC 마다 한 번씩)
+가상환경 = 이 프로젝트만 쓰는 파이썬 패키지 폴더(`.venv/`). 전역에 깔면 다른 프로젝트가 패키지 버전을
+바꿀 때 봇이 조용히 깨진다. `.venv/` 는 `.gitignore` 에 있어서 git 에 올라가지 않는다.
+
+**윈도우 (PowerShell)**
+```powershell
+cd C:\Users\<사용자>\Desktop\Repositories\arbitrage-bot
+python -m venv .venv                      # .venv\ 폴더 만들기 (한 번만)
+.\.venv\Scripts\Activate.ps1              # 가상환경 켜기
+pip install -r requirements.txt           # 패키지 설치 (ccxt, yfinance 등)
+Copy-Item .env.example .env               # 코인, 기준값, 자본, 수수료를 여기서 고친다
+python -m unittest discover -s tests      # 테스트 134개 (인터넷 필요 없음)
+```
+- `Activate.ps1` 이 "스크립트 실행이 차단되었습니다" 로 막히면 한 번만:
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+
+**맥 / 리눅스 (zsh, bash)**
 ```bash
 cd ~/Desktop/Individual/Repository/arbitrage-bot
-pip3 install -r requirements.txt
-cp .env.example .env        # 코인, 기준값, 자본, 수수료를 여기서 고친다 (없으면 기본값)
-python3 -m unittest discover -s tests   # 테스트 (인터넷 필요 없음)
+python3 -m venv .venv                     # 한 번만
+source .venv/bin/activate                 # 가상환경 켜기
+pip install -r requirements.txt
+cp .env.example .env
+python -m unittest discover -s tests
+```
+
+## 0-2. 그다음부터 (터미널 열 때마다)
+가상환경은 **터미널을 새로 열면 꺼져 있다.** 매번 켜야 한다.
+
+| 터미널 | 켜기 | 끄기 |
+|---|---|---|
+| 윈도우 PowerShell | `.\.venv\Scripts\Activate.ps1` | `deactivate` |
+| 윈도우 cmd | `.venv\Scripts\activate.bat` | `deactivate` |
+| 윈도우 Git Bash | `source .venv/Scripts/activate` | `deactivate` |
+| 맥 / 리눅스 | `source .venv/bin/activate` | `deactivate` |
+
+- 켜졌으면 프롬프트 앞에 `(.venv)` 가 붙는다. 확인: `python -c "import ccxt; print(ccxt.__version__)"` → 버전이 나오면 정상
+- `ModuleNotFoundError: No module named 'ccxt'` 가 나오면 **가상환경을 안 켠 것**이다 (또는 0-1 설치를 안 한 것).
+- 켜지 않고 경로를 직접 적어도 된다 (스크립트나 작업 스케줄러에서 쓰기 좋다):
+  - 윈도우: `.\.venv\Scripts\python.exe -m kimp.simulate --from 2026-09-22`
+  - 맥: `./.venv/bin/python -m kimp.simulate --from 2026-09-22`
+- 지금 깔린 버전을 그대로 보존하려면: `pip freeze > requirements.lock`
+  (서버로 옮겨 똑같이 재현할 때 `pip install -r requirements.lock`)
+
+### 윈도우에서 한글이 깨질 때
+로그의 한글이 `���` 처럼 보이면 출력 인코딩 때문이다. 터미널에서 한 번 설정하면 그 터미널에서 계속 적용된다.
+```powershell
+$env:PYTHONUTF8 = "1"
+python main.py
 ```
 
 ## 1. 한눈에
 | 하고 싶은 것 | 명령 | 걸리는 시간 |
 |---|---|---|
-| 봇 실행 (김프 + 펀딩비, 페이퍼) | `python3 main.py` | Ctrl+C 로 끔 |
-| 실거래 전 점검 (읽기만) | `python3 -m kimp.live_check` | 몇 초 |
-| 드라이런 / 실거래 | `PAPER_TRADING=false python3 main.py` ([live.md](live.md)) | |
-| 김프 전략 코인 추천 순위 | `python3 -m kimp.screen` | 처음 2~3분, 다음부터 수십 초 |
-| 김프 전략 과거 시뮬레이션 | `python3 -m kimp.simulate --from 2026-09-22` | 코인당 처음 1~2분 |
-| 펀딩비 전략 코인 순위 | `python3 -m kimp.carry_backtest screen` | 처음 약 2분 |
-| 펀딩비 전략 과거 시뮬레이션 | `python3 -m kimp.carry_backtest run --from 2026-09-22` | 처음 1~2분 |
-| 봇이 쌓은 김프 기록 분석 | `python3 -m kimp.report` | 몇 초 |
+| 봇 실행 (김프 + 펀딩비, 페이퍼) | `python main.py` | Ctrl+C 로 끔 |
+| 실거래 전 점검 (읽기만) | `python -m kimp.live_check` | 몇 초 |
+| 드라이런 / 실거래 | `PAPER_TRADING=false python main.py` ([live.md](live.md)) | |
+| 김프 전략 코인 추천 순위 | `python -m kimp.screen` | 처음 2~3분, 다음부터 수십 초 |
+| 김프 전략 과거 시뮬레이션 | `python -m kimp.simulate --from 2026-09-22` | 코인당 처음 1~2분 |
+| 펀딩비 전략 코인 순위 | `python -m kimp.carry_backtest screen` | 처음 약 2분 |
+| 펀딩비 전략 과거 시뮬레이션 | `python -m kimp.carry_backtest run --from 2026-09-22` | 처음 1~2분 |
+| 봇이 쌓은 김프 기록 분석 | `python -m kimp.report` | 몇 초 |
+
+> 가상환경을 켠 상태 기준이다 (0-2 번). 맥에서 안 켰으면 `python` → `python3`.
+> 윈도우 venv 에는 `python3.exe` 가 없어서, 켜고도 `python3` 를 치면 **전역 파이썬**이 돌아간다 → 꼭 `python`.
 
 날짜는 모두 **한국 시간**이다. `--to` 를 안 적으면 지금까지.
 과거 데이터는 `data/history.db` 에 저장돼서 두 번째부터는 모자란 구간만 받는다.
 
-## 2. 봇 실행 — `python3 main.py`
+## 2. 봇 실행 — `python main.py`
 - 김프 헷지 엔진(3초마다)과 펀딩비 엔진(60초마다, `CARRY_ENABLED=true`)이 같이 돈다. **지금은 페이퍼(가짜 주문)만** 된다.
 - 끄기: Ctrl+C. 열린 포지션과 잔고는 `data/kimp.db` 에 남아서 다시 켜면 이어서 관리한다.
 - 로그: 화면 + `logs/` 폴더
 - 처음부터 다시 하고 싶으면 봇을 끄고 `data/kimp.db` 를 지운다 (페이퍼 잔고·포지션 초기화).
 
 ## 3. 김프 전략 도구
-### 코인 추천 순위 — `python3 -m kimp.screen`
+### 코인 추천 순위 — `python -m kimp.screen`
 | 옵션 | 기본 | 뜻 |
 |---|---|---|
 | `--days` | 30 | 최근 며칠을 볼지 |
@@ -48,39 +95,54 @@ python3 -m unittest discover -s tests   # 테스트 (인터넷 필요 없음)
 
 끝에 `.env` 에 붙여넣을 `COINS=...` 와 코인별 진입 기준이 나온다. `이상김프` 표시 코인은 쓰지 말 것.
 
-### 과거 시뮬레이션 — `python3 -m kimp.simulate`
+### 과거 시뮬레이션 — `python -m kimp.simulate`
 ```bash
-python3 -m kimp.simulate --from 2026-09-22                       # 9/22 0시부터 지금까지
-python3 -m kimp.simulate --from 2026-09-22 --to 2026-10-15
-python3 -m kimp.simulate --from 2026-09-22 --coins MEW,CAP --verbose   # 거래 하나하나 보기
-python3 -m kimp.simulate --from 2026-09-22 --no-save             # 결과를 DB 에 안 남김
+python -m kimp.simulate --from 2026-09-22                       # 9/22 0시부터 지금까지
+python -m kimp.simulate --from 2026-09-22 --to 2026-10-15
+python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP --verbose   # 거래 하나하나 보기
+python -m kimp.simulate --from 2026-09-22 --no-save             # 결과를 DB 에 안 남김
 ```
 
-### 김프 기록 분석 — `python3 -m kimp.report`
+### 김프 기록 분석 — `python -m kimp.report`
 ```bash
-python3 -m kimp.report              # 최근 7일
-python3 -m kimp.report --hours 24
+python -m kimp.report              # 최근 7일
+python -m kimp.report --hours 24
 ```
 봇을 돌리면서 쌓인 기록이 있어야 나온다.
 
 ## 4. 펀딩비 전략 도구 (자세한 설명: [carry.md](carry.md))
 ```bash
-python3 -m kimp.carry_backtest screen                      # 최근 30일 코인 순위
-python3 -m kimp.carry_backtest screen --days 60 --top 30
-python3 -m kimp.carry_backtest run --from 2026-09-22       # .env 설정 그대로 과거 시뮬레이션
-python3 -m kimp.carry_backtest run --from 2026-09-22 --coins COMP,SUI --verbose
+python -m kimp.carry_backtest screen                      # 최근 30일 코인 순위
+python -m kimp.carry_backtest screen --days 60 --top 30
+python -m kimp.carry_backtest run --from 2026-09-22       # .env 설정 그대로 과거 시뮬레이션
+python -m kimp.carry_backtest run --from 2026-09-22 --coins COMP,SUI --verbose
 ```
 
 ## 5. 설정을 잠깐만 바꿔서 돌리기
-`.env` 를 고치지 않고 명령 앞에 붙이면 그 실행에만 적용된다.
+`.env` 를 고치지 않고 그 실행에만 설정을 적용할 수 있다. **적는 방법이 터미널마다 다르다.**
+
+**맥 / 리눅스 / Git Bash** — 명령 앞에 붙인다
 ```bash
 # 시드 250 USDT, 포지션 50 USDT 고정, MEW·CAP 만, MEW 진입 기준 -0.10%
 PAPER_INITIAL_TOTAL_USDT=250 POSITION_SIZE_USDT=50 MEW_ENTRY_PREMIUM_THRESHOLD_PERCENT=-0.10 \
-  python3 -m kimp.simulate --from 2026-09-22 --coins MEW,CAP
+  python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP
 
 # 펀딩비 전략 진입 기준 0.05%/일, 2배
-CARRY_ENTRY_MIN_DAILY_PERCENT=0.05 CARRY_LEVERAGE=2 python3 -m kimp.carry_backtest run --from 2026-09-22
+CARRY_ENTRY_MIN_DAILY_PERCENT=0.05 CARRY_LEVERAGE=2 python -m kimp.carry_backtest run --from 2026-09-22
 ```
+
+**윈도우 PowerShell** — 앞에 붙이는 방식이 없다. `$env:` 로 **먼저 설정**하고 그다음 줄에서 실행한다
+```powershell
+$env:PAPER_INITIAL_TOTAL_USDT = "250"
+$env:POSITION_SIZE_USDT = "50"
+$env:MEW_ENTRY_PREMIUM_THRESHOLD_PERCENT = "-0.10"
+python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP
+```
+- `$env:` 로 넣은 값은 **그 터미널이 닫힐 때까지 계속 남는다.** 다음 실행에 섞이지 않게 쓰고 나면 지운다:
+  `Remove-Item Env:PAPER_INITIAL_TOTAL_USDT, Env:POSITION_SIZE_USDT, Env:MEW_ENTRY_PREMIUM_THRESHOLD_PERCENT`
+- 매번 지우기 번거로우면 **Git Bash** 를 쓰는 게 편하다 (위 bash 방식 그대로 되고, 끝나면 설정도 안 남는다).
+  예) `PAPER_TRADING=false ./.venv/Scripts/python.exe main.py`
+- `PAPER_TRADING=false python main.py` 를 PowerShell 에 그대로 치면 **에러**가 난다 (bash 문법).
 
 ## 6. 자주 쓰는 설정 (전체는 `.env.example`)
 | 설정 | 기본 | 뜻 |
@@ -94,7 +156,8 @@ CARRY_ENTRY_MIN_DAILY_PERCENT=0.05 CARRY_LEVERAGE=2 python3 -m kimp.carry_backte
 | `BYBIT_LEVERAGE` | 1 | 김프 전략 숏 레버리지 (자본 비율 자동) |
 | `LIQUIDATION_WARN_PERCENT` | 15 | 강제청산까지 남은 상승폭이 이보다 작으면 경고 (두 전략 공통) |
 | `REBALANCE_THRESHOLD_PERCENT` | 10 | 양쪽 비율이 이만큼 깨지면 리밸런싱 |
-| `REBALANCE_TRANSFER_FEE_USDT` | 1.0 | 송금 한 번 수수료 (송금할 때만) |
+| `TRANSFER_FEE_UPBIT_TO_BYBIT_USDT` | 0 | 업비트 → 바이비트 송금 수수료 (업비트 USDT(TRX) 출금 무료) |
+| `TRANSFER_FEE_BYBIT_TO_UPBIT_USDT` | 1.3 | 바이비트 → 업비트 송금 수수료 (바이비트 TRC20 출금) |
 | `PAPER_AUTO_REBALANCE` | true | 페이퍼·시뮬레이션에서 필요할 때 자동 송금 흉내 |
 | `CARRY_ENABLED` | true | 펀딩비 전략 같이 돌리기 |
 | `CARRY_CAPITAL_USDT` | 1,000 | 펀딩비 전략 자본 (따로) |
@@ -102,12 +165,32 @@ CARRY_ENTRY_MIN_DAILY_PERCENT=0.05 CARRY_LEVERAGE=2 python3 -m kimp.carry_backte
 | `CARRY_LIQ_GUARD_PERCENT` | 15 | 펀딩비 전략: 강제청산까지 이보다 가까우면 양쪽 미리 정리 |
 
 ## 7. 실거래 (자세히: [live.md](live.md))
+**맥 / 리눅스 / Git Bash**
 ```bash
-python3 -m kimp.live_check                                               # ❌ 없을 때까지
-PAPER_TRADING=false python3 main.py                                      # 드라이런 (주문 안 냄)
-PAPER_TRADING=false LIVE_DRY_RUN=false LIVE_CONFIRM=YES python3 main.py  # 실제 주문
-touch data/STOP                                                          # 비상정지 (지우면 재개)
+python -m kimp.live_check                                               # ❌ 없을 때까지
+PAPER_TRADING=false python main.py                                      # 드라이런 (주문 안 냄)
+PAPER_TRADING=false LIVE_DRY_RUN=false LIVE_CONFIRM=YES python main.py  # 실제 주문
+touch data/STOP                                                         # 비상정지 (지우면 재개)
 ```
+
+**윈도우 PowerShell**
+```powershell
+python -m kimp.live_check                     # ❌ 없을 때까지
+
+$env:PAPER_TRADING = "false"                  # 드라이런 (주문 안 냄)
+python main.py
+
+$env:LIVE_DRY_RUN = "false"                   # 여기서부터 실제 주문이 나간다
+$env:LIVE_CONFIRM = "YES"
+python main.py
+
+New-Item -ItemType File data\STOP             # 비상정지 (지우면 재개)
+Remove-Item data\STOP                         # 재개
+```
+- 위 `$env:` 값은 그 터미널에 **계속 남는다.** 페이퍼로 돌아가려면 `$env:PAPER_TRADING = "true"` 로 바꾸거나 터미널을 새로 열 것.
+  실수로 실거래가 켜진 채 `main.py` 를 또 켜는 사고를 막으려면, 실거래용 설정은 `$env:` 가 아니라 **`.env` 에 적어 두는 게 안전하다.**
+- 비상정지는 파일만 만들면 되니 탐색기에서 `data` 폴더에 `STOP` 파일을 만들어도 같다.
+
 텔레그램: `/status`, `/stop`, `/resume`
 
 ## 8. 송금(리밸런싱)은 누가 하나
