@@ -300,7 +300,10 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """
         engine, _, sf, broker = self._engine_all_on_upbit()
         engine.startup()
-        move = 10_000 * (1 - engine.s.upbit_target_share())
+        import math
+
+        from kimp.broker import TRANSFER_DECIMALS
+        move = math.floor(10_000 * (1 - engine.s.upbit_target_share()) * 10 ** TRANSFER_DECIMALS)             / 10 ** TRANSFER_DECIMALS
         fee = engine.s.transfer_fee_usdt(True)
         self.assertEqual(fee, 0.0)
         with sf() as s:
@@ -337,7 +340,11 @@ class LeverageAndRebalanceTest(unittest.TestCase):
             broker.ensure_initial_balances(s, 10_000, 0.0)  # 전부 바이비트에
         engine = Engine(settings, FakeMarket(), None, broker, sf, ["XRP"])
         engine.startup()
-        move = 10_000 * settings.upbit_target_share()
+        import math
+
+        from kimp.broker import TRANSFER_DECIMALS
+        # 거래소가 소수점 6자리까지만 받으므로 보낼 금액을 내려서 자른다 (업비트가 실제로 거절했다)
+        move = math.floor(10_000 * settings.upbit_target_share() * 10 ** TRANSFER_DECIMALS)             / 10 ** TRANSFER_DECIMALS
         with sf() as s:
             self.assertAlmostEqual(broker.balance(s, BYBIT_USDT), 10_000 - move, places=6)
             self.assertAlmostEqual(broker.balance(s, UPBIT_USDT), move - 1.3, places=6)

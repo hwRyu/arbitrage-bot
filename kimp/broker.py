@@ -45,6 +45,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -78,6 +79,12 @@ from kimp.executor import (
 from kimp.pnl import EntryLegs, ExitLegs, PnLBreakdown, compute_pnl, liquidation_price
 from kimp.premium import ExitPlan, Quote, premium_percent
 from kimp.safety import Safety, kst_midnight_utc
+
+# 송금 금액 소수점 자리수 상한. 업비트는 6자리를 넘으면 거절한다 (2026-10-22 실거래에서 겪음)
+#   846.6747287521739 → "출금 소수점 자리수를 초과하였습니다. 6 이하 소수점 자리수만 적용됩니다."
+# 내림으로 자른다 (올리면 잔고보다 많이 보내려 할 수 있다)
+TRANSFER_DECIMALS = 6
+
 
 logger = logging.getLogger(__name__)
 
@@ -809,6 +816,7 @@ class HedgeBroker:
             today = session.scalar(select(func.coalesce(func.sum(Transfer.amount_usdt), 0.0)).where(
                 Transfer.status != TransferStatus.FAILED, Transfer.requested_at >= since)) or 0.0
             send = min(send, self.transfer_max_usdt_per_day - today)
+        send = math.floor(send * 10 ** TRANSFER_DECIMALS) / 10 ** TRANSFER_DECIMALS  # 거래소 자리수 제한
         if send <= max(fee_usdt, self.transfer_min_usdt) or send <= 0:
             return 0.0
         t = Transfer(direction="upbit->bybit" if to_bybit else "bybit->upbit", amount_usdt=send, fee_usdt=fee_usdt,
