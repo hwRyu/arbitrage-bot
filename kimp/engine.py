@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from kimp.config import Settings
 from kimp.broker import EntryRejected, ExitValuation, HedgeBroker, InsufficientBalance
-from kimp.db import ExitReason, FundingEvent, Position, PremiumSnapshot
+from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium, margin_to_add_usdt
@@ -44,6 +44,17 @@ logger = logging.getLogger(__name__)
 
 # 같은 경고를 너무 자주 찍지 않으려고 두는 간격 (초)
 LOG_COOLDOWN_SEC = 60.0
+
+
+def _as_utc(dt):
+    """
+    DB 에서 읽은 시각에 UTC 를 붙인다
+
+    SQLite 는 시간대를 저장하지 않아서 읽으면 'naive'(시간대 없음) 로 온다.
+    그대로 지금 시각(UTC)과 빼면 TypeError 가 나고, 한국 시간으로 착각하면 9시간이 밀린다.
+    """
+    from datetime import timezone
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 class Engine:
@@ -88,6 +99,10 @@ class Engine:
         self._reentry_allowed_at: Dict[str, float] = {}
         self._last_status_log = 0.0
 
+        # 한 번만 돌리기(ONE_SHOT): 포지션 하나를 끝까지 보고 종료한다
+        self._one_shot_opened = False  # 이번 실행에서 포지션을 잡았나 (또는 이미 있던 걸 이어받았나)
+        self._one_shot_done = False    # 그 포지션이 끝났나 → run 루프가 멈춘다
+
     @property
     def transfers(self) -> list:
         """지금까지 한 송금 (실패 제외, DB 기록)"""
@@ -116,6 +131,15 @@ class Engine:
                 if pos.coin not in self.coins:
                     logger.warning("%s 는 COINS 에 없지만 열린 포지션이 있어서 청산할 때까지 관리합니다", pos.coin)
                     self.coins.append(pos.coin)
+            if self.s.one_shot:
+                if positions:
+                    self._one_shot_opened = True
+                    logger.warning("[한 번만 돌리기] 이미 열린 포지션 %d개를 끝까지 관리하고 종료합니다 "
+                                   "(새로 진입하지 않습니다)", len(positions))
+                else:
+                    logger.warning("[한 번만 돌리기] 포지션 하나를 잡고, 청산되면 종료합니다"
+                                   "%s", f" (최대 보유 {self.s.one_shot_max_hours:g}시간)"
+                                   if self.s.one_shot_max_hours else " (목표에 닿을 때까지 기다립니다)")
             self._check_rebalance(session, positions, {}, when="시작")
 
     def run(self, stop_event: threading.Event) -> None:
@@ -128,6 +152,10 @@ class Engine:
                 self.step()
             except Exception:
                 logger.exception("스캔 중 에러 (다음 스캔에서 다시 시도)")
+            if self._one_shot_done:
+                logger.warning("[한 번만 돌리기] 포지션이 끝났습니다 → 봇을 종료합니다")
+                stop_event.set()
+                break
             stop_event.wait(max(0.0, self.s.scan_interval_sec - (time.monotonic() - started)))
         logger.info("엔진 종료 (열린 포지션은 DB 에 남아서 다음 실행 때 이어서 관리)")
 
@@ -163,6 +191,8 @@ class Engine:
                 self._log_throttled("entries-blocked", logging.WARNING, f"신규 진입 중단 중: {why}")
             self._save_snapshots(session, quotes)
             self._log_status(session, quotes, open_positions)
+            if self.s.one_shot:
+                self._check_one_shot(session, quotes)
 
     # ------------------------------------------------------------------
     # 가진 포지션
@@ -199,6 +229,55 @@ class Engine:
 
         self._close(session, pos, valuation, reason)
         return True
+
+    def _check_one_shot(self, session: Session, quotes: Dict[str, Quote]) -> None:
+        """
+        한 번만 돌리기: 포지션 하나가 끝났는지 보고, 끝났으면 종료 신호를 켠다
+
+        끝났다고 보는 때
+            정상 청산(CLOSED) / 진입 중 실패해서 되돌림(ABORTED) / 손으로 정리해야 하는 ERROR
+        아직 안 끝난 것: OPENING · OPEN · CLOSING (다음 스캔에서 이어서 처리)
+
+        ONE_SHOT_MAX_HOURS 를 넘기면 목표에 못 닿았어도 시장가로 정리한다 (청산 사유 TIMEOUT).
+        """
+        # 관리 중(OPEN) + 덜 끝난 것(OPENING/CLOSING/ERROR)을 모두 봐야 한다.
+        # ERROR 는 봇이 청산하지 못하므로 '끝난 것' 으로 보고 경고와 함께 종료한다.
+        open_now = self.broker.open_positions(session)
+        unfinished = [p for p in self.broker.unfinished_positions(session)
+                      if p.status != PositionStatus.ERROR]
+        errors = [p for p in self.broker.unfinished_positions(session) if p.status == PositionStatus.ERROR]
+        if open_now or unfinished:
+            self._one_shot_opened = True
+            if self.s.one_shot_max_hours:
+                limit = self.s.one_shot_max_hours * 3600
+                for pos in open_now:
+                    held = self._now_utc().timestamp() - _as_utc(pos.opened_at).timestamp()
+                    if held < limit:
+                        continue
+                    quote = quotes.get(pos.coin)
+                    valuation = self.broker.value_exit(pos, quote) if quote else None
+                    if valuation is None:
+                        continue
+                    logger.warning("[한 번만 돌리기] #%d %s 보유 %.1f시간 > %g시간 → 지금 시세로 정리합니다 "
+                                   "(순손익 %+.3f%%)", pos.id, pos.coin, held / 3600,
+                                   self.s.one_shot_max_hours, valuation.pnl.net_percent)
+                    self._close(session, pos, valuation, ExitReason.TIMEOUT)
+            # 방금 정리해서 남은 게 없으면 이번 스캔에서 바로 끝낸다 (한 번 더 기다리지 않게)
+            if self.broker.open_positions(session) or [
+                    p for p in self.broker.unfinished_positions(session) if p.status != PositionStatus.ERROR]:
+                return
+        if errors:
+            logger.critical("[한 번만 돌리기] 확인이 필요한 포지션(ERROR) %d개가 있어 종료합니다 — "
+                            "거래소에서 직접 정리하세요 (docs/live.md 6번)", len(errors))
+            self._one_shot_done = True
+            return
+        if self._one_shot_opened:
+            self._one_shot_done = True
+
+    def _now_utc(self):
+        """지금 시각 (UTC)"""
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(self._clock(), timezone.utc)
 
     def _close(self, session: Session, pos: Position, valuation: ExitValuation, reason: str,
                liquidated: bool = False) -> None:
@@ -390,6 +469,8 @@ class Engine:
         - 진입 기준은 코인별 설정 (없으면 공통값)
         - 여러 코인이 동시에 조건을 만족하면 '자기 기준보다 더 많이 낮은' 코인부터
         """
+        if self.s.one_shot and self._one_shot_opened:
+            return  # 한 번만 돌리기: 이미 하나 잡았으면 더 잡지 않는다
         busy = {p.coin for p in self.broker.unfinished_positions(session)}  # 진입 중·청산 중·확인 필요
         slots = self.s.max_open_positions - len(open_positions) - len(busy - set(open_positions))
         if slots <= 0:
@@ -450,6 +531,11 @@ class Engine:
                 params.target_net_profit_percent, target,
             )
             open_positions[coin] = pos
+            if self.s.one_shot:
+                self._one_shot_opened = True
+                logger.warning("[한 번만 돌리기] 포지션을 잡았습니다 (#%d %s) → 더 진입하지 않고 청산까지 봅니다",
+                               pos.id, coin)
+                return  # 여러 코인이 동시에 조건을 만족해도 하나만 잡는다
 
     def _plan_bybit_qty(self, coin: str, quote: Quote, size_usdt: float) -> Optional[float]:
         """

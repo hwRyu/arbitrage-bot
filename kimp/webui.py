@@ -481,7 +481,7 @@ SIM_ENV = {"seed": "PAPER_INITIAL_TOTAL_USDT", "size": "POSITION_SIZE_USDT",
 # 화면에서 켜는 봇은 '호가 기록을 쌓는 용도' 라 스캔을 느리게 하고 펀딩비 전략은 끈다 (요청 제한 여유).
 BOT_ENV = {"coins": "COINS", "scan": "SCAN_INTERVAL_SEC", "seed": "PAPER_INITIAL_TOTAL_USDT",
            "size": "POSITION_SIZE_USDT", "max_positions": "MAX_OPEN_POSITIONS",
-           "target": "TARGET_NET_PROFIT_PERCENT"}
+           "target": "TARGET_NET_PROFIT_PERCENT", "one_shot_max_hours": "ONE_SHOT_MAX_HOURS"}
 
 
 def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[str, str]]:
@@ -529,6 +529,8 @@ def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[st
         cmd.append("--yes")
     if kind == "bot":
         env["PAPER_TRADING"] = "true"  # 화면에서는 실거래를 켤 수 없다
+        if params.get("one_shot"):
+            env["ONE_SHOT"] = "true"   # 포지션 하나만 잡고 청산되면 스스로 종료
         env.setdefault("SCAN_INTERVAL_SEC", "20")
         env["CARRY_ENABLED"] = "true" if params.get("carry") else "false"
         if params.get("quiet"):

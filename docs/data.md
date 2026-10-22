@@ -107,7 +107,7 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 | `exit_usdt_price_krw` · `exit_usdt_fee_krw` · `usdt_bought` | USDT 되산 평균가·수수료·**되산 개수** |
 | `exit_bybit_price_usdt` · `exit_bybit_fee_usdt` | 숏 닫은 평균가·수수료 |
 | `exit_premium` | 청산 김프 (코인 몫, %) |
-| `exit_reason` | `TAKE_PROFIT`(목표 달성) / `STOP_LOSS`(손절) / `LIQUIDATION`(강제청산) / `MANUAL` |
+| `exit_reason` | `TAKE_PROFIT`(목표 달성) / `STOP_LOSS`(손절) / `LIQUIDATION`(강제청산) / `TIMEOUT`(한 번만 돌리기에서 시간 초과) |
 | `upbit_leg_usdt` | 업비트 몫 손익 = `usdt_bought − usdt_sold` |
 | `bybit_leg_usdt` | 바이비트 몫 손익 = 숏 개수 × (진입가 − 청산가) |
 | `gross_pnl_usdt` | 비용 빼기 전 손익 |

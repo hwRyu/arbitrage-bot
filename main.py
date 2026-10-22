@@ -26,6 +26,8 @@ from datetime import datetime
 
 from kimp.broker import HedgeBroker, PaperBroker, broker_kwargs
 from kimp.carry import CarryBroker, CarryEngine, LiveCarryMarket
+from sqlalchemy import select
+
 from kimp.config import Settings, load_settings
 from kimp.db import make_session_factory
 from kimp.engine import Engine
@@ -34,6 +36,8 @@ from kimp.fx import FxProvider
 from kimp.logging_setup import setup_logging
 from kimp.market_data import MarketData
 from kimp.safety import KST, Safety
+
+LF = chr(10)
 
 logger = logging.getLogger("main")
 
@@ -132,6 +136,76 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
 
     threading.Thread(target=daily, name="daily-summary", daemon=True).start()
     notifier.send(f"봇 시작 ({MODE_LABEL[settings.mode]}, 코인 {', '.join(settings.coins)})")
+
+
+def print_one_shot_report(settings: Settings, session_factory) -> None:
+    """
+    한 번만 돌리기(ONE_SHOT)가 끝났을 때 '제대로 돌았나' 점검표를 찍어준다
+
+    처음 실제 주문을 내보는 자리라서, 어디를 확인해야 하는지까지 같이 알려준다.
+    (거래소 앱의 체결 내역과 숫자가 맞는지 사람이 봐야 한다)
+    """
+    from kimp.db import Fill, FundingEvent, Position, Transfer
+
+    line = "=" * 78
+    with session_factory() as session:
+        pos = session.scalars(select(Position).order_by(Position.id.desc()).limit(1)).first()
+        if pos is None:
+            print(f"{LF}{line}{LF}[한 번만 돌리기] 진입한 포지션이 없습니다 "
+                  f"(김프가 기준까지 내려오지 않았거나, 안전장치에 막혔습니다){LF}{line}")
+            return
+        fills = session.scalars(select(Fill).where(Fill.position_id == pos.id).order_by(Fill.id)).all()
+        fundings = session.scalars(select(FundingEvent).where(FundingEvent.position_id == pos.id)).all()
+        transfers = session.scalars(select(Transfer).order_by(Transfer.id)).all()
+
+    from kimp.engine import _as_utc
+    held = ((_as_utc(pos.closed_at).timestamp() - _as_utc(pos.opened_at).timestamp()) / 3600
+            if pos.closed_at else 0.0)
+    ok = pos.status == "CLOSED"
+    print()
+    print(line)
+    print(f"[한 번만 돌리기 결과] 모드 {settings.mode} · 포지션 #{pos.id} {pos.coin} · 상태 {pos.status}"
+          f"{' ✅' if ok else ' ⚠️ 확인 필요'}")
+    print(line)
+    print(f"  진입   {pos.opened_at:%Y-%m-%d %H:%M:%S} UTC  김프 {pos.entry_premium:+.3f}% "
+          f"(기준 {pos.entry_threshold_percent:+.2f}%)")
+    print(f"         업비트 USDT {pos.usdt_sold:.2f}개 매도 @{pos.entry_usdt_price_krw:,.2f}원 "
+          f"→ {pos.coin} {pos.upbit_qty:.6g}개 매수 @{pos.entry_upbit_price_krw:,.4f}원")
+    print(f"         바이비트 숏 {pos.bybit_qty:g}개 @{pos.entry_bybit_price_usdt:.6f} "
+          f"({pos.leverage:g}배, 증거금 {pos.bybit_margin_usdt:.2f}, 강제청산 {pos.liquidation_price:.6f})")
+    if pos.closed_at:
+        print(f"  청산   {pos.closed_at:%Y-%m-%d %H:%M:%S} UTC  김프 {pos.exit_premium:+.3f}% "
+              f"· 사유 {pos.exit_reason} · 보유 {held:.2f}시간")
+        print(f"         {pos.coin} {pos.upbit_qty:.6g}개 매도 @{pos.exit_upbit_price_krw:,.4f}원 "
+              f"→ USDT {pos.usdt_bought:.2f}개 매수 @{pos.exit_usdt_price_krw:,.2f}원")
+        print(f"  손익   업비트 {pos.upbit_leg_usdt:+.3f} + 바이비트 {pos.bybit_leg_usdt:+.3f} "
+              f"+ 펀딩 {pos.funding_usdt:+.3f} − 비용 {pos.total_cost_usdt:.3f} "
+              f"= 순손익 {pos.net_pnl_usdt:+.3f} USDT ({pos.net_pnl_percent:+.3f}%)")
+    else:
+        print("  청산   아직 안 됨")
+    print(f"  체결   {len(fills)}건 (진입 3 + 청산 3 이 정상. 부분 체결이 있으면 더 많다)")
+    for f in fills:
+        state = f.state or "DONE"
+        print(f"         {f.exchange:7s} {f.side:16s} {f.qty:>14.6g} @ {f.avg_price:>14.6g} "
+              f"수수료 {f.fee:>10.4f} {f.fee_currency}  밀림 {f.slippage_percent:+.3f}%  {state}")
+    if fundings:
+        print(f"  펀딩비 {len(fundings)}번, 합계 {sum(f.amount_usdt for f in fundings):+.4f} USDT")
+    if transfers:
+        print(f"  송금   {len(transfers)}번")
+        for t in transfers:
+            print(f"         {t.direction} {t.amount_usdt:.2f} USDT (수수료 {t.fee_usdt:g}, {t.network}) {t.status}")
+    print()
+    print("  확인할 것")
+    print(f"    1) 거래소 앱의 체결 내역과 위 '체결' 의 개수·평균가·수수료가 같은지")
+    print(f"    2) 양쪽 잔고가 예상대로인지 (업비트 USDT, 바이비트 USDT·포지션 0)")
+    print(f"    3) 자세한 기록: {settings.active_db_path} 의 positions · fills 테이블 "
+          f"(python -m kimp.webui 의 '페이퍼 봇' 탭에서도 보입니다)")
+    print(f"    4) 로그 파일: {settings.log_dir}/")
+    if pos.status == "ERROR":
+        print("    ⚠️ 상태가 ERROR 입니다 → 거래소에서 직접 정리하고 DB 상태를 고친 뒤 다시 켜세요 (docs/live.md 6번)")
+    elif pos.status == "ABORTED":
+        print("    ⚠️ 진입 중 실패해서 되돌렸습니다 → 양쪽에 남은 것이 없는지 확인하세요")
+    print(line)
 
 
 def main() -> int:
@@ -236,6 +310,8 @@ def main() -> int:
     engine.run(stop_event)
     if carry_thread:
         carry_thread.join(timeout=30)
+    if settings.one_shot:
+        print_one_shot_report(settings, session_factory)
     return 0
 
 

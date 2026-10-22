@@ -186,6 +186,11 @@
         <label><input type="checkbox" id="btQuiet" checked> 텔레그램 알림 끄기</label>
         <label><input type="checkbox" id="btCarry"> 펀딩비 전략도 함께</label>
         <button class="act" id="btRun">페이퍼 봇 켜기</button>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="btOnce"> <b>한 번만</b> (포지션 1개 잡고 청산되면 스스로 종료)</label>
+        <label>최대 보유 <input id="btOnceHours" type="number" value="0" min="0" step="0.5" style="width:70px">시간
+          <span class="muted">(0 = 목표에 닿을 때까지)</span></label>
         <span class="muted">페이퍼(가짜 주문)로만 켭니다. 호가 기록이 1분에 1건씩 쌓입니다</span>
       </div>
     </div>
@@ -729,6 +734,8 @@ $("smRun").onclick = () => runJob("sim", {
 $("btRun").onclick = () => runJob("bot", {
   coins: $("btCoins").value, scan: $("btScan").value,
   quiet: $("btQuiet").checked ? "1" : "", carry: $("btCarry").checked ? "1" : "",
+  one_shot: $("btOnce").checked ? "1" : "",
+  one_shot_max_hours: $("btOnce").checked ? $("btOnceHours").value : "",
 });
 
 // ---------- 페이퍼 봇 상태 ----------

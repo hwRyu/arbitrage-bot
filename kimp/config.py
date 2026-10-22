@@ -271,6 +271,16 @@ class Settings:
     # 바이비트 최소 주문(개수·금액)은 거래소 마켓 정보에서 읽는다 (예: XRP 0.1개, 5 USDT)
     upbit_min_order_krw: float = 5_000.0
 
+    # ★ 한 번만 돌리기 (첫 실거래 점검용)
+    # true 면 포지션을 **딱 하나만** 잡고, 그 포지션이 청산되면 봇이 스스로 종료한다.
+    # 처음 실제 주문을 내볼 때 "한 바퀴가 제대로 도는지"만 확인하려고 쓴다.
+    #   진입 → 보유 → 청산 → 요약 출력 → 종료
+    # 이미 열린 포지션이 있으면 그걸 끝까지 관리하고 종료한다 (새로 잡지 않는다).
+    one_shot: bool = False
+    # 한 번만 돌리기에서 이 시간을 넘겨도 청산 조건에 닿지 않으면 시장가로 정리하고 끝낸다.
+    # 0 이면 무제한(목표에 닿을 때까지 기다림). 예) 6 = 6시간 뒤에도 안 되면 정리
+    one_shot_max_hours: float = 0.0
+
     # 리밸런싱 송금 한 번에 드는 출금 수수료 (USDT). 송금할 때만 한 번 든다 (거래마다 X)
     # 보내는 거래소가 떼기 때문에 방향마다 다르다. (2026-10-22 확인: 실제 송금 + 바이비트 API 조회)
     #   업비트 → 바이비트: 업비트 USDT(TRX) 출금 무료      → 0
@@ -510,6 +520,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
         hedge_tolerance_percent=_env_float("HEDGE_TOLERANCE_PERCENT", d.hedge_tolerance_percent),
         upbit_min_order_krw=_env_float("UPBIT_MIN_ORDER_KRW", d.upbit_min_order_krw),
+        one_shot=_env_bool("ONE_SHOT", d.one_shot),
+        one_shot_max_hours=_env_float("ONE_SHOT_MAX_HOURS", d.one_shot_max_hours),
         transfer_fee_upbit_to_bybit_usdt=_env_float("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT",
                                                     d.transfer_fee_upbit_to_bybit_usdt),
         transfer_fee_bybit_to_upbit_usdt=_env_float("TRANSFER_FEE_BYBIT_TO_UPBIT_USDT",
@@ -678,6 +690,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("MAX_POSITION_USDT 는 0보다 커야 합니다")
     if s.daily_loss_limit_usdt is not None and s.daily_loss_limit_usdt <= 0:
         errors.append("DAILY_LOSS_LIMIT_USDT 는 0보다 커야 합니다")
+    if s.one_shot_max_hours < 0:
+        errors.append("ONE_SHOT_MAX_HOURS 는 0 이상이어야 합니다 (0 = 무제한)")
     if s.transfer_min_usdt <= max(s.transfer_fee_upbit_to_bybit_usdt, s.transfer_fee_bybit_to_upbit_usdt):
         errors.append("TRANSFER_MIN_USDT 는 송금 수수료(TRANSFER_FEE_*)보다 커야 합니다")
 
