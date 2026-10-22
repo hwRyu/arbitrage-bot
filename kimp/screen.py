@@ -39,7 +39,7 @@
        예) 30일에 3번 왕복 → 주기 240시간 → 0.1 (기회가 너무 드묾)
    - 띠 가중치: 기간을 4등분한 구간별 김프 중간값이 얼마나 옮겨 다녔나 (띠 이동폭 = 최고 − 최저)
        0.3%p 이하 → 1.0 / 0.9%p → 0.5 / 1.5%p 이상 → 0  (띠가 흔들리면 진입 기준이 금방 안 맞게 됨)
-   점수 = 기본 점수 × 주기 가중치 × 띠 가중치  예) 기본 4.0 × 주기 0.5 × 띠 0.8 → 1.6
+   점수 = 기본 점수 ÷ 자리 점유율 × 띠 가중치  예) 기본 4.0 ÷ 점유율 0.5 × 띠 0.8 → 6.4
    - 김프가 1시간 평균으로 ±5% 를 넘은 적이 있으면 '이상김프' (입출금 막힘 등) → 순위 맨 아래로
      예) LSK 2026-09-22~10-02 김프 −5% ~ −31% → 들어가자마자 손절만 반복 (한 달 −64 USDT)
 
@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+from collections import Counter
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -76,6 +77,7 @@ from kimp.history import (
 )
 from kimp.market_data import USDT_KRW_SYMBOL, bybit_symbol, upbit_symbol
 from kimp.simulate import tick_floor_percent, usdt_tick_percent
+from kimp.spread import LIVE_SAMPLES, median_spread_depth, resolve_spreads
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,14 @@ ABNORMAL_PREMIUM_PERCENT = 5.0  # 1시간 평균 김프가 ±5% 를 넘은 적�
 
 # 반복 주기 가중치: 주기가 이 시간 이하면 1.0, 길어지면 (이 시간 ÷ 주기)
 CYCLE_GOOD_HOURS = 24.0
+
+# 자리 점유율 하한. 거래가 1~2건뿐인 코인이 '자리를 거의 안 쓴다' 는 이유로
+# 점수가 부풀지 않게 막는다. 0.25 = 자리를 4분의 1 은 쓴다고 보고 계산
+MIN_OCCUPANCY = 0.25
+
+# 추천 COINS 목록을 만들 때 쓸 자리 예산 비율.
+# 자리 3개 × 0.8 = 2.4 까지만 채운다 (꽉 채우면 빠른 코인이 들어갈 틈이 없다)
+SLOT_BUDGET_RATIO = 0.8
 # 띠 가중치: 구간별 중간값 이동폭이 OK 이하면 1.0, ZERO 이상이면 0, 사이는 직선
 BAND_SHIFT_OK_PERCENT = 0.3
 BAND_SHIFT_ZERO_PERCENT = 1.5
@@ -378,10 +388,27 @@ def cycle_weight(cycle_hours: Optional[float], good_hours: float = CYCLE_GOOD_HO
     반복 주기 가중치 = min(1, 24시간 ÷ 주기). 왕복이 없으면 0
 
     예) 주기 12시간 → 1.0 / 48시간 → 0.5 / 240시간(30일에 3번) → 0.1
+
+    지금은 점수에 쓰지 않는다 (자리 점유율로 대체). 표에 주기를 보여줄 때만 참고.
     """
     if not cycle_hours:
         return 0.0
     return min(1.0, good_hours / cycle_hours)
+
+
+def slot_efficiency(monthly_percent: float, occupancy: float) -> float:
+    """
+    자리당 효율 = 월 수익 ÷ 자리 점유율 (포지션 자리 하나를 한 달 내내 썼다면 얼마 벌었나)
+
+    왜 필요한가: 동시에 들 수 있는 포지션은 MAX_OPEN_POSITIONS(기본 3)개뿐이다.
+    느린 코인은 자리를 며칠씩 차지해서, 몇 시간마다 기회가 오는 코인의 진입을 막는다.
+    코인을 하나씩 따로 보면 이 손실이 안 보인다.
+      예) 자리를 80% 쓰면서 월 +6% 인 코인 → 6 ÷ 0.8 = 7.5
+          자리를 20% 쓰면서 월 +4% 인 코인 → 4 ÷ 0.25(하한) = 16.0  ← 남는 자리에 다른 코인을 넣을 수 있어 더 좋다
+
+    점유율이 아주 작은 코인(거래 1~2건)이 과대평가되지 않도록 하한 MIN_OCCUPANCY 를 둔다.
+    """
+    return monthly_percent / max(occupancy, MIN_OCCUPANCY)
 
 
 def band_weight(band_shift: float) -> float:
@@ -425,9 +452,22 @@ class CoinScore:
         return self.days * 24 / self.full.trades
 
     @property
+    def occupancy(self) -> float:
+        """
+        자리 점유율 = 포지션을 들고 있던 시간 ÷ 전체 기간 (0~1)
+
+        예) 30일(720시간) 중 거래 14건 × 평균 36.7시간 = 514시간 들고 있었으면 0.71
+        한 번에 포지션 1개로 돌린 결과라 1 을 넘지 않는다.
+        """
+        if not self.full or self.days <= 0:
+            return 0.0
+        held = sum(self.full.holding_hours)
+        return min(1.0, held / (self.days * 24))
+
+    @property
     def weight(self) -> float:
-        """주기 가중치 × 띠 가중치 (0~1)"""
-        return cycle_weight(self.cycle_hours, self.cycle_good_hours) * band_weight(self.stats.band_shift)
+        """띠 가중치 (0~1). 같은 띠 안에서 움직이는 코인만 인정한다"""
+        return band_weight(self.stats.band_shift)
 
     @property
     def monthly(self) -> float:
@@ -447,12 +487,18 @@ class CoinScore:
     @property
     def score(self) -> float:
         """
-        점수 = 기본 점수 × 가중치 (기본 점수가 + 일 때만. − 는 그대로 둬서 손해가 작아 보이지 않게)
+        점수 = 자리당 효율 × 띠 가중치 (기본 점수가 + 일 때만. − 는 그대로 둬서 손해가 작아 보이지 않게)
 
-        예) 기본 4.0, 주기 48시간(0.5), 띠 이동 0.5%p(0.83) → 4.0 × 0.5 × 0.83 = 1.67
+        자리당 효율 = 기본 점수(전체·검증 중 작은 월수익) ÷ 자리 점유율
+
+        예) 기본 13.94, 점유율 0.71, 띠 이동 0.23%p(가중치 1.0) → 13.94 ÷ 0.71 × 1.0 = 19.6
+            기본  5.25, 점유율 0.79, 띠 가중치 1.0              →  5.25 ÷ 0.79 × 1.0 =  6.6
+        → 자리를 비슷하게 쓰면서 덜 버는 코인이 확실히 밀린다.
         """
         base = self.base_score
-        return base * self.weight if base > 0 else base
+        if base <= 0:
+            return base
+        return slot_efficiency(base, self.occupancy) * self.weight
 
 
 def funding_per_8h_percent(funding: Sequence[Tuple[int, float]], days: float) -> float:
@@ -550,11 +596,11 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
     lines = [
         settings_note,
         "",
-        "점수 = min(전체 월수익, 검증 월수익) × 주기 가중치 × 띠 가중치 · 수익은 포지션 금액 대비 % "
+        "점수 = min(전체 월수익, 검증 월수익) ÷ 자리 점유율 × 띠 가중치 · 수익은 포지션 금액 대비 % "
         "(한 번에 포지션 1개, 펀딩비 포함)",
         "",
         f"{'순위':>3} {'코인':<7}{'점수':>6} {'전체/월':>7} {'검증/월':>7} {'거래':>4} {'승':>3} "
-        f"{'진입기준':>7} {'보유h':>5} {'주기h':>5} {'가중':>4} │ {'중간값':>6} {'범위(5~95%)':>13} {'횡보':>4} "
+        f"{'진입기준':>7} {'보유h':>5} {'주기h':>5} {'점유':>5} {'가중':>4} │ {'중간값':>6} {'범위(5~95%)':>13} {'횡보':>4} "
         f"{'띠이동':>5} {'반감h':>5} "
         f"│ {'호가':>5} {'비용':>5} {'업비트(억)':>9} {'바이비트(M$)':>11} {'펀딩/8h':>7}  경고",
     ]
@@ -564,7 +610,8 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
         lines.append(
             f"{i:>3}. {s.coin:<7}{(f'{s.score:+.2f}' if f else '-'):>6} {s.monthly:>+7.2f} {s.test_monthly:>+7.2f} "
             f"{(f.trades if f else 0):>4} {(f.wins if f else 0):>3} "
-            f"{(f'{f.threshold:+.2f}' if f else '-'):>7} {hold:>5.1f} {_hl(s.cycle_hours):>5} {s.weight:>4.2f} │ "
+            f"{(f'{f.threshold:+.2f}' if f else '-'):>7} {hold:>5.1f} {_hl(s.cycle_hours):>5} "
+            f"{s.occupancy * 100:>4.0f}% {s.weight:>4.2f} │ "
             f"{s.stats.median:>+6.2f} {s.stats.p5:>+6.2f}~{s.stats.p95:>+6.2f} "
             f"{s.stats.sideways_share * 100:>3.0f}% {s.stats.band_shift:>5.2f} {_hl(s.stats.half_life_h):>5} │ "
             f"{s.spread_percent:>5.2f} {s.cost_percent:>5.2f} {s.live.upbit_krw_24h / 1e8:>9,.0f} "
@@ -580,7 +627,9 @@ LEGEND = """
   거래/승  전체 기간 닫은 거래 수 / 그중 이익 / 진입기준: 그때 쓴 진입 김프 기준 (%)
   보유h    거래 하나 평균 보유 시간
   주기h    반복 주기 = 기간 ÷ 왕복 횟수 (시간). 24시간 이하면 가중치 1, 48시간 0.5, 1주 0.14
-  가중     주기 가중치 × 띠 가중치 (0~1)
+  점유     자리 점유율 = 포지션을 들고 있던 시간 ÷ 전체 기간. 자리가 MAX_OPEN_POSITIONS 개뿐이라,
+           오래 들고 있는 코인은 다른 코인의 진입을 막는다 → 점수를 이 값으로 나눈다 (하한 25%)
+  가중     띠 가중치 (0~1). 같은 띠 안에서 움직이는 코인만 인정
   중간값·범위  봇 김프(코인 몫) 중간값과 하위 5% ~ 상위 5% (넓을수록 기회가 큼)
   횡보     중간값 ±0.3% 안에 있던 시간 비율
   띠이동   기간 4등분 구간별 중간값의 최고 − 최저 (%p). 0.3 이하 가중치 1, 1.5 이상 0
@@ -594,13 +643,35 @@ LEGEND = """
 """
 
 
-def env_snippet(ranked: Sequence[CoinScore], n: int) -> str:
-    """상위 코인을 .env 에 바로 붙일 수 있게"""
-    picks = [s for s in ranked[:n] if s.full and s.score > 0 and not s.abnormal]
+def env_snippet(ranked: Sequence[CoinScore], n: int, max_open_positions: int = 3) -> str:
+    """
+    상위 코인을 .env 에 바로 붙일 수 있게
+
+    자리가 MAX_OPEN_POSITIONS 개뿐이라 점유율 합이 그 안에 들어가게 고른다.
+    꽉 채우면 몇 시간마다 기회가 오는 코인이 들어갈 틈이 없어서, 예산은 자리 수 × 0.8 만 쓴다.
+      예) 자리 3개 → 예산 2.4. CAP(0.71) + WAVES(0.79) + GRVT(0.78) = 2.28 까지 담고 다음은 버림
+    """
+    budget = max_open_positions * SLOT_BUDGET_RATIO
+    picks: List[CoinScore] = []
+    used = 0.0
+    skipped: List[str] = []
+    for s in ranked[:n]:
+        if not (s.full and s.score > 0 and not s.abnormal):
+            continue
+        need = max(s.occupancy, MIN_OCCUPANCY)
+        if used + need > budget:
+            skipped.append(s.coin)
+            continue
+        picks.append(s)
+        used += need
     if not picks:
         return "점수가 + 인 코인이 없습니다. (목표 순이익을 낮추거나 기간을 바꿔서 다시 보세요)"
-    lines = ["# .env 에 붙여넣기 예시 (점수 + 인 상위 코인)", "COINS=" + ",".join(s.coin for s in picks)]
+    lines = [f"# .env 에 붙여넣기 예시 (자리 {max_open_positions}개 예산 {budget:.1f} 중 {used:.2f} 사용)",
+             "COINS=" + ",".join(s.coin for s in picks)]
     lines += [f"{s.coin}_ENTRY_PREMIUM_THRESHOLD_PERCENT={s.full.threshold:.2f}" for s in picks]
+    if skipped:
+        lines.append(f"# 자리가 모자라 빠진 코인: {', '.join(skipped)} "
+                     f"(넣으려면 MAX_OPEN_POSITIONS 를 늘리거나 위 코인을 빼세요)")
     return "\n".join(lines)
 
 
@@ -640,46 +711,6 @@ def fetch_live(md, coins: List[str]) -> Dict[str, CoinLive]:
         live[c].upbit_krw_24h = float((up_t.get(upbit_symbol(c)) or {}).get("quoteVolume") or 0)
         live[c].bybit_usdt_24h = float((by_t.get(bybit_symbol(c)) or {}).get("quoteVolume") or 0)
     return live
-
-
-def _depth(levels, best: float, within: float, is_ask: bool) -> float:
-    """맨 앞 호가에서 within(소수) 안쪽에 쌓인 금액 (가격 × 개수 합)"""
-    limit = best * (1 + within) if is_ask else best * (1 - within)
-    return sum(p * q for p, q, *_ in levels if (p <= limit if is_ask else p >= limit))
-
-
-def fetch_books(md, coins: List[str], usdt_krw: float) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-    """
-    코인마다 (지금 호가 간격 %, 물량 USDT)
-
-    호가 간격 = 업비트 (매도1 − 매수1) ÷ 중간 + 바이비트 (매도1 − 매수1) ÷ 중간
-    물량 = 업비트 매도벽(우리가 살 쪽)과 바이비트 매수벽(우리가 숏 칠 쪽) 중 작은 쪽, 맨 앞에서 0.3% 안쪽
-    """
-    out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-    up_books: Dict[str, dict] = {}
-    for i in range(0, len(coins), 50):  # 업비트는 여러 코인 호가창을 한 번에 받을 수 있다
-        chunk = [upbit_symbol(c) for c in coins[i:i + 50]]
-        try:
-            up_books.update(md.upbit.fetch_order_books(chunk, limit=15))
-        except Exception as exc:
-            logger.warning("업비트 호가창 받기 실패: %s", exc)
-    for c in coins:
-        try:
-            ub = up_books.get(upbit_symbol(c))
-            bb = with_retry(md.bybit.fetch_order_book, bybit_symbol(c), limit=50)
-            if not ub or not ub["bids"] or not ub["asks"] or not bb["bids"] or not bb["asks"]:
-                out[c] = (None, None)
-                continue
-            ub_bid, ub_ask = ub["bids"][0][0], ub["asks"][0][0]
-            bb_bid, bb_ask = bb["bids"][0][0], bb["asks"][0][0]
-            spread = ((ub_ask - ub_bid) / ((ub_ask + ub_bid) / 2) + (bb_ask - bb_bid) / ((bb_ask + bb_bid) / 2)) * 100
-            depth = min(_depth(ub["asks"], ub_ask, 0.003, True) / usdt_krw,
-                        _depth(bb["bids"], bb_bid, 0.003, False))
-            out[c] = (spread, depth)
-        except Exception as exc:
-            logger.warning("%s 호가창 받기 실패: %s", c, exc)
-            out[c] = (None, None)
-    return out
 
 
 def default_size_usdt(settings: Settings) -> float:
@@ -774,28 +805,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         data[c] = (store.load_closes(src(UPBIT), c, start_ms, now_ms),
                    store.load_closes(src(BYBIT), c, start_ms, now_ms),
                    [r for r in store.load_funding(c, start_ms, now_ms) if r[0] < now_ms])
-    print("\n지금 호가창 확인 중...")
-    books = fetch_books(md, list(data), usdt_now)
+    print("")  # 한 줄 띄우기
+    print(f"지금 호가창 확인 중... ({LIVE_SAMPLES}번 재서 중간값. 한 번만 재면 그 순간 호가에 순위가 휘둘린다)")
+    books = median_spread_depth(md, list(data), usdt_now, retry=with_retry,
+                                progress=lambda n, total: print(f"  {n}/{total}번째", flush=True))
+    # 봇이 쌓은 기록이 있으면 그게 우선 (시뮬레이션과 같은 규칙: kimp/spread.py)
+    resolved, spread_sources = resolve_spreads(list(data), settings.db_path,
+                                               settings.sim_default_spread_percent,
+                                               {c: v[0] for c, v in books.items()})
 
     scores = []
     for c, (up, by, funding) in data.items():
         spread_live, depth = books.get(c, (None, None))
         live[c].spread_percent, live[c].depth_usdt = spread_live, depth
         floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
-        spread = max(spread_live or 0.0, floor) or settings.sim_default_spread_percent
+        spread = max(resolved[c], floor)
         s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, args.days, spread, usdt_spread,
                           fixed, target, settings.stop_loss_percent, funding, live[c], size, args.cycle_hours)
         if s:
             scores.append(s)
 
     ranked = rank(scores)
+    used = Counter(spread_sources[s.coin] for s in scores)
     note = (f"{'~' + args.end + ' ' if args.end else '최근 '}{args.days:g}일 · {args.timeframe}봉 · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
             f"손절 {settings.stop_loss_percent:g}% · 포지션 {size:,.0f} USDT · "
-            f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}%")
+            f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}%\n"
+            f"코인 호가 간격 출처: {', '.join(f'{k} {v}개' for k, v in used.most_common())} "
+            f"(호가 단위보다 좁으면 호가 단위로 올림)")
     print()
     print(format_table(ranked, args.top, note))
     print(LEGEND)
-    print(env_snippet(ranked, min(args.top, settings.max_open_positions * 2)))
+    print(env_snippet(ranked, args.top, settings.max_open_positions))
     return 0
 
 

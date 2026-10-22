@@ -137,11 +137,52 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual([s.coin for s in rank([flat, wave])], ["WAVE", "FLAT"])
 
     def test_slow_cycle_scores_lower(self):
-        # 같은 모양이지만 왕복이 4배 느린 코인 → 주기 가중치가 낮아 점수가 낮다
+        """같은 모양이지만 왕복이 4배 느린 코인 → 자리를 오래 차지해서 점수가 낮다"""
         fast = self._eval("FAST", ([-1.5] * 5 + [0.8] * 5) * 40)
         slow = self._eval("SLOW", ([-1.5] * 20 + [0.8] * 20) * 10)
         self.assertGreater(fast.score, slow.score)
-        self.assertLess(slow.weight, fast.weight)
+        # 이 가짜 데이터는 둘 다 '절반은 들고 있는' 모양이라 점유율이 같다.
+        # 점수 차이는 같은 자리를 쓰면서 느린 코인이 덜 번다는 데서 나온다.
+        self.assertAlmostEqual(slow.occupancy, fast.occupancy, places=6)
+        self.assertGreater(fast.base_score, slow.base_score)
+
+    def test_slot_efficiency(self):
+        """
+        자리당 효율 = 월 수익 ÷ 자리 점유율 (하한 25%)
+
+        자리를 80% 쓰면서 월 +6% < 자리를 25% 쓰면서 월 +4% (남는 자리에 다른 코인을 넣을 수 있다)
+        """
+        from kimp.screen import MIN_OCCUPANCY, slot_efficiency
+        self.assertAlmostEqual(slot_efficiency(6.0, 0.8), 7.5)
+        self.assertAlmostEqual(slot_efficiency(4.0, 0.25), 16.0)
+        self.assertGreater(slot_efficiency(4.0, 0.25), slot_efficiency(6.0, 0.8))
+        # 점유율이 하한보다 작아도 하한으로 계산 (거래 1~2건 코인 과대평가 방지)
+        self.assertAlmostEqual(slot_efficiency(4.0, 0.01), slot_efficiency(4.0, MIN_OCCUPANCY))
+
+    def test_occupancy(self):
+        """자리 점유율 = 들고 있던 시간 ÷ 전체 기간"""
+        s = self._eval("WAVE", ([-1.5] * 5 + [0.8] * 5) * 40)
+        held = sum(s.full.holding_hours)
+        self.assertAlmostEqual(s.occupancy, held / (s.days * 24), places=6)
+        self.assertLessEqual(s.occupancy, 1.0)
+
+    def test_env_snippet_respects_slot_budget(self):
+        """
+        추천 목록은 자리 예산(자리 수 × 0.8) 안에서만 고른다
+
+        느린 코인을 여러 개 넣어 빠른 코인의 자리를 막는 일을 막는다.
+        """
+        from kimp.screen import env_snippet
+        # 점유율 50% 짜리 코인 6개 → 예산 2.4 ÷ 0.5 = 4개까지만 담긴다
+        waves = [self._eval(f"WAVE{i}", ([-1.5] * 5 + [0.8] * 5) * 40) for i in range(6)]
+        ranked = rank(waves)
+        self.assertTrue(all(s.score > 0 for s in ranked))
+        out = env_snippet(ranked, n=10, max_open_positions=3)
+        coins = [l for l in out.splitlines() if l.startswith("COINS=")][0]
+        picked = coins.removeprefix("COINS=").split(",")
+        used = sum(max(s.occupancy, 0.25) for s in ranked if s.coin in picked)
+        self.assertLessEqual(used, 3 * 0.8 + 1e-9)
+        self.assertIn("자리가 모자라 빠진 코인", out)
 
     def test_abnormal_goes_last(self):
         wave = ([-1.5] * 5 + [0.8] * 5) * 30

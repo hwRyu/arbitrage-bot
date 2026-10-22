@@ -43,7 +43,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from sqlalchemy import func, select
 
 from kimp.config import Settings, load_settings
-from kimp.db import Position, PositionStatus, PremiumSnapshot, make_session_factory
+from kimp.db import Position, PositionStatus, make_session_factory
+from kimp.spread import (LIVE_SAMPLES, MIN_SNAPSHOTS_FOR_SPREAD, median_spread_depth, resolve_spreads,
+                         snapshot_spreads)
 from kimp.engine import Engine
 from kimp.fx import FxQuote
 from kimp.history import (BYBIT, MINUTE_MS, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade,
@@ -64,7 +66,6 @@ FILL_FORWARD_MINUTES = 5
 ASSUMED_DEPTH = 1e15
 
 # 실시간 기록에서 호가 간격을 측정하려면 최소 이만큼은 있어야 믿는다
-MIN_SNAPSHOTS_FOR_SPREAD = 30
 
 
 # ----------------------------------------------------------------------
@@ -427,36 +428,29 @@ def apply_tick_floor(spreads: Dict[str, float], sources: Dict[str, str],
             sources[coin] = f"{sources.get(coin, '-')} → 호가 단위 하한으로 올림"
 
 
-def decide_spreads(settings: Settings, coins: List[str]) -> Tuple[Dict[str, float], Dict[str, str]]:
+def decide_spreads(settings: Settings, coins: List[str], md=None,
+                   usdt_krw: float = 1.0) -> Tuple[Dict[str, float], Dict[str, str]]:
     """
-    코인별 코인 호가 간격(%) 정하기: 실측값 → 코인별 설정 → 공통 설정 순서
+    코인별 코인 호가 간격(%) 정하기 — 스크리너와 같은 규칙 (kimp/spread.py)
 
-    실측값 = 실시간 김프 기록의 (진입 김프 - 청산 김프 - USDT 호가 간격) 평균 (30건 이상일 때)
+    순서: 봇이 쌓은 기록 평균 → 코인별 설정 → 지금 호가창 여러 번 중간값 → 공통 기본값
+
+    과거 호가창은 거래소가 주지 않는다. 그래서 기록이 없으면 '지금' 호가를 대신 쓴다.
+    기본값 0.1% 를 쓰면 실제(예: CAP 0.35%)보다 싸게 계산돼서 가짜 수익이 나온다.
+
+    Args:
+        md: MarketData. 주면 기록이 없는 코인의 호가창을 조회해서 중간값을 쓴다
+        usdt_krw: 업비트 USDT 가격 (물량을 USDT 로 바꿀 때만 쓴다)
     """
-    measured: Dict[str, Tuple[float, int]] = {}
-    if os.path.exists(settings.db_path):  # 없는 DB 를 새로 만들지 않도록
-        sf = make_session_factory(settings.db_path)
-        with sf() as session:
-            spread = (PremiumSnapshot.entry_premium_top - PremiumSnapshot.exit_premium_top
-                      - func.coalesce(PremiumSnapshot.usdt_spread_percent, 0.0))
-            rows = session.execute(
-                select(PremiumSnapshot.coin, func.avg(spread), func.count())
-                .where(PremiumSnapshot.coin.in_(coins)).group_by(PremiumSnapshot.coin)
-            )
-            measured = {coin: (avg, n) for coin, avg, n in rows if avg is not None}
-
-    spreads: Dict[str, float] = {}
-    sources: Dict[str, str] = {}
-    for coin in coins:
-        avg_n = measured.get(coin)
-        env_value = os.getenv(f"{coin}_SIM_SPREAD_PERCENT", "").strip()
-        if avg_n and avg_n[1] >= MIN_SNAPSHOTS_FOR_SPREAD:
-            spreads[coin], sources[coin] = avg_n[0], f"실측 {avg_n[1]:,}건"
-        elif env_value:
-            spreads[coin], sources[coin] = float(env_value), "코인별 설정"
-        else:
-            spreads[coin], sources[coin] = settings.sim_default_spread_percent, "기본 설정"
-    return spreads, sources
+    live = None
+    if md is not None:
+        need = [c for c in coins
+                if not os.getenv(f"{c}_SIM_SPREAD_PERCENT", "").strip()
+                and snapshot_spreads(settings.db_path, [c]).get(c, (0, 0))[1] < MIN_SNAPSHOTS_FOR_SPREAD]
+        if need:
+            print(f"호가 간격 확인 중 (기록이 없는 {len(need)}개 코인, {LIVE_SAMPLES}번 재서 중간값)...")
+            live = {c: v[0] for c, v in median_spread_depth(md, need, usdt_krw).items()}
+    return resolve_spreads(coins, settings.db_path, settings.sim_default_spread_percent, live)
 
 
 # ----------------------------------------------------------------------
@@ -643,7 +637,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     upbit = {c: store.load_closes(UPBIT, c, start_ms - pad, end_ms) for c in coins}
     bybit = {c: store.load_closes(BYBIT, c, start_ms - pad, end_ms) for c in coins}
     usdt = store.load_closes(UPBIT_USDT, "USDT", start_ms - pad, end_ms)
-    spreads, sources = decide_spreads(settings, coins)
+    spreads, sources = decide_spreads(settings, coins, md, usdt[max(usdt)] if usdt else 1.0)
     apply_tick_floor(spreads, sources, {c: tick_floor_percent(list(upbit[c].values()), list(bybit[c].values()))
                                         for c in coins})
     clock = SimClock(start_ms / 1000)
