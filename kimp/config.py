@@ -271,6 +271,18 @@ class Settings:
     # 바이비트 최소 주문(개수·금액)은 거래소 마켓 정보에서 읽는다 (예: XRP 0.1개, 5 USDT)
     upbit_min_order_krw: float = 5_000.0
 
+    # ★ 펀딩비 안전장치 (concept.md 11번 1순위)
+    # 우리는 바이비트 숏이라 펀딩비율이 +면 받고 −면 낸다. 김프 회복을 며칠 기다리는 전략이라
+    # 내는 쪽에 오래 머물면 김프가 그대로여도 손실만 쌓인다.
+    #   예) 100 USDT 포지션, −0.0646%/8h → 하루 −0.194 USDT → 5일이면 목표(1%)를 전부 먹는다
+    #
+    # ① 진입 차단: 8시간 기준 펀딩비율이 이 값보다 나쁘면 진입하지 않는다 (None 이면 보지 않음)
+    #    −0.05 = "8시간에 0.05% 넘게 내야 하면 들어가지 않는다"
+    entry_min_funding_8h_percent: Optional[float] = -0.05
+    # ② 누적 한도: 이 포지션에서 펀딩비로 낸 금액이 포지션 금액의 이 % 를 넘으면 정리한다 (0 = 무제한)
+    #    1.0 = "목표 수익(1%)만큼 펀딩비로 썼으면 더 기다리지 않는다"
+    max_funding_cost_percent: float = 1.0
+
     # ★ 한 번만 돌리기 (첫 실거래 점검용)
     # true 면 포지션을 **딱 하나만** 잡고, 그 포지션이 청산되면 봇이 스스로 종료한다.
     # 처음 실제 주문을 내볼 때 "한 바퀴가 제대로 도는지"만 확인하려고 쓴다.
@@ -538,6 +550,10 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
         hedge_tolerance_percent=_env_float("HEDGE_TOLERANCE_PERCENT", d.hedge_tolerance_percent),
         upbit_min_order_krw=_env_float("UPBIT_MIN_ORDER_KRW", d.upbit_min_order_krw),
+        entry_min_funding_8h_percent=(_env_optional_float("ENTRY_MIN_FUNDING_8H_PERCENT")
+                                      if os.getenv("ENTRY_MIN_FUNDING_8H_PERCENT") is not None
+                                      else d.entry_min_funding_8h_percent),
+        max_funding_cost_percent=_env_float("MAX_FUNDING_COST_PERCENT", d.max_funding_cost_percent),
         one_shot=_env_bool("ONE_SHOT", d.one_shot),
         one_shot_max_hours=_env_float("ONE_SHOT_MAX_HOURS", d.one_shot_max_hours),
         transfer_fee_upbit_to_bybit_usdt=_env_float("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT",
@@ -709,6 +725,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("MAX_POSITION_USDT 는 0보다 커야 합니다")
     if s.daily_loss_limit_usdt is not None and s.daily_loss_limit_usdt <= 0:
         errors.append("DAILY_LOSS_LIMIT_USDT 는 0보다 커야 합니다")
+    if s.max_funding_cost_percent < 0:
+        errors.append("MAX_FUNDING_COST_PERCENT 는 0 이상이어야 합니다 (0 = 무제한)")
     if s.one_shot_max_hours < 0:
         errors.append("ONE_SHOT_MAX_HOURS 는 0 이상이어야 합니다 (0 = 무제한)")
     if s.transfer_min_usdt <= max(s.transfer_fee_upbit_to_bybit_usdt, s.transfer_fee_bybit_to_upbit_usdt):

@@ -96,9 +96,11 @@ class SimulationTest(unittest.TestCase):
 
     def test_funding_applied_on_schedule(self):
         """보유 중에 지난 펀딩비 정산이 손익에 들어간다 (숏이라 비율 - 면 낸다)"""
+        # 펀딩비 안전장치는 꺼 둔다 — 안 그러면 '내는 코인' 이라 진입이 막혀서 반영을 확인할 수 없다
         funding = [(START + 30 * MINUTE_MS, -0.001)]  # 30분 뒤 -0.1% 정산
         clock, market, fx, end = build([-1.0] * 120, funding=funding)
-        r = run_simulation(settings(), ["XRP"], market, fx, clock, START, end)
+        no_guard = settings(entry_min_funding_8h_percent=None, max_funding_cost_percent=0)
+        r = run_simulation(no_guard, ["XRP"], market, fx, clock, START, end)
         [t] = r.trades
         self.assertLess(t.funding_usdt, 0)
         self.assertAlmostEqual(t.funding_usdt, -0.001 * 500, delta=0.01)

@@ -97,6 +97,8 @@ class Engine:
         # 아래 시각들은 메모리에만 둔다 (clock 기준, 초)
         self._last_snapshot: Dict[str, float] = {}
         self._last_funding_check: Dict[str, float] = {}
+        self._funding_8h: Dict[str, float] = {}       # 코인별 8시간 기준 펀딩비율 (%) — 진입 판단용
+        self._funding_8h_at: Dict[str, float] = {}    # 그 값을 받은 시각 (너무 자주 조회하지 않게)
         self._last_log: Dict[str, float] = {}
         self._reentry_allowed_at: Dict[str, float] = {}
         self._last_status_log = 0.0
@@ -285,6 +287,15 @@ class Engine:
             reason = ExitReason.TAKE_PROFIT
         elif stop < 0 and pnl.net_percent <= stop:
             reason = ExitReason.STOP_LOSS
+        elif self.s.max_funding_cost_percent:
+            # 펀딩비로 낸 돈이 한도를 넘으면 더 기다리지 않는다.
+            # 김프 회복을 기다리는 전략이라, 내는 쪽에 오래 머물면 김프가 그대로여도 손실이 쌓인다.
+            cost = self._funding_cost_percent(pos)
+            if cost >= self.s.max_funding_cost_percent:
+                logger.warning("[펀딩비 한도] #%d %s 펀딩비로 %.3f%% 썼습니다 (한도 %.2f%%) → 정리합니다 "
+                               "(지금 순손익 %+.3f%%)", pos.id, pos.coin, cost,
+                               self.s.max_funding_cost_percent, pnl.net_percent)
+                reason = ExitReason.FUNDING_COST
         if reason is None:
             logger.debug("%s 보유 중: 청산 김프 %+.3f%%, 순손익 %+.3f%% (%+.2f USDT)",
                          pos.coin, valuation.exit_premium, pnl.net_percent, pnl.net_usdt)
@@ -443,6 +454,34 @@ class Engine:
     # ------------------------------------------------------------------
     # 자본 비율 / 리밸런싱
     # ------------------------------------------------------------------
+    def _funding_8h_percent(self, coin: str) -> Optional[float]:
+        """
+        코인의 펀딩비율을 8시간 기준 %로 (진입 판단용, FUNDING_REFRESH_SEC 마다 갱신)
+
+        코인마다 정산 주기가 1·4·8시간으로 달라서 그대로 비교하면 안 된다.
+          예) 1시간마다 0.0025% → 8시간 기준 0.02%
+        우리는 숏이라 + 면 받고 − 면 낸다. 못 받으면 None (데이터가 없다고 기회를 버리지는 않는다)
+        """
+        now = self._clock()
+        if now - self._funding_8h_at.get(coin, 0.0) < self.s.funding_refresh_sec:
+            return self._funding_8h.get(coin)
+        info = self.market.fetch_funding(coin)
+        self._funding_8h_at[coin] = now
+        if info is None:
+            self._funding_8h.pop(coin, None)
+            return None
+        hours = info.interval_hours or 8.0
+        value = info.rate * 100 * (8.0 / hours if hours else 1.0)
+        self._funding_8h[coin] = value
+        return value
+
+    def _funding_cost_percent(self, pos: Position) -> float:
+        """이 포지션에서 펀딩비로 **낸** 금액이 포지션 금액의 몇 % 인지 (받았으면 0)"""
+        notional = pos.bybit_qty * pos.entry_bybit_price_usdt
+        if notional <= 0 or pos.funding_usdt >= 0:
+            return 0.0
+        return -pos.funding_usdt / notional * 100
+
     def _check_rebalance(self, session: Session, positions: List[Position], quotes: Dict[str, Quote],
                          when: str, need: Optional[InsufficientBalance] = None) -> Optional[float]:
         """
@@ -548,6 +587,19 @@ class Engine:
             top = quote.entry_premium_top
             if top is None or top > threshold:
                 continue  # 맨 앞 호가로도 조건이 안 되면 더 볼 필요 없음
+            # 펀딩비 안전장치: 숏이 돈을 내는 쪽이 심하면 들어가지 않는다 (김프 조건을 통과한 코인만 확인)
+            min_funding = self.s.entry_min_funding_8h_percent
+            if min_funding is not None:
+                funding = self._funding_8h_percent(coin)
+                if funding is None:
+                    self._log_throttled(f"funding-unknown-{coin}", logging.WARNING,
+                                        f"{coin} 펀딩비율을 못 받아서 펀딩비 확인 없이 진입을 판단합니다")
+                elif funding < min_funding:
+                    self._log_throttled(
+                        f"funding-block-{coin}", logging.INFO,
+                        f"{coin} 진입 보류: 펀딩비 {funding:+.4f}%/8h < 기준 {min_funding:+.4f}%/8h "
+                        f"(숏이 내는 쪽이라 오래 들고 있으면 김프가 올라도 손해)")
+                    continue
             size = self._position_size_usdt(session, coin, list(open_positions.values()), quotes)
             bybit_qty = self._plan_bybit_qty(coin, quote, size)
             if bybit_qty is None:

@@ -532,3 +532,130 @@ class CloseRequestTest(unittest.TestCase):
         engine, sf, _ = make_engine(make_settings(), market)
         engine.startup()
         self.assertIn("들고 있는 포지션이 없습니다", engine.request_close())
+
+
+class FundingGuardTest(unittest.TestCase):
+    """
+    펀딩비 안전장치 (concept.md 11번 1순위)
+
+    우리는 숏이라 펀딩비율이 − 면 낸다. 김프 회복을 며칠 기다리는 전략이라, 내는 쪽에 오래 머물면
+    김프가 그대로여도 손실만 쌓인다.
+      예) 100 USDT 포지션, −0.0646%/8h → 하루 −0.194 → 5일이면 목표(1%)를 전부 먹는다
+    ① 진입 차단: 펀딩비율이 기준보다 나쁘면 들어가지 않는다
+    ② 누적 한도: 펀딩비로 낸 돈이 포지션 금액의 N% 를 넘으면 정리한다
+    """
+
+    def _engine(self, funding_rate=None, interval_hours=8.0, **overrides):
+        market = FakeMarket()
+        if funding_rate is not None:
+            market.funding = FundingInfo(rate=funding_rate, next_funding_ms=10 ** 14,
+                                         mark_price=1.0, interval_hours=interval_hours)
+        else:
+            market.funding = None
+        engine, sf, broker = make_engine(make_settings(**overrides), market)
+        return engine, sf, broker, market
+
+    # ---------------- ① 진입 차단 ----------------
+    def test_blocks_entry_when_funding_too_negative(self):
+        """−0.08%/8h (기준 −0.05%) → 진입하지 않는다"""
+        engine, sf, broker, market = self._engine(funding_rate=-0.0008,
+                                                  entry_min_funding_8h_percent=-0.05)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 0)
+
+    def test_allows_entry_when_funding_ok(self):
+        """+0.01%/8h → 받는 쪽이라 진입한다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001,
+                                                  entry_min_funding_8h_percent=-0.05)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 1)
+
+    def test_interval_is_converted_to_8h(self):
+        """
+        정산 주기가 1시간이면 8배로 환산해서 비교한다
+
+        1시간마다 −0.01% = 8시간 기준 −0.08% → 기준 −0.05% 보다 나쁘므로 막아야 한다.
+        환산을 안 하면 −0.01% 로 보여서 통과해 버린다.
+        """
+        engine, sf, broker, market = self._engine(funding_rate=-0.0001, interval_hours=1.0,
+                                                  entry_min_funding_8h_percent=-0.05)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 0)
+        self.assertAlmostEqual(engine._funding_8h_percent("XRP"), -0.08, places=6)
+
+    def test_unknown_funding_does_not_block(self):
+        """펀딩비를 못 받으면 막지 않는다 (데이터가 없다고 기회를 버리지는 않는다)"""
+        engine, sf, broker, market = self._engine(funding_rate=None,
+                                                  entry_min_funding_8h_percent=-0.05)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 1)
+
+    def test_guard_off_by_none(self):
+        """기준을 비우면(None) 펀딩비를 보지 않는다"""
+        engine, sf, broker, market = self._engine(funding_rate=-0.01,
+                                                  entry_min_funding_8h_percent=None)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 1)
+
+    # ---------------- ② 누적 한도 ----------------
+    def test_closes_when_funding_cost_exceeds_limit(self):
+        """펀딩비로 포지션 금액의 1% 를 쓰면 정리한다 (목표에 못 닿았어도)"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, max_funding_cost_percent=1.0,
+                                                  entry_min_funding_8h_percent=None)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            pos = broker.open_positions(s)[0]
+            notional = pos.bybit_qty * pos.entry_bybit_price_usdt
+            pos.funding_usdt = -notional * 0.011        # 1.1% 를 펀딩비로 냈다
+            s.commit()
+            self.assertAlmostEqual(engine._funding_cost_percent(pos), 1.1, places=6)
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 0)
+            from sqlalchemy import select
+            from kimp.db import Position
+            self.assertEqual(s.scalars(select(Position)).all()[0].exit_reason, ExitReason.FUNDING_COST)
+
+    def test_keeps_position_below_limit(self):
+        """한도 아래면 그대로 들고 있는다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, max_funding_cost_percent=1.0,
+                                                  entry_min_funding_8h_percent=None)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            pos = broker.open_positions(s)[0]
+            pos.funding_usdt = -pos.bybit_qty * pos.entry_bybit_price_usdt * 0.005   # 0.5%
+            s.commit()
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 1)
+
+    def test_received_funding_is_not_a_cost(self):
+        """펀딩비를 받았으면(+) 비용이 0 이다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, entry_min_funding_8h_percent=None)
+        engine.startup()
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            pos = broker.open_positions(s)[0]
+            pos.funding_usdt = 5.0
+            s.commit()
+            self.assertEqual(engine._funding_cost_percent(pos), 0.0)
