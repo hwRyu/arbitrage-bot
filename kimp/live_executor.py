@@ -113,6 +113,16 @@ class LiveExecutor:
 
     @staticmethod
     def _ignore_not_modified(what: str, call) -> None:
+        """
+        바이비트 설정 바꾸기를 시도하고, '이미 그 값이다' 오류는 무시한다
+
+        set_position_mode / set_margin_mode / set_leverage 는 **이미 원하는 값이면 오류**를 준다.
+        봇을 다시 켤 때마다 이 오류가 나므로 그냥 넘겨야 한다.
+            110043  레버리지가 안 바뀜 (이미 그 값)
+            110026  마진 모드가 안 바뀜
+            110025  포지션 모드가 안 바뀜
+        그 밖의 실패는 경고만 남기고 계속한다 — 설정이 안 맞으면 주문 단계에서 다시 걸러진다.
+        """
         try:
             call()
         except Exception as exc:  # 바뀐 게 없다는 오류는 정상
@@ -132,6 +142,12 @@ class LiveExecutor:
         self._shorts = {}
 
     def _balances(self):
+        """
+        업비트·바이비트 잔고 (스캔당 한 번만 받고 기억한다)
+
+        한 스캔에서 free() 를 여러 번 부르는데 매번 조회하면 요청 제한에 걸린다.
+        주문·출금 뒤에는 잔고가 바뀌므로 refresh() 로 비워서 다시 받게 한다.
+        """
         if self._up_bal is None:
             self._up_bal = self.up.fetch_balance()
         if self._by_bal is None:
@@ -140,9 +156,25 @@ class LiveExecutor:
 
     @staticmethod
     def _amount(bal: dict, cur: str, kind: str) -> float:
+        """
+        ccxt 잔고에서 숫자 하나 꺼내기 (없는 통화·없는 칸은 0)
+
+        ccxt 잔고는 {'USDT': {'free': 1.2, 'used': 0, 'total': 1.2}, ...} 모양이다.
+        kind: 'free' 주문에 쓸 수 있는 양 / 'total' 주문에 묶인 것까지 포함
+        """
         return float((bal.get(cur) or {}).get(kind) or 0.0)
 
     def free(self, session: Session, asset: str) -> float:
+        """
+        쓸 수 있는 잔고 (asset 이름 규칙은 kimp/executor.py 와 같다)
+
+            upbit:USDT   업비트 USDT / upbit:KRW 업비트 원화 / bybit:USDT 바이비트 USDT
+            upbit:<코인>  업비트 코인 개수
+
+        session 은 쓰지 않는다 — 페이퍼는 DB 장부를 보지만 실거래는 거래소가 진실이다.
+        모르는 이름은 KeyError 로 터뜨린다. 조용히 0 을 돌려주면 '잔고가 없다' 로 오해해서
+        주문을 안 내고 조용히 멈춰 버린다.
+        """
         up, by = self._balances()
         if asset == UPBIT_USDT:
             return self._amount(up, "USDT", "free")
@@ -155,6 +187,12 @@ class LiveExecutor:
         raise KeyError(asset)
 
     def coin_total(self, session: Session, coin: str) -> float:
+        """
+        업비트에 있는 코인 전체 개수 (주문에 묶인 것까지 포함)
+
+        청산할 때 '가진 만큼 다 팔기' 에 쓴다. free 가 아니라 total 을 쓰는 이유:
+        주문이 걸려 있어도 그 코인은 내 것이라 결국 팔아야 하기 때문이다.
+        """
         up, _ = self._balances()
         return self._amount(up, coin, "total")
 
@@ -169,6 +207,12 @@ class LiveExecutor:
         return self._shorts[coin]
 
     def short_liquidated(self, session: Session, coin: str) -> bool:
+        """
+        바이비트 숏이 사라졌나 (= 강제청산됐나)
+
+        기억해 둔 값을 **일부러 비우고 다시 조회**한다. 강제청산은 우리가 주문하지 않아도
+        일어나므로, 캐시된 값을 보면 '아직 있다' 로 잘못 판단한다.
+        """
         self._shorts.pop(coin, None)
         return self.short_qty(session, coin) <= 0
 
@@ -246,6 +290,18 @@ class LiveExecutor:
 
     @staticmethod
     def _fill(order: dict, fee_ccy: str, what: str) -> LegFill:
+        """
+        ccxt 주문 응답 → 체결값 (LegFill)
+
+        거래소마다 비는 칸이 달라서 서로 메꿔 준다.
+            average 가 없으면  cost / filled 로 평균가를 낸다
+            cost 가 없으면     average x filled 로 금액을 낸다
+        수수료는 **우리가 세는 통화만** 더한다 (fee_ccy). 업비트는 원화, 바이비트는 USDT 로 떼는데
+        한 주문에 여러 통화 수수료가 섞여 오는 경우가 있어서 그대로 더하면 금액이 틀린다.
+
+        Raises:
+            OrderFailed: 체결이 0 개 (주문이 거절되거나 전량 취소된 것)
+        """
         qty = float(order.get("filled") or 0.0)
         if qty <= 0:
             raise OrderFailed(f"{what}: 체결 0 (상태 {order.get('status')})")
@@ -297,6 +353,13 @@ class LiveExecutor:
         return LegFill(qty=0.0, avg_price=0.0, cost=0.0, fee=0.0, order_id="")
 
     def open_short(self, session: Session, quote: Quote, coin: str, qty: float, client_id: str = "") -> LegFill:
+        """
+        바이비트 USDT 무기한 시장가 숏 열기 (개수 지정)
+
+        positionIdx 0 = 단방향(one-way) 모드. setup() 에서 맞춰 둔다 — 양방향 모드면
+        롱·숏이 따로 잡혀서 reduceOnly 로 닫는 흐름이 깨진다.
+        amount_to_precision 으로 거래소 주문 단위에 맞추고, 그래서 0 이 되면 주문을 안 낸다.
+        """
         sym = bybit_symbol(coin)
         cid = client_id or new_client_id()
         amount = float(self.by.amount_to_precision(sym, qty))
@@ -307,11 +370,19 @@ class LiveExecutor:
 
     def close_short(self, session: Session, quote: Quote, coin: str, qty: float,
                     entry_price: float, margin_usdt: float, client_id: str = "") -> LegFill:
+        """
+        바이비트 숏 닫기 (reduceOnly 시장가 매수)
+
+        reduceOnly 를 붙이는 이유: 숏이 이미 강제청산됐거나 수량이 어긋나 있을 때 그냥 매수하면
+        **반대 방향 롱이 새로 생긴다.** reduceOnly 면 줄이기만 하고 새로 생기지 않는다.
+        entry_price·margin_usdt 는 페이퍼 쪽 계산에만 쓰는 인자라 여기서는 안 쓴다
+        (실거래는 거래소가 손익을 계산한다). 모드끼리 동작 목록을 맞추려고 받아만 둔다.
+        """
         sym = bybit_symbol(coin)
         cid = client_id or new_client_id()
         try:
             amount = float(self.by.amount_to_precision(sym, qty))
-        except Exception:  # 주문 단위보다 작음
+        except Exception:  # 주문 단위보다 작아서 자리수 변환이 터진다 → 할 게 없음
             return self._nothing()
         if amount <= 0:
             return self._nothing()
@@ -320,6 +391,12 @@ class LiveExecutor:
             "USDT", cid)
 
     def _upbit_sell(self, sym: str, qty: float, what: str, client_id: str) -> LegFill:
+        """
+        업비트 시장가 매도 (개수 지정) — 코인 팔기와 USDT 팔기가 같은 모양이라 모아 둠
+
+        amount_to_precision 이 터지거나 0 이 되면 주문 단위보다 작다는 뜻 → 주문 안 냄.
+        identifier 가 추적번호다 (응답이 끊겨도 이걸로 주문을 되찾는다).
+        """
         cid = client_id or new_client_id()
         try:
             amount = float(self.up.amount_to_precision(sym, qty))
@@ -331,6 +408,13 @@ class LiveExecutor:
             sym, "market", "sell", amount, None, {"identifier": cid}), "KRW", cid)
 
     def _upbit_buy_cost(self, sym: str, krw: float, what: str, client_id: str) -> LegFill:
+        """
+        업비트 시장가 매수 (**원화 금액** 지정) — 코인 사기와 USDT 사기가 같은 모양
+
+        업비트 시장가 매수는 '몇 개' 가 아니라 '몇 원어치' 로만 주문된다. 그래서 금액 헷징과
+        궁합이 맞는다 (바이비트 숏 금액만큼 사면 된다).
+        금액은 1원 단위로 **내림** 한다 — 올리면 잔고가 모자라 주문이 거절된다.
+        """
         cid = client_id or new_client_id()
         krw = math.floor(krw)  # 업비트 시장가 매수는 원화 금액 (1원 단위로 내림)
         if krw <= 0:
@@ -338,17 +422,23 @@ class LiveExecutor:
         return self._order(self.up, sym, what, lambda: self.up.create_market_buy_order_with_cost(
             sym, krw, {"identifier": cid}), "KRW", cid)
 
+    # 아래 네 개가 업비트에서 하는 동작 전부다 (진입 2단계 + 청산 2단계).
+    # quote(그 순간 호가)는 페이퍼가 체결가를 계산할 때만 쓰고, 실거래는 거래소가 정하므로 안 쓴다.
     def sell_usdt(self, session: Session, quote: Quote, amount_usdt: float, client_id: str = "") -> LegFill:
+        """진입 1단계: USDT 를 팔아 원화 만들기"""
         return self._upbit_sell(USDT_KRW_SYMBOL, amount_usdt, "업비트 USDT 매도", client_id)
 
     def buy_coin_with_krw(self, session: Session, quote: Quote, coin: str, krw: float,
                           client_id: str = "") -> LegFill:
+        """진입 2단계: 그 원화로 코인 사기 (바이비트 숏 금액과 같은 금액)"""
         return self._upbit_buy_cost(upbit_symbol(coin), krw, f"업비트 {coin} 매수", client_id)
 
     def sell_coin(self, session: Session, quote: Quote, coin: str, qty: float, client_id: str = "") -> LegFill:
+        """청산 1단계: 코인을 팔아 원화 만들기"""
         return self._upbit_sell(upbit_symbol(coin), qty, f"업비트 {coin} 매도", client_id)
 
     def buy_usdt_with_krw(self, session: Session, quote: Quote, krw: float, client_id: str = "") -> LegFill:
+        """청산 2단계: 그 원화로 USDT 되사기 (여기까지 오면 자본이 다시 USDT 가 된다)"""
         return self._upbit_buy_cost(USDT_KRW_SYMBOL, krw, "업비트 USDT 매수", client_id)
 
     def lookup(self, session: Session, side: str, coin: str, client_id: str) -> Optional[LegFill]:
@@ -464,6 +554,16 @@ class DryRunExecutor(PaperExecutor):
         return self.live.min_order_krw(coin)
 
     def ensure_initial(self, session: Session, total_usdt: float, upbit_share: float) -> bool:
+        """
+        처음 한 번만: 실제 거래소 잔고를 페이퍼 장부로 복사한다
+
+        이미 장부가 있으면(두 번째 실행부터) 아무것도 안 한다 — 복사하면 그동안 쌓인
+        드라이런 손익이 지워진다. total_usdt·upbit_share 는 페이퍼용 인자라 안 쓴다
+        (실제 잔고를 그대로 쓰므로 비율을 정할 필요가 없다).
+
+        Returns:
+            복사했으면 True (브로커가 '시작 자본을 넣었다' 로 로그를 남긴다)
+        """
         if session.get(PaperBalance, UPBIT_USDT) is not None or session.get(PaperBalance, BYBIT_USDT) is not None:
             return False
         real = self.live.read_balances()
@@ -475,9 +575,12 @@ class DryRunExecutor(PaperExecutor):
         return True
 
     def _say(self, text: str, f: LegFill) -> LegFill:
+        """'실제였다면 이런 주문' 로그를 남기고 체결값은 그대로 돌려준다 (아래 래퍼들의 공통부)"""
         logger.info("[드라이런] 실제였다면 %s → 계산 체결 %g개 평균 %.8g (주문은 안 냄)", text, f.qty, f.avg_price)
         return f
 
+    # 아래는 전부 PaperExecutor 의 계산을 그대로 쓰고 로그만 덧붙이는 래퍼다.
+    # 주문은 한 줄도 내지 않는다 — 실거래 전 '같은 판단이 나오나' 를 눈으로 보는 단계.
     def open_short(self, session, quote, coin, qty, client_id=""):
         return self._say(f"바이비트 {coin} {qty:g}개 시장가 숏",
                          super().open_short(session, quote, coin, qty, client_id))

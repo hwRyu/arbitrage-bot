@@ -36,10 +36,26 @@ def kst_midnight_utc(now_sec: float) -> datetime:
 
 
 class Safety:
-    """신규 진입 허용 여부. 엔진이 진입 전에 entries_allowed() 를 묻는다"""
+    """
+    신규 진입 허용 여부. 엔진이 진입 전에 entries_allowed() 를 묻는다
+
+    **막는 것은 신규 진입뿐이다.** 이미 가진 포지션의 관리·청산·되돌리기는 계속 돌아간다 —
+    안전장치가 청산까지 막으면 한쪽만 열린 상태로 갇혀서 더 위험해진다.
+    엔진의 한 스캔 순서도 그래서 이 모양이다: 대조 → 관리·청산 → 리밸런싱 → (여기서 물어봄) → 진입.
+
+    상태는 메모리에만 둔다 (DB 에 안 적는다). 봇을 다시 켜면 수동 정지·연속 실패는 풀리고,
+    DB 를 보는 두 가지(ERROR 포지션 / 하루 손실)는 다시 켜도 그대로 막힌다 — 의도한 것이다.
+    """
 
     def __init__(self, max_consecutive_failures: int = 3, daily_loss_limit_usdt: Optional[float] = None,
                  stop_file: Optional[str] = None, clock: Callable[[], float] = time.time):
+        """
+        Args:
+            max_consecutive_failures: 주문이 연달아 이만큼 실패하면 막는다
+            daily_loss_limit_usdt: 하루 확정 손실 한도 (양수로 적는다). None 이면 안 막음
+            stop_file: 이 파일이 생기면 막는다 (기본 data/STOP). 터미널이 없어도 멈출 수 있는 수단
+            clock: 지금 시각 함수 (테스트에서 날짜를 바꿔 끼우려고 받는다)
+        """
         self.max_failures = max_consecutive_failures
         self.daily_loss_limit = daily_loss_limit_usdt
         self.stop_file = stop_file
@@ -50,6 +66,7 @@ class Safety:
 
     @classmethod
     def from_settings(cls, settings, clock: Callable[[], float] = time.time) -> "Safety":
+        """설정(.env)에서 만들기 — 엔진이 쓰는 경로"""
         return cls(settings.max_consecutive_failures, settings.daily_loss_limit_usdt, settings.stop_file, clock)
 
     # 다른 곳에서 알려주는 것들
@@ -60,15 +77,29 @@ class Safety:
         self._blocks[key] = reason
 
     def clear(self, key: str) -> None:
+        """
+        그 이유로 막힌 것을 푼다 (없던 key 면 아무 일도 없다)
+
+        대조 불일치처럼 '다음 스캔에 맞으면 저절로 풀려야 하는' 것들이 이걸 쓴다.
+        """
         if self._blocks.pop(key, None) is not None:
             logger.warning("[신규 진입 재개] %s 해결", key)
 
     def record_failure(self, what: str) -> None:
+        """
+        주문 실패 하나 세기 (연속 카운트)
+
+        성공하면 record_success() 로 0 이 된다. 즉 '연속' 실패만 센다 — 하루에 띄엄띄엄
+        한 번씩 실패하는 것으로는 안 막힌다.
+        거래소 규정 거절(출금지연제 등)은 여기로 오지 않는다. 우리가 고칠 수 없는 것으로
+        봇을 멈추면 안 되기 때문이다 (kimp/broker.py 의 is_policy_reject).
+        """
         self.failures += 1
         if self.failures == self.max_failures:
             logger.critical("[신규 진입 중단] 주문 연속 %d번 실패 (마지막: %s) → 확인 후 /resume", self.failures, what)
 
     def record_success(self) -> None:
+        """주문 성공 → 연속 실패 횟수를 0 으로"""
         self.failures = 0
 
     def resume(self) -> None:
@@ -77,7 +108,14 @@ class Safety:
         self.failures = 0
 
     def daily_loss_usdt(self, session: Session) -> float:
-        """오늘(한국 시간) 확정 손익 합 (청산 + 되돌린 진입)"""
+        """
+        오늘(한국 시간 0시부터) 확정 손익 합 — 손실이면 음수
+
+        CLOSED(정상 청산) 와 ABORTED(진입 실패 되돌림) 만 센다. 아직 들고 있는 포지션의
+        평가 손익은 **세지 않는다** — 김프는 되돌아오는 성질이라, 평가손으로 막으면
+        회복될 포지션 때문에 매매를 멈추게 된다.
+        한국 시간 기준이라 자정이 지나면 저절로 0 부터 다시 센다.
+        """
         since = kst_midnight_utc(self._clock())
         total = session.scalar(
             select(func.coalesce(func.sum(Position.net_pnl_usdt), 0.0)).where(
@@ -87,7 +125,15 @@ class Safety:
         return float(total or 0.0)
 
     def entries_allowed(self, session: Session) -> Tuple[bool, str]:
-        """(허용?, 막힌 이유)"""
+        """
+        지금 신규 진입을 해도 되나
+
+        위에서부터 순서대로 보고 **처음 걸린 이유 하나만** 돌려준다 (사람이 고칠 것 하나를
+        보여주려고). 사람이 직접 멈춘 것(파일·텔레그램)을 먼저 보는 이유: 가장 강한 의사 표시다.
+
+        Returns:
+            (허용 여부, 막힌 이유). 허용이면 이유는 빈 글자
+        """
         if self.stop_file and os.path.exists(self.stop_file):
             return False, f"비상정지 파일 {self.stop_file} 있음 (지우면 재개)"
         if self.manual_stop:
