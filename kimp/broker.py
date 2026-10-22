@@ -83,7 +83,24 @@ from kimp.safety import Safety, kst_midnight_utc
 # 송금 금액 소수점 자리수 상한. 업비트는 6자리를 넘으면 거절한다 (2026-10-22 실거래에서 겪음)
 #   846.6747287521739 → "출금 소수점 자리수를 초과하였습니다. 6 이하 소수점 자리수만 적용됩니다."
 # 내림으로 자른다 (올리면 잔고보다 많이 보내려 할 수 있다)
+LF = chr(10)
+
 TRANSFER_DECIMALS = 6
+
+# 거래소가 '규정상 지금은 안 된다' 고 거절할 때 나오는 말들.
+# 우리 잘못이 아니므로 연속 실패로 세지 않고(세면 신규 진입이 막힌다) 잠시 뒤 다시 시도한다.
+#   예) 업비트 출금지연제: 원화 입금 후 24시간 동안 그 금액 상당의 코인을 못 보낸다
+#       "출금 가능한 수량을 초과하였습니다. 출금지연제 적용(공지 참고)에 따라 24시간 이내 입금하신
+#        원화 입금액 상당의 코인은 출금 가능 수량에서 제외됩니다."
+POLICY_REJECT_WORDS = ("출금지연", "출금 가능한 수량", "한도를 초과", "withdraw_delay", "exceeded",
+                       "출금 가능 수량", "일일 출금", "출금이 제한")
+# 규정 거절 뒤 다시 시도하기까지 기다리는 시간 (초). 매 스캔마다 찔러서 로그를 더럽히지 않으려고
+POLICY_RETRY_SEC = 600.0
+
+
+def is_policy_reject(message: str) -> bool:
+    """거래소 규정 때문에 거절된 것인가 (우리 코드·잔고 문제가 아닌 것)"""
+    return any(word in message for word in POLICY_REJECT_WORDS)
 
 
 logger = logging.getLogger(__name__)
@@ -809,6 +826,10 @@ class HedgeBroker:
         if self.pending_transfers(session):
             logger.info("송금 중인 건이 있어서 이번엔 안 보냄")
             return 0.0
+        waiting = getattr(self, "_policy_block_until", 0.0) - self._now().timestamp()
+        if waiting > 0:
+            logger.debug("거래소 규정으로 송금 보류 중 (%.0f분 남음)", waiting / 60)
+            return 0.0
         to_bybit = amount_usdt > 0
         send = min(abs(amount_usdt), self.balance(session, UPBIT_USDT if to_bybit else BYBIT_USDT))
         if self.transfer_max_usdt_per_day is not None:
@@ -828,8 +849,16 @@ class HedgeBroker:
         except OrderFailed as exc:
             t.status, t.note = TransferStatus.FAILED, str(exc)[:200]
             session.commit()
-            self.safety.record_failure(f"송금: {exc}")
-            logger.critical("[송금 실패] %s USDT %s: %s", t.direction, f"{send:,.2f}", exc)
+            if is_policy_reject(str(exc)):
+                # 거래소 규정(출금지연제 등) → 연속 실패로 세지 않는다. 그래야 신규 진입이 막히지 않는다
+                self._policy_block_until = self._now().timestamp() + POLICY_RETRY_SEC
+                logger.error("[송금 보류] %s USDT %s — 거래소가 지금은 안 된다고 합니다: %s%s",
+                             t.direction, f"{send:,.2f}", exc,
+                             f"{LF}            → {POLICY_RETRY_SEC / 60:.0f}분 뒤 다시 시도합니다. "
+                             f"업비트 출금지연제라면 원화 입금 후 24시간이 지나야 풀립니다")
+            else:
+                self.safety.record_failure(f"송금: {exc}")
+                logger.critical("[송금 실패] %s USDT %s: %s", t.direction, f"{send:,.2f}", exc)
             return 0.0
         session.commit()
         logger.warning("[송금 요청 · %s] %s USDT %s 개 (%s, 수수료 %g)", reason or "-", t.direction, f"{send:,.2f}",

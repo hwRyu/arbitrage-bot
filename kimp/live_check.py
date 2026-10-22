@@ -26,6 +26,30 @@ from kimp.market_data import bybit_symbol
 OK, WARN, FAIL = "OK", "확인 필요", "실패"
 
 
+def _recent_krw_deposit_hold(upbit):
+    """
+    24시간 안에 들어온 원화 입금이 있으면 (금액, 남은 시간) 을 돌려준다
+
+    업비트 출금지연제: 원화를 입금하면 그 금액 상당의 코인을 24시간 동안 다른 곳으로 못 보낸다
+    (사고팔기는 된다). 그 시간에는 자동 송금이 거절되므로 미리 알려준다.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        deposits = upbit.private_get_deposits({"currency": "KRW", "limit": 5})
+    except Exception:
+        return None
+    now = datetime.now(timezone.utc)
+    for d in deposits:
+        when = d.get("done_at") or d.get("created_at")
+        if not when:
+            continue
+        left = (datetime.fromisoformat(when.replace("Z", "+00:00")) + timedelta(hours=24)) - now
+        if left.total_seconds() > 0:
+            return float(d.get("amount") or 0), left.total_seconds() / 3600
+    return None
+
+
 def _short(exc: Exception) -> str:
     return str(exc).replace("\n", " ")[:160]
 
@@ -120,6 +144,26 @@ def run_checks(settings, upbit=None, bybit=None) -> List[Tuple[str, str, str]]:
             "등록됨" if found else f"없음 (USDT 허용 주소 {len(usdt)}개) → 업비트 Open API 관리 > 출금 허용 주소에 등록")
     except Exception as exc:
         add(WARN, "업비트 출금 허용 주소", _short(exc))
+
+    # 지금 실제로 출금이 되는 상태인가 (출금지연제·한도)
+    # 2026-10-22: 원화 200만원을 입금한 날 846 USDT 송금이 거절됐다.
+    #   "출금지연제 적용에 따라 24시간 이내 입금하신 원화 입금액 상당의 코인은 출금 가능 수량에서 제외"
+    # 모르고 실거래를 켜면 송금만 반복 실패한다 → 켜기 전에 알려준다.
+    try:
+        limit = (upbit.private_get_withdraws_chance(
+            {"currency": "USDT", "net_type": up_net}).get("withdraw_limit") or {})
+        hold = _recent_krw_deposit_hold(upbit)
+        detail = (f"출금 가능 수량 {float(limit.get('remaining_daily') or 0):,.4f} USDT · "
+                  f"1회 한도 {float(limit.get('onetime') or 0):,.0f} · 출금 가능 {limit.get('can_withdraw')}")
+        if hold:
+            amount, hours_left = hold
+            detail += (f" | 오늘 원화 {amount:,.0f}원 입금 → 그 금액 상당은 약 {hours_left:.1f}시간 뒤 "
+                       f"출금 가능 (업비트 출금지연제)")
+        status = OK if (limit.get("can_withdraw") and not hold) else (
+            FAIL if settings.auto_transfer_enabled else WARN)
+        add(status, "업비트 출금 가능 상태", detail)
+    except Exception as exc:
+        add(WARN, "업비트 출금 가능 상태", _short(exc))
 
     # 3) 바이비트
     try:

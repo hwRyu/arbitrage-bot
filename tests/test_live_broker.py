@@ -47,7 +47,8 @@ class FakeExchange:
         self.orders = {}
         self.by_client = {}  # 추적번호 → 주문 번호
         self.calls = []
-        self.fail = set()  # 실패시킬 동작 이름 (한 번, 주문 안 들어감)
+        self.fail = set()
+        self.fail_once = {}  # {동작: 에러 문구} — 그 문구로 한 번 거절  # 실패시킬 동작 이름 (한 번, 주문 안 들어감)
         self.lost = set()  # 주문은 들어가는데 응답만 끊기는 동작 (한 번)
         self.partial = {}  # 동작 이름 → 체결 비율 (한 번)
         self.slow = set()  # 시간 안에 안 끝나는 동작 (한 번): 'open' 상태로 일부만 체결, 취소하면 끝
@@ -62,6 +63,8 @@ class FakeExchange:
 
     def _maybe_fail(self, what):
         self.calls.append(what)
+        if what in getattr(self, "fail_once", {}):   # 거래소가 준 '그 문구' 로 거절시키기 (규정 거절 구분 테스트)
+            raise RuntimeError(self.fail_once.pop(what))
         if what in self.fail:
             self.fail.discard(what)
             raise RuntimeError(f"가짜 거래소 거절: {what}")
@@ -806,3 +809,52 @@ class TransferDecimalsTest(unittest.TestCase):
         with sf() as session:
             broker.ensure_initial_balances(session, 0.0, 0.5)
             self.assertEqual(broker.transfer(session, 9.9999999, 0.0, reason="테스트"), 0.0)  # 최소 10
+
+
+class PolicyRejectTest(unittest.TestCase):
+    """
+    거래소 규정 거절은 '우리 실패' 로 세지 않는다 (2026-10-22 실거래에서 겪음)
+
+    업비트 출금지연제: 원화 입금 후 24시간 동안 그 금액 상당의 코인을 못 보낸다.
+    이걸 연속 실패로 세면 3번 만에 신규 진입이 막혀서, 풀린 뒤에도 사람이 /resume 을 눌러야 한다.
+    → 규정 거절은 경고만 하고 10분 뒤 다시 시도한다.
+    """
+
+    def test_classify(self):
+        from kimp.broker import is_policy_reject
+        self.assertTrue(is_policy_reject("출금 가능한 수량을 초과하였습니다. 출금지연제 적용(공지 참고)에 따라"))
+        self.assertTrue(is_policy_reject("일일 출금 한도를 초과하였습니다"))
+        self.assertFalse(is_policy_reject("출금 소수점 자리수를 초과하였습니다"))   # 우리 버그였다
+        self.assertFalse(is_policy_reject("withdraw() takes from 4 to 5 positional arguments"))
+        self.assertFalse(is_policy_reject("Insufficient balance"))
+
+    def test_policy_reject_does_not_block_entries(self):
+        """규정 거절 → 연속 실패 0, 송금 기록은 FAILED, 잠시 뒤 재시도"""
+        from kimp.broker import POLICY_RETRY_SEC
+        prices, up, by, broker, sf = make_live()
+        up.bal["USDT"] = 1_000.0
+        up.fail_once["withdraw"] = "출금 가능한 수량을 초과하였습니다. 출금지연제 적용(공지 참고)에 따라"
+        with sf() as session:
+            broker.ensure_initial_balances(session, 0.0, 0.5)
+            sent = broker.transfer(session, 500.0, 0.0, reason="테스트")
+            self.assertEqual(sent, 0.0)
+            self.assertEqual(broker.safety.failures, 0)          # 연속 실패로 세지 않는다
+            self.assertTrue(broker.safety.entries_allowed(session)[0])   # 진입도 막히지 않는다
+            from sqlalchemy import select as _select   # transfers() 는 실패 건을 빼고 주므로 직접 본다
+            rows = session.scalars(_select(Transfer).order_by(Transfer.id)).all()
+            self.assertEqual(rows[-1].status, TransferStatus.FAILED)
+            self.assertIn("출금지연", rows[-1].note)
+            # 바로 다시 찔러도 보류 중이라 요청하지 않는다
+            self.assertEqual(broker.transfer(session, 500.0, 0.0, reason="테스트"), 0.0)
+        self.assertGreater(broker._policy_block_until, 0)
+        self.assertLessEqual(broker._policy_block_until - broker._now().timestamp(), POLICY_RETRY_SEC + 1)
+
+    def test_real_failure_still_counts(self):
+        """우리 잘못인 실패(잔고·버그)는 그대로 연속 실패로 센다"""
+        prices, up, by, broker, sf = make_live()
+        up.bal["USDT"] = 1_000.0
+        up.fail_once["withdraw"] = "Insufficient balance"
+        with sf() as session:
+            broker.ensure_initial_balances(session, 0.0, 0.5)
+            broker.transfer(session, 500.0, 0.0, reason="테스트")
+            self.assertEqual(broker.safety.failures, 1)
