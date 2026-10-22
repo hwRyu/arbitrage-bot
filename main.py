@@ -102,7 +102,7 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory) -> str
 HELP_TEXT = (
     "/status   잔고·포지션·진입 가능 여부" + LF +
     "/premium  지금 김프 (가운데·진입·청산, 기준까지 얼마 남았나)" + LF +
-    "/close    들고 있는 포지션 강제 청산 (예: /close 또는 /close CAP,SEI)" + LF +
+    "/close    강제 청산 + 신규 진입 중단 (예: /close 또는 /close CAP,SEI → 재개는 /resume)" + LF +
     "/stop     신규 진입 중단 (청산·관리는 계속)" + LF +
     "/resume   재개" + LF +
     "/collect  시세 수집 현황 (/collect start 40 · /collect stop)" + LF +

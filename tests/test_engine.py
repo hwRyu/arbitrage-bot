@@ -497,34 +497,35 @@ class CloseRequestTest(unittest.TestCase):
         with sf() as s:
             self.assertEqual(len(broker.open_positions(s)), 2)  # 아무것도 청산하지 않는다
 
-    def test_close_then_reenters_if_still_cheap(self):
+    def test_close_blocks_new_entries(self):
         """
-        /close 는 '청산' 만 한다 — 김프가 여전히 기준 아래면 같은 스캔에서 다시 들어간다
+        /close 는 신규 진입도 막는다 (/stop 과 같은 효과)
 
-        재진입까지 막으려면 /stop 과 함께 써야 한다. (헷갈리기 쉬운 부분이라 테스트로 박아둔다)
+        김프가 여전히 기준 아래여도 다시 들어가지 않는다. 사람이 정리하라고 했는데
+        같은 스캔에서 또 들어가면 뜻과 다르기 때문이다. 다시 돌리려면 /resume.
         """
         engine, sf, broker, market = self._engine_with_positions(coins=("XRP",))
         with sf() as s:
             first = broker.open_positions(s)[0].id
         engine.request_close()
-        engine.step()                                   # 청산 + 재진입
+        self.assertTrue(broker.safety.manual_stop)
+        engine.step()                                   # 김프는 그대로 -1% (기준 아래)
         with sf() as s:
-            now = broker.open_positions(s)
-            self.assertEqual(len(now), 1)
-            self.assertNotEqual(now[0].id, first)       # 새 포지션이다
+            self.assertEqual(len(broker.open_positions(s)), 0)   # 재진입하지 않는다
             from sqlalchemy import select
             from kimp.db import Position
             closed = [p for p in s.scalars(select(Position)).all() if p.id == first][0]
             self.assertEqual(closed.exit_reason, ExitReason.MANUAL)
 
-    def test_close_with_stop_does_not_reenter(self):
-        """/stop 뒤에 /close 하면 청산만 되고 다시 들어가지 않는다"""
+    def test_resume_lets_it_trade_again(self):
+        """/close 뒤 /resume 하면 다시 진입한다"""
         engine, sf, broker, market = self._engine_with_positions(coins=("XRP",))
-        broker.safety.manual_stop = True                # 텔레그램 /stop 과 같은 효과
         engine.request_close()
         engine.step()
+        broker.safety.resume()                          # 텔레그램 /resume
+        engine.step()
         with sf() as s:
-            self.assertEqual(len(broker.open_positions(s)), 0)
+            self.assertEqual(len(broker.open_positions(s)), 1)
 
     def test_close_with_no_position(self):
         market = FakeMarket()

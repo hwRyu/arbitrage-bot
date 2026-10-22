@@ -113,15 +113,19 @@ class Engine:
         """
         강제 청산 요청 (텔레그램 /close). 실제 청산은 다음 스캔에서 엔진이 한다.
 
+        **신규 진입도 함께 막는다** (/stop 과 같은 효과). 사람이 정리하라고 했는데 같은 스캔에서
+        다시 들어가면 뜻과 다르기 때문이다. 다시 돌리려면 /resume.
+
         Args:
             coins: 청산할 코인들. 없으면 전부
         Returns:
             사람에게 보여줄 안내 문장
         """
+        self.broker.safety.manual_stop = True   # 정리하는 동안 새로 들어가지 않게
         with self.session_factory() as session:
             holding = self.broker.open_positions(session)
         if not holding:
-            return "들고 있는 포지션이 없습니다."
+            return "들고 있는 포지션이 없습니다. (신규 진입은 멈춰 뒀습니다. 재개: /resume)"
         if coins:
             want = {c.strip().upper() for c in coins if c.strip()}
             found = [p for p in holding if p.coin in want]
@@ -131,10 +135,12 @@ class Engine:
             self._close_requests |= {p.coin for p in found}
             note = f" (없는 코인: {', '.join(sorted(missing))})" if missing else ""
             return (f"청산 요청: {', '.join(sorted(p.coin for p in found))}{note}"
-                    f"{LF}다음 스캔({self.s.scan_interval_sec:.0f}초 안)에 지금 시세로 정리합니다.")
+                    f"{LF}다음 스캔({self.s.scan_interval_sec:.0f}초 안)에 지금 시세로 정리합니다."
+                    f"{LF}신규 진입도 멈췄습니다 (재개: /resume)")
         self._close_requests.add("*")
         return (f"청산 요청: 전체 {len(holding)}개 ({', '.join(p.coin for p in holding)})"
-                f"{LF}다음 스캔({self.s.scan_interval_sec:.0f}초 안)에 지금 시세로 정리합니다.")
+                f"{LF}다음 스캔({self.s.scan_interval_sec:.0f}초 안)에 지금 시세로 정리합니다."
+                f"{LF}신규 진입도 멈췄습니다 (재개: /resume)")
 
     def _handle_close_requests(self, session: Session, quotes: Dict[str, Quote],
                                open_positions: Dict[str, Position]) -> bool:
