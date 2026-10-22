@@ -61,6 +61,24 @@
   .pick.none { opacity: .45; text-decoration: line-through; }
   .pick i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
   .chip { font-size: 12px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--dim); }
+  /* 용어 설명 풍선: 점선 밑줄에 마우스를 올리면 뜻·공식·예시가 나온다 */
+  .hint { border-bottom: 1px dotted currentColor; cursor: help; }
+  [data-tip] { position: relative; }
+  [data-tip]:hover::after {
+    content: attr(data-tip); position: absolute; left: 0; top: 125%; z-index: 50;
+    white-space: pre-line; width: max-content; max-width: 340px; text-align: left;
+    background: #0b0f15; color: var(--text); border: 1px solid var(--accent); border-radius: 7px;
+    padding: 8px 10px; font-size: 12px; font-weight: 400; line-height: 1.5;
+    box-shadow: 0 6px 20px rgba(0,0,0,.5);
+  }
+  th:last-child [data-tip]:hover::after, td:last-child [data-tip]:hover::after { left: auto; right: 0; }
+  details { margin-bottom: 12px; }
+  details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+  details .panel { margin-top: 8px; }
+  details dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; font-size: 13px; }
+  details dt { color: var(--dim); font-weight: 600; }
+  details dd { margin: 0; }
+  details code { background: #11151c; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .chip.running { color: #11151c; background: var(--warn); border-color: var(--warn); font-weight: 700; }
   .chip.done { color: #11151c; background: var(--up); border-color: var(--up); font-weight: 700; }
   .chip.bad { color: #11151c; background: var(--down); border-color: var(--down); font-weight: 700; }
@@ -91,6 +109,22 @@
 
 <main>
   <section id="live" class="on">
+    <details>
+      <summary>용어 설명 (김프가 왜 세 개인가?)</summary>
+      <div class="panel">
+        <p class="note" style="margin:0 0 10px">
+김프 = <code>업비트 코인 원화가 ÷ (바이비트 가격 × 업비트 USDT 원화가) − 1</code>
+세 가지는 <b>같은 공식에 어느 가격을 넣느냐</b>만 다릅니다. 시장마다 가격이 둘(사는 값·파는 값)이라서 생깁니다.
+호가 간격이 0 이라면 세 김프가 같은 값이 됩니다. <b>수수료는 어느 김프에도 포함되지 않습니다.</b></p>
+        <dl>
+          <dt>가운데 김프</dt><dd>사는 값과 파는 값의 중간. 실제로 그 가격에 거래는 안 되지만 <b>흐름 보기엔 이것만 보면 됩니다.</b></dd>
+          <dt>진입 김프</dt><dd>지금 진입하면 체결될 김프 (코인 비싸게 사고 / 숏 싸게 치고 / USDT 싸게 팜). 가운데보다 <b>높다</b>. 이 값이 기준 아래로 내려오면 봇이 진입.</dd>
+          <dt>청산 김프</dt><dd>지금 청산하면 체결될 김프 (코인 싸게 팔고 / 숏 비싸게 닫고 / USDT 비싸게 삼). 가운데보다 <b>낮다</b>.</dd>
+          <dt>진입 − 청산</dt><dd>= 호가 간격 한 칸(왕복). 사자마자 팔면 날아가는 비용. <b>좁은 코인이 유리</b>합니다.</dd>
+          <dt>필요한 상승</dt><dd>목표 1% + 수수료 0.31% + 호가 간격. 예) 호가 0.22% 면 김프가 약 <b>1.53%p</b> 올라야 1% 남습니다.</dd>
+        </dl>
+      </div>
+    </details>
     <div class="row">
       <label>볼 코인
         <select id="liveScope">
@@ -261,7 +295,56 @@ const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "
 const sign = (v, d = 2) => (v === null || v === undefined) ? "-" : (v >= 0 ? "+" : "") + Number(v).toFixed(d);
 const cls = (v) => (v === null || v === undefined) ? "" : (v >= 0 ? "plus" : "minus");
 const kst = (ms) => new Date(ms).toLocaleString("ko-KR", { hour12: false });
-const NL = String.fromCharCode(10);  // 줄바꿈 (편집 사고를 막으려고 상수로)
+const NL = String.fromCharCode(10);
+
+// 용어 설명 (표 헤더에 마우스 올리면 뜬다). 한 곳에서 관리해서 어디서든 같은 설명이 나오게.
+const TIP = {
+  mid: "가운데 김프 (코인 몫)" + NL +
+       "= 업비트 코인 가운데가격 ÷ (바이비트 가운데가격 × 업비트 USDT 가운데가격) − 1" + NL +
+       "사는 가격과 파는 가격의 중간이라 실제로 그 가격에 거래할 수는 없다. 흐름을 볼 때 쓰는 값." + NL +
+       "테더 프리미엄·환율은 빠져 있다 (봇 손익에 영향 없음).",
+  entry: "진입 김프 = 지금 진입하면 실제로 체결될 김프" + NL +
+         "코인은 비싸게(매도호가) 사고, 숏은 싸게(매수호가) 치고, USDT 는 싸게(매수호가) 판다." + NL +
+         "→ 가운데 김프보다 높게 나온다. 이 값이 기준 아래로 내려오면 봇이 진입한다." + NL +
+         "수수료는 포함되지 않는다 (손익 계산에서 따로 뺀다).",
+  exit: "청산 김프 = 지금 청산하면 실제로 체결될 김프" + NL +
+        "코인은 싸게(매수호가) 팔고, 숏은 비싸게(매도호가) 닫고, USDT 는 비싸게(매도호가) 산다." + NL +
+        "→ 가운데 김프보다 낮게 나온다. 이 값이 올라가면 목표에 가까워진다." + NL +
+        "수수료는 포함되지 않는다.",
+  coinSpread: "코인 호가 간격 = 진입 김프 − 청산 김프 − USDT 호가 간격" + NL +
+              "업비트 코인과 바이비트의 '사는 가격 − 파는 가격' 합. 사자마자 팔면 그냥 날아가는 비용." + NL +
+              "예) 0.22% 면 김프가 그만큼 더 올라야 본전. 좁은 코인이 유리하다.",
+  usdtSpread: "업비트 USDT/KRW 호가 간격" + NL +
+              "진입할 때 USDT 를 팔고 청산할 때 되사므로 이 간격도 비용이다 (보통 0.07% 쯤).",
+  funding: "펀딩비율 (8시간 기준으로 환산)" + NL +
+           "우리는 숏이라 + 면 받고 − 면 낸다. 코인마다 정산 주기가 1·4·8시간이라 8시간 기준으로 맞춘 값." + NL +
+           "예) +0.01% 면 1,000 USDT 숏이 8시간마다 0.1 USDT 를 받는다.",
+  tether: "테더 프리미엄 = 업비트 USDT 가격 ÷ 달러 환율 − 1" + NL +
+          "봇 손익에는 영향이 없다 (USDT 를 팔고 되사서 상쇄). 표시용.",
+  site: "사이트식 김프 = 달러 환율 기준 김프 (김프 사이트 숫자)" + NL +
+        "대략 '봇 김프 + 테더 프리미엄'. 봇이 노리는 건 봇 김프(코인 몫)뿐이다.",
+  volUp: "업비트 24시간 거래대금 (억원)" + NL + "작으면 호가가 얇아서 시장가가 밀린다.",
+  volBy: "바이비트 24시간 거래대금 (백만 USDT)",
+  records: "봇이 1분마다 남긴 김프 기록 건수" + NL +
+           "30건을 넘으면 스크리너·시뮬레이션이 '지금 호가' 대신 이 실측 평균을 쓴다.",
+  source: "이 호가 간격이 어디서 온 값인지" + NL +
+          "기록 N건 = 봇이 쌓은 실측(가장 정확) / 코인별 설정 / 지금 호가 3번 중간값 / 기본 설정 0.1%",
+  score: "점수 = min(전체 월수익, 검증 월수익) ÷ 자리 점유율 × 띠 가중치" + NL +
+         "자리 점유율로 나누는 이유: 동시 보유가 3개뿐이라, 오래 들고 있는 코인은 다른 코인의 진입을 막는다.",
+  monthly: "전체/월 = 최근 기간 전체에서 가장 좋았던 진입 기준으로 돌렸을 때 월 환산 수익" + NL +
+           "답을 보고 기준을 고른 값이라 실제보다 좋게 나온다 (과최적화).",
+  testMonthly: "검증/월 = 앞 2/3 기간으로 고른 기준을 뒤 1/3 기간에 그대로 써본 월 환산 수익" + NL +
+               "고를 때 보지 않은 구간이라 이 값이 더 믿을 만하다. 0 이면 그 기간에 거래가 없었다는 뜻.",
+  occupancy: "자리 점유율 = 포지션을 들고 있던 시간 ÷ 전체 기간" + NL +
+             "90% 면 자리를 거의 혼자 쓴다는 뜻. 동시 보유가 3개뿐이라 낮을수록 좋다.",
+  netPnl: "순손익 (USDT) = 업비트 몫 + 바이비트 몫 + 펀딩비 − 수수료·전송비" + NL +
+          "봇은 이 값이 포지션 금액의 목표(기본 1%)를 넘으면 청산한다.",
+  liq: "강제청산 가격 (바이비트 숏)" + NL +
+       "가격이 여기 닿으면 숏 증거금을 잃는다. 1배면 진입가의 약 2배. 15% 이내로 다가오면 긴급 경고.",
+  margin: "이 포지션에 묶인 바이비트 증거금 = 숏 금액 ÷ 레버리지",
+  reason: "청산 사유" + NL + "TAKE_PROFIT 목표 달성 / STOP_LOSS 손절 / LIQUIDATION 강제청산 / TIMEOUT 한 번만 돌리기 시간 초과",
+  status: "포지션 상태" + NL + "OPENING 진입 중 / OPEN 보유 / CLOSING 청산 중 / CLOSED 끝 / ABORTED 되돌림 / ERROR 사람이 정리 필요",
+};  // 줄바꿈 (편집 사고를 막으려고 상수로)
 let CONFIG = null, TIMER = null;
 
 // 탭 전환은 스크립트 맨 앞에서 등록한다. 아래쪽 코드에 문제가 생겨도 탭은 계속 동작하게.
@@ -294,8 +377,11 @@ async function api(path) {
   return data;
 }
 
+// cols 의 tip 이 있으면 헤더에 점선 밑줄 + 마우스 올렸을 때 설명 풍선
 function table(el, cols, rows) {
-  const head = "<tr>" + cols.map((c) => `<th>${c.t}</th>`).join("") + "</tr>";
+  const head = "<tr>" + cols.map((c) => `<th>${c.tip
+    ? `<span class="hint" data-tip="${c.tip.split(NL).join("&#10;").split(String.fromCharCode(34)).join(String.fromCharCode(39))}">${c.t}</span>`
+    : c.t}</th>`).join("") + "</tr>";
   const body = rows.map((r) => "<tr" + (r._click ? ` class="click" onclick="${r._click}"` : "") + ">" +
     cols.map((c) => `<td class="${c.cls ? c.cls(r) : ""}">${c.v(r)}</td>`).join("") + "</tr>").join("");
   el.innerHTML = head + body;
@@ -323,14 +409,16 @@ async function loadLive() {
     const ok = rows.filter((r) => !r.error);
     table($("liveTable"), [
       { t: "코인", v: (r) => r.coin },
-      { t: "가운데 김프", v: (r) => sign(r.mid, 3), cls: (r) => cls(r.mid) },
-      { t: "진입 김프", v: (r) => sign(r.entry, 3), cls: (r) => cls(r.entry) },
-      { t: "청산 김프", v: (r) => sign(r.exit, 3), cls: (r) => cls(r.exit) },
-      { t: "코인 호가", v: (r) => fmt(r.coin_spread, 3) + "%" },
-      { t: "USDT 호가", v: (r) => fmt(r.usdt_spread, 3) + "%" },
-      { t: "펀딩/8h", v: (r) => sign(r.funding_8h, 4) + "%", cls: (r) => cls(r.funding_8h) },
-      { t: "업비트(억)", v: (r) => r.upbit_krw_24h ? (r.upbit_krw_24h / 1e8).toFixed(0) : "-" },
-      { t: "바이비트(M$)", v: (r) => r.bybit_usdt_24h ? (r.bybit_usdt_24h / 1e6).toFixed(1) : "-" },
+      { t: "가운데 김프", tip: TIP.mid, v: (r) => sign(r.mid, 3), cls: (r) => cls(r.mid) },
+      { t: "진입 김프", tip: TIP.entry, v: (r) => sign(r.entry, 3), cls: (r) => cls(r.entry) },
+      { t: "청산 김프", tip: TIP.exit, v: (r) => sign(r.exit, 3), cls: (r) => cls(r.exit) },
+      { t: "코인 호가", tip: TIP.coinSpread, v: (r) => fmt(r.coin_spread, 3) + "%" },
+      { t: "USDT 호가", tip: TIP.usdtSpread, v: (r) => fmt(r.usdt_spread, 3) + "%" },
+      { t: "펀딩/8h", tip: TIP.funding, v: (r) => sign(r.funding_8h, 4) + "%", cls: (r) => cls(r.funding_8h) },
+      { t: "테더", tip: TIP.tether, v: (r) => sign(r.tether_premium, 3) },
+      { t: "사이트 김프", tip: TIP.site, v: (r) => sign(r.site_premium, 3) },
+      { t: "업비트(억)", tip: TIP.volUp, v: (r) => r.upbit_krw_24h ? (r.upbit_krw_24h / 1e8).toFixed(0) : "-" },
+      { t: "바이비트(M$)", tip: TIP.volBy, v: (r) => r.bybit_usdt_24h ? (r.bybit_usdt_24h / 1e6).toFixed(1) : "-" },
       { t: "업비트(원)", v: (r) => r.upbit_krw ? r.upbit_krw.toLocaleString(undefined, { maximumFractionDigits: 2 }) : "-" },
       { t: "차트", v: (r) => `<span class="pick" onclick="openChart('${r.coin}')">보기</span>` },
     ], rows.map((r) => r.error ? { ...r, mid: null, entry: null, exit: null } : r));
@@ -343,9 +431,9 @@ async function loadLive() {
     const rows = await api("/api/spreads");
     table($("spreadTable"), [
       { t: "코인", v: (r) => r.coin },
-      { t: "호가 간격", v: (r) => fmt(r.percent, 3) + "%" },
-      { t: "출처", v: (r) => r.source },
-      { t: "기록 건수", v: (r) => (r.records || 0).toLocaleString() },
+      { t: "호가 간격", tip: TIP.coinSpread, v: (r) => fmt(r.percent, 3) + "%" },
+      { t: "출처", tip: TIP.source, v: (r) => r.source },
+      { t: "기록 건수", tip: TIP.records, v: (r) => (r.records || 0).toLocaleString() },
     ], rows);
   } catch (e) {
     $("spreadTable").innerHTML = `<tr><td class="err">${e.message}</td></tr>`;
@@ -363,16 +451,18 @@ function openChart(coin) {
 // ---------- 김프 차트 (지표 골라 보기) ----------
 // 왼쪽 축은 % 지표(김프·호가 간격·펀딩비 등), 오른쪽 축은 단위가 다른 지표(원화 가격)를 쓴다.
 const SERIES = [
-  { k: "mid",         name: "가운데 김프",     color: "#58a6ff", axis: "%",  on: true },
-  { k: "entry",       name: "진입 김프",       color: "#f85149", axis: "%",  on: true },
-  { k: "exit",        name: "청산 김프",       color: "#3fb950", axis: "%",  on: true },
-  { k: "spread",      name: "코인 호가 간격",  color: "#d29922", axis: "%",  on: false },
-  { k: "usdt_spread", name: "USDT 호가 간격",  color: "#a371f7", axis: "%",  on: false },
-  { k: "funding",     name: "펀딩비율(8h)",    color: "#f778ba", axis: "%",  on: false },
-  { k: "tether",      name: "테더 프리미엄",   color: "#56d4dd", axis: "%",  on: false },
-  { k: "site",        name: "사이트식 김프",   color: "#ffa657", axis: "%",  on: false },
-  { k: "usdt_krw",    name: "USDT 가격(원)",   color: "#8b98a9", axis: "원", on: false },
-  { k: "upbit_krw",   name: "업비트 가격(원)", color: "#6e7681", axis: "원", on: false },
+  { k: "mid",         name: "가운데 김프",     color: "#58a6ff", axis: "%",  on: true,  tip: TIP.mid },
+  { k: "entry",       name: "진입 김프",       color: "#f85149", axis: "%",  on: false, tip: TIP.entry },
+  { k: "exit",        name: "청산 김프",       color: "#3fb950", axis: "%",  on: false, tip: TIP.exit },
+  { k: "spread",      name: "코인 호가 간격",  color: "#d29922", axis: "%",  on: false, tip: TIP.coinSpread },
+  { k: "usdt_spread", name: "USDT 호가 간격",  color: "#a371f7", axis: "%",  on: false, tip: TIP.usdtSpread },
+  { k: "funding",     name: "펀딩비율(8h)",    color: "#f778ba", axis: "%",  on: false, tip: TIP.funding },
+  { k: "tether",      name: "테더 프리미엄",   color: "#56d4dd", axis: "%",  on: false, tip: TIP.tether },
+  { k: "site",        name: "사이트식 김프",   color: "#ffa657", axis: "%",  on: false, tip: TIP.site },
+  { k: "usdt_krw",    name: "USDT 가격(원)",   color: "#8b98a9", axis: "원", on: false,
+    tip: "업비트 USDT 가격 (원)" + NL + "오른쪽 축·점선으로 그린다. 김프와 단위가 달라서 축을 따로 쓴다." },
+  { k: "upbit_krw",   name: "업비트 가격(원)", color: "#6e7681", axis: "원", on: false,
+    tip: "업비트 코인 가격 (원). 오른쪽 축·점선." },
 ];
 let LAST = null, CHART_PICKED = false;  // CHART_PICKED: 사용자가 코인을 직접 골랐나
 
@@ -381,8 +471,11 @@ function renderPicks(available) {
   $("seriesPick").innerHTML = SERIES.map((s, i) => {
     const ok = has(s.k);
     const title = ok ? "" : ' title="이 기록에는 없는 지표입니다 (1분봉에는 호가가 없습니다)"';
+    const tip = ok ? (s.tip || "") : "이 기록에는 없는 지표입니다 (1분봉에는 호가가 없습니다)";
     return `<span class="pick ${s.on && ok ? "on" : ""} ${ok ? "" : "none"}"
-       style="${s.on && ok ? "color:" + s.color : ""}"${title} onclick="togglePick(${i})">
+       style="${s.on && ok ? "color:" + s.color : ""}"${title}
+       data-tip="${tip.split(NL).join("&#10;").split(String.fromCharCode(34)).join(String.fromCharCode(39))}"
+       onclick="togglePick(${i})">
        <i style="background:${ok ? s.color : "#3a4453"}"></i>${s.name}${ok ? "" : " (없음)"}</span>`;
   }).join("");
 }
@@ -510,16 +603,16 @@ async function loadScreen() {
       { t: "순위", v: (r) => r.rank },
       { t: "코인", v: (r) => r.coin },
       { t: "봉", v: (r) => r.timeframe || "-" },
-      { t: "점수", v: (r) => sign(r.score), cls: (r) => cls(r.score) },
-      { t: "전체/월", v: (r) => sign(r.monthly) + "%", cls: (r) => cls(r.monthly) },
-      { t: "검증/월", v: (r) => sign(r.test_monthly) + "%", cls: (r) => cls(r.test_monthly) },
+      { t: "점수", tip: TIP.score, v: (r) => sign(r.score), cls: (r) => cls(r.score) },
+      { t: "전체/월", tip: TIP.monthly, v: (r) => sign(r.monthly) + "%", cls: (r) => cls(r.monthly) },
+      { t: "검증/월", tip: TIP.testMonthly, v: (r) => sign(r.test_monthly) + "%", cls: (r) => cls(r.test_monthly) },
       { t: "거래", v: (r) => `${r.trades}건 ${r.wins}승` },
       { t: "진입기준", v: (r) => sign(r.threshold) + "%" },
       { t: "보유h", v: (r) => fmt(r.holding_hours, 1) },
-      { t: "점유", v: (r) => fmt(r.occupancy * 100, 0) + "%" },
-      { t: "호가", v: (r) => fmt(r.spread_percent, 2) + "%" },
+      { t: "점유", tip: TIP.occupancy, v: (r) => fmt(r.occupancy * 100, 0) + "%" },
+      { t: "호가", tip: TIP.coinSpread, v: (r) => fmt(r.spread_percent, 2) + "%" },
       { t: "비용", v: (r) => fmt(r.cost_percent, 2) + "%" },
-      { t: "펀딩/8h", v: (r) => sign(r.funding_8h, 4), cls: (r) => cls(r.funding_8h) },
+      { t: "펀딩/8h", tip: TIP.funding, v: (r) => sign(r.funding_8h, 4), cls: (r) => cls(r.funding_8h) },
       { t: "경고", v: (r) => `<span class="flags">${(r.flags || []).join(", ")}</span>` },
     ], rows);
   } catch (e) {
@@ -568,8 +661,8 @@ async function showTrades(id) {
       { t: "청산", v: (r) => (r.closed_at || "보유 중").replace("T", " ").slice(5, 16) },
       { t: "진입 김프", v: (r) => sign(r.entry_premium, 3) },
       { t: "청산 김프", v: (r) => sign(r.exit_premium, 3) },
-      { t: "사유", v: (r) => r.exit_reason },
-      { t: "손익", v: (r) => sign(r.net_pnl_usdt) + " USDT", cls: (r) => cls(r.net_pnl_usdt) },
+      { t: "사유", tip: TIP.reason, v: (r) => r.exit_reason },
+      { t: "손익", tip: TIP.netPnl, v: (r) => sign(r.net_pnl_usdt) + " USDT", cls: (r) => cls(r.net_pnl_usdt) },
       { t: "손익률", v: (r) => sign(r.net_pnl_percent) + "%", cls: (r) => cls(r.net_pnl_percent) },
       { t: "펀딩비", v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
       { t: "비용", v: (r) => fmt(r.cost_usdt, 3) },
@@ -761,14 +854,14 @@ async function loadBot() {
     ], b.snapshot_coins || []);
     table($("botPos"), [
       { t: "코인", v: (r) => r.coin },
-      { t: "상태", v: (r) => r.status },
+      { t: "상태", tip: TIP.status, v: (r) => r.status },
       { t: "진입 시각", v: (r) => (r.opened_at || "").slice(0, 19) },
-      { t: "진입 김프", v: (r) => sign(r.entry_premium, 3) },
+      { t: "진입 김프", tip: TIP.entry, v: (r) => sign(r.entry_premium, 3) },
       { t: "코인 수량", v: (r) => fmt(r.upbit_qty, 4) },
       { t: "숏 수량", v: (r) => fmt(r.bybit_qty, 4) },
       { t: "판 USDT", v: (r) => fmt(r.usdt_sold) },
-      { t: "증거금", v: (r) => fmt(r.margin) },
-      { t: "강제청산가", v: (r) => fmt(r.liquidation_price, 6) },
+      { t: "증거금", tip: TIP.margin, v: (r) => fmt(r.margin) },
+      { t: "강제청산가", tip: TIP.liq, v: (r) => fmt(r.liquidation_price, 6) },
       { t: "펀딩비", v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
       { t: "목표/손절", v: (r) => `+${fmt(r.target)}% / ${fmt(r.stop)}%` },
     ], b.positions);
@@ -778,8 +871,8 @@ async function loadBot() {
       { t: "청산", v: (r) => (r.closed_at || "").slice(5, 16) },
       { t: "진입 김프", v: (r) => sign(r.entry_premium, 3) },
       { t: "청산 김프", v: (r) => sign(r.exit_premium, 3) },
-      { t: "사유", v: (r) => r.exit_reason },
-      { t: "손익", v: (r) => sign(r.net_pnl_usdt) + " USDT", cls: (r) => cls(r.net_pnl_usdt) },
+      { t: "사유", tip: TIP.reason, v: (r) => r.exit_reason },
+      { t: "손익", tip: TIP.netPnl, v: (r) => sign(r.net_pnl_usdt) + " USDT", cls: (r) => cls(r.net_pnl_usdt) },
       { t: "손익률", v: (r) => sign(r.net_pnl_percent) + "%", cls: (r) => cls(r.net_pnl_percent) },
     ], b.recent);
   } catch (e) {

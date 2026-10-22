@@ -276,3 +276,70 @@ class AvailableKeysTest(unittest.TestCase):
     def test_empty(self):
         from kimp.webui import _available_keys
         self.assertEqual(_available_keys([]), [])
+
+
+class LivePremiumFieldsTest(unittest.TestCase):
+    """지금 김프가 화면에 필요한 칸을 다 주는지 (테더·사이트식 김프 포함)"""
+
+    class FakeMd:
+        """업비트 호가창 + 바이비트 티커를 흉내내는 가짜"""
+
+        class _Up:
+            id = "upbit"
+            markets = {"AAA/KRW": {"base": "AAA", "quote": "KRW", "active": True}}
+
+            def fetch_order_books(self, symbols, limit=5):
+                out = {}
+                for sym in symbols:
+                    if sym == "USDT/KRW":
+                        out[sym] = {"bids": [(1_330.0, 1e6)], "asks": [(1_331.0, 1e6)]}
+                    else:
+                        out[sym] = {"bids": [(99.0, 1e6)], "asks": [(101.0, 1e6)]}
+                return out
+
+            def fetch_tickers(self, symbols=None):
+                return {"AAA/KRW": {"quoteVolume": 100e8}}
+
+        class _By:
+            id = "bybit"
+            markets = {"AAA/USDT:USDT": {}}
+
+            def fetch_tickers(self, symbols=None):
+                return {"AAA/USDT:USDT": {"bid": 0.0745, "ask": 0.0755, "quoteVolume": 2e6,
+                                          "info": {"fundingRate": "0.0001"}}}
+
+            def market(self, symbol):
+                return {"info": {"fundingInterval": "480"}}
+
+        def __init__(self):
+            self.upbit, self.bybit = self._Up(), self._By()
+
+    def test_fields(self):
+        import kimp.webui as w
+        orig_fx, w._fx_rate = w._fx_rate, lambda *a, **k: 1_320.0
+        try:
+            row = w.live_premium(self.FakeMd(), ["AAA"])[0]
+        finally:
+            w._fx_rate = orig_fx
+        # 진입 김프는 가운데보다 높고(불리), 청산 김프는 낮다
+        self.assertGreater(row["entry"], row["mid"])
+        self.assertLess(row["exit"], row["mid"])
+        # 코인 호가 간격 = 업비트(101/99-1=2.02%) + 바이비트(0.0755/0.0745-1=1.34%)
+        self.assertAlmostEqual(row["coin_spread"], 2.0202 + 1.3423, places=2)
+        # 테더 프리미엄 = USDT 가운데(1330.5) / 환율(1320) − 1
+        self.assertAlmostEqual(row["tether_premium"], (1_330.5 / 1_320.0 - 1) * 100, places=4)
+        self.assertIsNotNone(row["site_premium"])
+        # 펀딩비율 0.01% (8시간 정산이라 환산 그대로)
+        self.assertAlmostEqual(row["funding_8h"], 0.01, places=6)
+
+    def test_without_fx_only_tether_site_missing(self):
+        """환율을 못 받아도 김프는 그대로 나온다 (표시용이라 매매에 영향 없음)"""
+        import kimp.webui as w
+        orig_fx, w._fx_rate = w._fx_rate, lambda *a, **k: None
+        try:
+            row = w.live_premium(self.FakeMd(), ["AAA"])[0]
+        finally:
+            w._fx_rate = orig_fx
+        self.assertIsNotNone(row["mid"])
+        self.assertIsNone(row["tether_premium"])
+        self.assertIsNone(row["site_premium"])

@@ -317,6 +317,8 @@ def live_premium(md, coins: Sequence[str]) -> List[Dict[str, Any]]:
     usdt_mid = (usdt_bid + usdt_ask) / 2
     tickers = md.bybit.fetch_tickers()
     vol = universe(md)["volume"]
+    fx = _fx_rate()  # 달러 환율 (표시용: 테더 프리미엄·사이트식 김프). 없으면 그 두 칸만 빈다
+    tether = (usdt_mid / fx - 1) * 100 if fx else None
 
     out: List[Dict[str, Any]] = []
     for c in coins:
@@ -341,11 +343,32 @@ def live_premium(md, coins: Sequence[str]) -> List[Dict[str, Any]]:
             "coin_spread": (up_ask / up_bid - 1) * 100 + (by_ask / by_bid - 1) * 100,
             "usdt_spread": (usdt_ask / usdt_bid - 1) * 100,
             "upbit_krw": up_mid, "bybit_usdt": by_mid, "usdt_krw": usdt_mid,
+            "fx_krw": fx, "tether_premium": tether,
+            # 사이트식 김프 = 달러 환율 기준. 대략 '봇 김프 + 테더 프리미엄'
+            "site_premium": prem(up_mid, by_mid, fx) if fx else None,
             "funding_8h": _funding_8h_percent(float(rate) if rate not in (None, "") else None, interval),
             "upbit_krw_24h": (vol.get(c) or {}).get("upbit_krw"),
             "bybit_usdt_24h": (vol.get(c) or {}).get("bybit_usdt"),
         })
     return out
+
+
+# 달러 환율은 표시용이라 10분 캐시로 충분하다 (김프 계산에는 쓰지 않는다)
+_FX: Dict[str, Any] = {"at": 0.0, "rate": None}
+
+
+def _fx_rate(ttl_sec: float = 600.0) -> Optional[float]:
+    """달러 환율 (표시용). 실패하면 None — 테더 프리미엄·사이트식 김프 칸만 비워진다"""
+    import time as _time
+
+    if _FX["rate"] and _time.time() - _FX["at"] < ttl_sec:
+        return _FX["rate"]
+    try:
+        from kimp.fx import fetch_usd_krw_from_yfinance
+        _FX.update({"at": _time.time(), "rate": fetch_usd_krw_from_yfinance()})
+    except Exception as exc:
+        logger.warning("달러 환율 조회 실패 (표시용이라 매매에는 영향 없음): %s", exc)
+    return _FX["rate"]
 
 
 def _bybit_funding_interval_hours(md, coin: str) -> float:
