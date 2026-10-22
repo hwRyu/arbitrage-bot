@@ -273,7 +273,7 @@ python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP
 | `LIQUIDATION_WARN_PERCENT` | 15 | 강제청산까지 남은 상승폭이 이보다 작으면 경고 (두 전략 공통) |
 | `REBALANCE_THRESHOLD_PERCENT` | 10 | 양쪽 비율이 이만큼 깨지면 리밸런싱 |
 | `ENTRY_MIN_FUNDING_8H_PERCENT` | -0.05 | 8시간 기준 펀딩비율이 이보다 나쁘면 진입 안 함 (비우면 끔) |
-| `MAX_FUNDING_COST_PERCENT` | 1.0 | 펀딩비로 낸 돈이 포지션 금액의 이 %를 넘으면 정리 (0 = 무제한) |
+| `MAX_FUNDING_COST_PERCENT` | 0.3 | 펀딩비로 낸 돈이 포지션 금액의 이 %를 넘으면 정리 (0 = 무제한). 펀딩비만큼 필요 청산 김프가 올라가서, 0.3%면 이미 도달이 어려워진다 |
 | `TRANSFER_FEE_UPBIT_TO_BYBIT_USDT` | 0 | 업비트 → 바이비트 송금 수수료 (업비트 USDT(TRX) 출금 무료) |
 | `TRANSFER_FEE_BYBIT_TO_UPBIT_USDT` | 1.3 | 바이비트 → 업비트 송금 수수료 (바이비트 TRC20 출금) |
 | `PAPER_AUTO_REBALANCE` | true | 페이퍼·시뮬레이션에서 필요할 때 자동 송금 흉내 |
