@@ -44,8 +44,8 @@ from sqlalchemy import func, select
 
 from kimp.config import Settings, load_settings
 from kimp.db import Position, PositionStatus, make_session_factory
-from kimp.spread import (LIVE_SAMPLES, MIN_SNAPSHOTS_FOR_SPREAD, median_spread_depth, resolve_spreads,
-                         snapshot_spreads)
+from kimp.spread import (LIVE_SAMPLES, MIN_SNAPSHOTS_FOR_SPREAD, accumulate_hint, is_rough,
+                         median_spread_depth, resolve_spreads, snapshot_spreads)
 from kimp.engine import Engine
 from kimp.fx import FxQuote
 from kimp.history import (BYBIT, MINUTE_MS, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade,
@@ -428,8 +428,8 @@ def apply_tick_floor(spreads: Dict[str, float], sources: Dict[str, str],
             sources[coin] = f"{sources.get(coin, '-')} → 호가 단위 하한으로 올림"
 
 
-def decide_spreads(settings: Settings, coins: List[str], md=None,
-                   usdt_krw: float = 1.0) -> Tuple[Dict[str, float], Dict[str, str]]:
+def decide_spreads(settings: Settings, coins: List[str], md=None, usdt_krw: float = 1.0,
+                   allow_live: bool = True) -> Tuple[Dict[str, float], Dict[str, str]]:
     """
     코인별 코인 호가 간격(%) 정하기 — 스크리너와 같은 규칙 (kimp/spread.py)
 
@@ -441,9 +441,10 @@ def decide_spreads(settings: Settings, coins: List[str], md=None,
     Args:
         md: MarketData. 주면 기록이 없는 코인의 호가창을 조회해서 중간값을 쓴다
         usdt_krw: 업비트 USDT 가격 (물량을 USDT 로 바꿀 때만 쓴다)
+        allow_live: False 면 지금 호가창을 조회하지 않는다 (어차피 막힐 실행에서 10초를 버리지 않도록)
     """
     live = None
-    if md is not None:
+    if md is not None and allow_live:
         need = [c for c in coins
                 if not os.getenv(f"{c}_SIM_SPREAD_PERCENT", "").strip()
                 and snapshot_spreads(settings.db_path, [c]).get(c, (0, 0))[1] < MIN_SNAPSHOTS_FOR_SPREAD]
@@ -609,6 +610,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--coins", default=None, help="코인 목록 (안 적으면 .env 의 COINS) 예: XRP,SOL")
     parser.add_argument("--verbose", action="store_true", help="거래 내역 하나하나 보기")
     parser.add_argument("--no-save", action="store_true", help="결과를 history DB 에 저장하지 않음")
+    parser.add_argument("--rough-spread", action="store_true",
+                        help="호가 간격 기록이 없어도 '지금 호가' 로 대충 돌린다 (숫자가 실행마다 바뀜)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s - %(message)s")
@@ -637,7 +640,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     upbit = {c: store.load_closes(UPBIT, c, start_ms - pad, end_ms) for c in coins}
     bybit = {c: store.load_closes(BYBIT, c, start_ms - pad, end_ms) for c in coins}
     usdt = store.load_closes(UPBIT_USDT, "USDT", start_ms - pad, end_ms)
-    spreads, sources = decide_spreads(settings, coins, md, usdt[max(usdt)] if usdt else 1.0)
+    spreads, sources = decide_spreads(settings, coins, md, usdt[max(usdt)] if usdt else 1.0,
+                                      allow_live=args.rough_spread)
+    rough = [c for c in coins if is_rough(sources.get(c, ""))]
+    if rough and not args.rough_spread:
+        # 믿을 수 없는 숫자를 내놓는 대신 멈춘다 (실행마다 결과가 바뀌므로)
+        print()
+        print(accumulate_hint(rough))
+        return 3
+    if rough:
+        print(f"[주의] 호가 간격이 '지금 호가' 기준인 코인: {', '.join(rough)} "
+              f"— 숫자가 실행마다 바뀝니다 (--rough-spread)")
     apply_tick_floor(spreads, sources, {c: tick_floor_percent(list(upbit[c].values()), list(bybit[c].values()))
                                         for c in coins})
     clock = SimClock(start_ms / 1000)

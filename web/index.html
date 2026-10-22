@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>김프 봇 도구</title>
+<style>
+  :root {
+    --bg: #11151c; --panel: #181e28; --line: #2a3340; --text: #e6edf3; --dim: #8b98a9;
+    --up: #3fb950; --down: #f85149; --accent: #58a6ff; --warn: #d29922;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 "Malgun Gothic", "Apple SD Gothic Neo", system-ui, sans-serif; }
+  header { padding: 14px 18px; border-bottom: 1px solid var(--line); display: flex; gap: 14px;
+           align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0; font-weight: 700; }
+  .muted { color: var(--dim); font-size: 13px; }
+  .tabs { display: flex; gap: 4px; padding: 10px 18px 0; flex-wrap: wrap; }
+  .tabs button { background: none; border: 1px solid var(--line); color: var(--dim); padding: 7px 14px;
+                 border-radius: 7px 7px 0 0; cursor: pointer; font: inherit; }
+  .tabs button.on { background: var(--panel); color: var(--text); border-bottom-color: var(--panel); }
+  main { padding: 0 18px 28px; }
+  section { display: none; background: var(--panel); border: 1px solid var(--line); border-radius: 0 8px 8px 8px;
+            padding: 16px; }
+  section.on { display: block; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+  td:first-child, th:first-child { text-align: left; }
+  .wrap { overflow-x: auto; }
+  .plus { color: var(--up); } .minus { color: var(--down); }
+  .flags { color: var(--warn); font-size: 12px; white-space: normal; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  select, button.act { background: #0d1117; color: var(--text); border: 1px solid var(--line);
+                       border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
+  button.act:hover { border-color: var(--accent); }
+  .chart { width: 100%; height: 340px; background: #0d1117; border: 1px solid var(--line); border-radius: 8px; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--dim); margin-top: 8px; }
+  .legend i { display: inline-block; width: 18px; height: 2px; vertical-align: middle; margin-right: 5px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .card { background: #0d1117; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card b { display: block; color: var(--dim); font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+  .card span { font-size: 17px; }
+  .note { color: var(--dim); font-size: 12px; margin: 10px 0 0; white-space: pre-wrap; }
+  pre { background: #0d1117; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+        overflow-x: auto; font-size: 12px; margin: 10px 0 0; }
+  .err { color: var(--down); }
+  tr.click { cursor: pointer; } tr.click:hover td { background: #1f2630; }
+</style>
+</head>
+<body>
+<header>
+  <h1>김프 봇 도구</h1>
+  <span class="muted" id="head">불러오는 중…</span>
+  <span style="flex:1"></span>
+  <label class="muted"><input type="checkbox" id="auto"> 10초마다 새로고침</label>
+  <button class="act" onclick="reload()">새로고침</button>
+</header>
+
+<div class="tabs">
+  <button data-tab="live" class="on">지금 김프</button>
+  <button data-tab="chart">김프 차트</button>
+  <button data-tab="screen">추천 코인</button>
+  <button data-tab="sim">시뮬레이션</button>
+  <button data-tab="config">설정</button>
+</div>
+
+<main>
+  <section id="live" class="on">
+    <div class="wrap"><table id="liveTable"></table></div>
+    <p class="note">진입 김프 = 지금 사고 숏 칠 때 / 청산 김프 = 지금 팔고 숏 닫을 때. 둘의 차이가 호가 간격입니다.
+코인 몫 김프만 봇 손익에 영향을 줍니다 (테더 프리미엄·환율은 상쇄).</p>
+    <h3 style="font-size:14px;margin:18px 0 8px">호가 간격 기록</h3>
+    <div class="wrap"><table id="spreadTable"></table></div>
+    <p class="note">기록이 30건을 넘으면 스크리너·시뮬레이션이 자동으로 그 값을 씁니다. 기록이 없으면 시뮬레이션은 멈춥니다.</p>
+  </section>
+
+  <section id="chart">
+    <div class="row">
+      <select id="chartCoin"></select>
+      <select id="chartHours">
+        <option value="6">6시간</option>
+        <option value="24" selected>24시간</option>
+        <option value="72">3일</option>
+        <option value="168">7일</option>
+        <option value="720">30일</option>
+      </select>
+      <span class="muted" id="chartInfo"></span>
+    </div>
+    <svg class="chart" id="svg" viewBox="0 0 900 340" preserveAspectRatio="none"></svg>
+    <div class="legend">
+      <span><i style="background:#58a6ff"></i>가운데 김프</span>
+      <span><i style="background:#f85149"></i>진입 김프(불리)</span>
+      <span><i style="background:#3fb950"></i>청산 김프(불리)</span>
+      <span><i style="background:#8b98a9"></i>진입 기준</span>
+    </div>
+    <p class="note" id="chartNote"></p>
+  </section>
+
+  <section id="screen">
+    <div id="screenBody" class="muted">불러오는 중…</div>
+  </section>
+
+  <section id="sim">
+    <div class="wrap"><table id="simTable"></table></div>
+    <div id="simTrades"></div>
+  </section>
+
+  <section id="config">
+    <div class="cards" id="cards"></div>
+    <h3 style="font-size:14px;margin:18px 0 8px">코인별 설정</h3>
+    <div class="wrap"><table id="coinTable"></table></div>
+    <p class="note" id="configNote"></p>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "-" : Number(v).toFixed(d);
+const sign = (v, d = 2) => (v === null || v === undefined) ? "-" : (v >= 0 ? "+" : "") + Number(v).toFixed(d);
+const cls = (v) => (v === null || v === undefined) ? "" : (v >= 0 ? "plus" : "minus");
+const kst = (ms) => new Date(ms).toLocaleString("ko-KR", { hour12: false });
+let CONFIG = null, TIMER = null;
+
+async function api(path) {
+  const r = await fetch(path);
+  const data = await r.json();
+  if (data && data.error && !Array.isArray(data)) throw new Error(data.error);
+  return data;
+}
+
+function table(el, cols, rows) {
+  const head = "<tr>" + cols.map((c) => `<th>${c.t}</th>`).join("") + "</tr>";
+  const body = rows.map((r) => "<tr" + (r._click ? ` class="click" onclick="${r._click}"` : "") + ">" +
+    cols.map((c) => `<td class="${c.cls ? c.cls(r) : ""}">${c.v(r)}</td>`).join("") + "</tr>").join("");
+  el.innerHTML = head + body;
+}
+
+// ---------- 지금 김프 ----------
+async function loadLive() {
+  try {
+    const rows = await api("/api/live");
+    table($("liveTable"), [
+      { t: "코인", v: (r) => r.coin },
+      { t: "가운데 김프", v: (r) => sign(r.mid, 3), cls: (r) => cls(r.mid) },
+      { t: "진입 김프", v: (r) => sign(r.entry, 3), cls: (r) => cls(r.entry) },
+      { t: "청산 김프", v: (r) => sign(r.exit, 3), cls: (r) => cls(r.exit) },
+      { t: "코인 호가", v: (r) => fmt(r.coin_spread, 3) + "%" },
+      { t: "USDT 호가", v: (r) => fmt(r.usdt_spread, 3) + "%" },
+      { t: "펀딩/8h", v: (r) => sign(r.funding_8h, 4) + "%", cls: (r) => cls(r.funding_8h) },
+      { t: "업비트(원)", v: (r) => r.upbit_krw ? r.upbit_krw.toLocaleString() : "-" },
+      { t: "바이비트(USDT)", v: (r) => fmt(r.bybit_usdt, 4) },
+      { t: "USDT(원)", v: (r) => fmt(r.usdt_krw, 1) },
+      { t: "테더 프리미엄", v: (r) => sign(r.tether_premium, 3) },
+      { t: "사이트 김프", v: (r) => sign(r.site_premium, 3) },
+    ], rows);
+  } catch (e) {
+    $("liveTable").innerHTML = `<tr><td class="err">시세 조회 실패: ${e.message}</td></tr>`;
+  }
+  try {
+    const rows = await api("/api/spreads");
+    table($("spreadTable"), [
+      { t: "코인", v: (r) => r.coin },
+      { t: "호가 간격", v: (r) => fmt(r.percent, 3) + "%" },
+      { t: "출처", v: (r) => r.source },
+      { t: "기록 건수", v: (r) => (r.records || 0).toLocaleString() },
+    ], rows);
+  } catch (e) {
+    $("spreadTable").innerHTML = `<tr><td class="err">${e.message}</td></tr>`;
+  }
+}
+
+// ---------- 김프 차트 ----------
+function drawChart(data) {
+  const W = 900, H = 340, L = 54, R = 12, T = 14, B = 26;
+  const svg = $("svg");
+  const pts = data.points || [];
+  if (!pts.length) { svg.innerHTML = `<text x="20" y="30" fill="#8b98a9">기록이 없습니다</text>`; return; }
+  const xs = pts.map((p) => p[0]);
+  const all = pts.flatMap((p) => [p[1], p[2], p[3]]).filter((v) => v !== null && v !== undefined);
+  const coin = $("chartCoin").value;
+  const entry = (CONFIG?.per_coin || []).find((c) => c.coin === coin)?.entry;
+  if (entry !== undefined && entry !== null) all.push(entry);
+  let lo = Math.min(...all), hi = Math.max(...all);
+  const pad = (hi - lo) * 0.12 || 0.1;
+  lo -= pad; hi += pad;
+  const x = (t) => L + (t - xs[0]) / Math.max(1, xs[xs.length - 1] - xs[0]) * (W - L - R);
+  const y = (v) => T + (hi - v) / (hi - lo) * (H - T - B);
+  const line = (idx, color) => {
+    const d = pts.filter((p) => p[idx] !== null && p[idx] !== undefined)
+      .map((p, i) => (i ? "L" : "M") + x(p[0]).toFixed(1) + " " + y(p[idx]).toFixed(1)).join(" ");
+    return d ? `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.4"/>` : "";
+  };
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, yy = y(v);
+    grid += `<line x1="${L}" y1="${yy}" x2="${W - R}" y2="${yy}" stroke="#2a3340"/>`;
+    grid += `<text x="${L - 6}" y="${yy + 4}" fill="#8b98a9" font-size="11" text-anchor="end">${v.toFixed(2)}%</text>`;
+  }
+  if (lo < 0 && hi > 0) grid += `<line x1="${L}" y1="${y(0)}" x2="${W - R}" y2="${y(0)}" stroke="#58a6ff" stroke-dasharray="3 3" opacity=".5"/>`;
+  if (entry !== undefined && entry !== null) {
+    grid += `<line x1="${L}" y1="${y(entry)}" x2="${W - R}" y2="${y(entry)}" stroke="#8b98a9" stroke-dasharray="5 4"/>`;
+  }
+  const t0 = kst(xs[0]), t1 = kst(xs[xs.length - 1]);
+  svg.innerHTML = grid + line(1, "#58a6ff") + line(2, "#f85149") + line(3, "#3fb950") +
+    `<text x="${L}" y="${H - 8}" fill="#8b98a9" font-size="11">${t0}</text>` +
+    `<text x="${W - R}" y="${H - 8}" fill="#8b98a9" font-size="11" text-anchor="end">${t1}</text>`;
+  const last = pts[pts.length - 1];
+  $("chartInfo").textContent = `${pts.length.toLocaleString()}개 · 출처 ${data.source} · 마지막 ${sign(last[1], 3)}%`;
+  $("chartNote").textContent = data.source === "1분봉"
+    ? "봇 기록이 없어서 과거 1분봉 종가로 계산했습니다 (가운데 가격 기준만, 진입·청산 김프는 없음)."
+    : "봇이 1분마다 남긴 기록입니다. 진입·청산 김프는 실제 호가 기준입니다.";
+}
+
+async function loadChart() {
+  const coin = $("chartCoin").value, hours = $("chartHours").value;
+  if (!coin) return;
+  try {
+    drawChart(await api(`/api/premium?coin=${coin}&hours=${hours}`));
+  } catch (e) {
+    $("svg").innerHTML = `<text x="20" y="30" fill="#f85149">${e.message}</text>`;
+  }
+}
+
+// ---------- 추천 코인 ----------
+async function loadScreen() {
+  try {
+    const d = await api("/api/screen");
+    const rows = d.rows || [];
+    const el = document.createElement("div");
+    el.innerHTML = `<p class="muted">${d.note || ""}</p><div class="wrap"><table id="scTable"></table></div>` +
+      (d.env_snippet ? `<pre>${d.env_snippet}</pre>` : "");
+    $("screenBody").innerHTML = "";
+    $("screenBody").appendChild(el);
+    table(el.querySelector("#scTable"), [
+      { t: "순위", v: (r) => r.rank },
+      { t: "코인", v: (r) => r.coin },
+      { t: "봉", v: (r) => r.timeframe || "-" },
+      { t: "점수", v: (r) => sign(r.score), cls: (r) => cls(r.score) },
+      { t: "전체/월", v: (r) => sign(r.monthly) + "%", cls: (r) => cls(r.monthly) },
+      { t: "검증/월", v: (r) => sign(r.test_monthly) + "%", cls: (r) => cls(r.test_monthly) },
+      { t: "거래", v: (r) => `${r.trades}건 ${r.wins}승` },
+      { t: "진입기준", v: (r) => sign(r.threshold) + "%" },
+      { t: "보유h", v: (r) => fmt(r.holding_hours, 1) },
+      { t: "점유", v: (r) => fmt(r.occupancy * 100, 0) + "%" },
+      { t: "호가", v: (r) => fmt(r.spread_percent, 2) + "%" },
+      { t: "비용", v: (r) => fmt(r.cost_percent, 2) + "%" },
+      { t: "펀딩/8h", v: (r) => sign(r.funding_8h, 4), cls: (r) => cls(r.funding_8h) },
+      { t: "경고", v: (r) => `<span class="flags">${(r.flags || []).join(", ")}</span>` },
+    ], rows);
+  } catch (e) {
+    $("screenBody").innerHTML = `<p class="err">${e.message}</p>
+      <p class="muted">먼저 <code>python -m kimp.screen</code> 을 한 번 돌리면 결과가 여기 나옵니다.</p>`;
+  }
+}
+
+// ---------- 시뮬레이션 ----------
+async function loadSims() {
+  try {
+    const runs = await api("/api/sims");
+    if (!runs.length) {
+      $("simTable").innerHTML = `<tr><td class="muted">아직 저장된 실행이 없습니다. python -m kimp.simulate --from 날짜 (--no-save 를 빼고) 돌리면 여기 쌓입니다.</td></tr>`;
+      return;
+    }
+    table($("simTable"), [
+      { t: "번호", v: (r) => r.id },
+      { t: "돌린 시각", v: (r) => (r.created_at || "").replace("T", " ").slice(0, 16) },
+      { t: "기간", v: (r) => `${kst(r.from_ms).slice(0, 12)} ~ ${kst(r.to_ms).slice(0, 12)}` },
+      { t: "코인", v: (r) => r.coins.join(",") },
+      { t: "총 손익", v: (r) => sign(r.summary.total_net_usdt) + " USDT", cls: (r) => cls(r.summary.total_net_usdt) },
+      { t: "자본 대비", v: (r) => sign(r.summary.return_percent, 3) + "%", cls: (r) => cls(r.summary.return_percent) },
+      { t: "확정", v: (r) => sign(r.summary.realized_usdt), cls: (r) => cls(r.summary.realized_usdt) },
+      { t: "평가", v: (r) => sign(r.summary.unrealized_usdt), cls: (r) => cls(r.summary.unrealized_usdt) },
+      { t: "닫은 거래", v: (r) => `${r.summary.closed_trades ?? "-"}건` },
+      { t: "보유 중", v: (r) => `${r.summary.open_positions ?? 0}개` },
+      { t: "호가 출처", v: (r) => (r.settings.spread_source && Object.values(r.settings.spread_source)[0]) || "-" },
+      { t: "", v: () => "거래 보기 ›" },
+    ], runs.map((r) => ({ ...r, _click: `showTrades(${r.id})` })));
+  } catch (e) {
+    $("simTable").innerHTML = `<tr><td class="err">${e.message}</td></tr>`;
+  }
+}
+
+async function showTrades(id) {
+  const box = $("simTrades");
+  box.innerHTML = `<p class="muted">불러오는 중…</p>`;
+  try {
+    const rows = await api(`/api/sim?id=${id}`);
+    box.innerHTML = `<h3 style="font-size:14px;margin:18px 0 8px">실행 #${id} 거래 ${rows.length}건</h3>
+                     <div class="wrap"><table id="trTable"></table></div>`;
+    table($("trTable"), [
+      { t: "코인", v: (r) => r.coin },
+      { t: "진입", v: (r) => (r.opened_at || "").replace("T", " ").slice(5, 16) },
+      { t: "청산", v: (r) => (r.closed_at || "보유 중").replace("T", " ").slice(5, 16) },
+      { t: "진입 김프", v: (r) => sign(r.entry_premium, 3) },
+      { t: "청산 김프", v: (r) => sign(r.exit_premium, 3) },
+      { t: "사유", v: (r) => r.exit_reason },
+      { t: "손익", v: (r) => sign(r.net_pnl_usdt) + " USDT", cls: (r) => cls(r.net_pnl_usdt) },
+      { t: "손익률", v: (r) => sign(r.net_pnl_percent) + "%", cls: (r) => cls(r.net_pnl_percent) },
+      { t: "펀딩비", v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
+      { t: "비용", v: (r) => fmt(r.cost_usdt, 3) },
+    ], rows);
+  } catch (e) {
+    box.innerHTML = `<p class="err">${e.message}</p>`;
+  }
+}
+
+// ---------- 설정 ----------
+function renderConfig(c) {
+  const cards = [
+    ["모드", c.mode],
+    ["코인", c.coins.join(", ") || "-"],
+    ["레버리지", c.leverage + "배"],
+    ["자본 비율", `업비트 ${c.capital_split.upbit}% : 바이비트 ${c.capital_split.bybit}%`],
+    ["포지션 크기", c.position_size_usdt ? c.position_size_usdt + " USDT" : "자동"],
+    ["최대 동시 보유", c.max_open_positions + "개"],
+    ["포지션 상한", c.max_position_usdt ? c.max_position_usdt + " USDT" : "없음(페이퍼)"],
+    ["왕복 수수료", fmt(c.fees.round_trip_percent) + "%"],
+    ["송금 수수료", `업→바 ${fmt(c.fees.transfer_to_bybit)} / 바→업 ${fmt(c.fees.transfer_to_upbit)}`],
+    ["API 키", c.keys_present ? "있음" : "없음"],
+    ["텔레그램", c.telegram ? "설정됨" : "없음"],
+  ];
+  $("cards").innerHTML = cards.map(([k, v]) => `<div class="card"><b>${k}</b><span>${v}</span></div>`).join("");
+  table($("coinTable"), [
+    { t: "코인", v: (r) => r.coin },
+    { t: "진입 기준", v: (r) => sign(r.entry) + "%", cls: (r) => cls(r.entry) },
+    { t: "목표 순이익", v: (r) => "+" + fmt(r.target) + "%" },
+    { t: "손절", v: (r) => fmt(r.stop) + "%" },
+    { t: "포지션", v: (r) => r.size ? r.size + " USDT" : "공통값" },
+  ], c.per_coin);
+  $("configNote").textContent = (c.warnings.length ? "⚠ " + c.warnings.join("\n⚠ ") + "\n\n" : "") +
+    `DB: 페이퍼 ${c.db.paper} / 과거데이터 ${c.db.history}`;
+  $("head").textContent = `모드 ${c.mode} · 코인 ${c.coins.join(", ")} · 목표 +${fmt(c.per_coin[0]?.target || 0)}%`;
+}
+
+// ---------- 탭 / 새로고침 ----------
+document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll("main section").forEach((s) => s.classList.toggle("on", s.id === b.dataset.tab));
+  if (b.dataset.tab === "chart") loadChart();
+  if (b.dataset.tab === "screen") loadScreen();
+  if (b.dataset.tab === "sim") loadSims();
+});
+$("chartCoin").onchange = loadChart;
+$("chartHours").onchange = loadChart;
+$("auto").onchange = (e) => {
+  clearInterval(TIMER);
+  if (e.target.checked) TIMER = setInterval(() => { loadLive(); if ($("chart").classList.contains("on")) loadChart(); }, 10000);
+};
+
+async function reload() {
+  try {
+    CONFIG = await api("/api/config");
+    renderConfig(CONFIG);
+    $("chartCoin").innerHTML = CONFIG.coins.map((c) => `<option>${c}</option>`).join("");
+  } catch (e) {
+    $("head").innerHTML = `<span class="err">설정을 읽지 못했습니다: ${e.message}</span>`;
+  }
+  loadLive();
+  const on = document.querySelector("main section.on").id;
+  if (on === "chart") loadChart();
+  if (on === "screen") loadScreen();
+  if (on === "sim") loadSims();
+}
+reload();
+</script>
+</body>
+</html>

@@ -140,6 +140,47 @@ def median_spread_depth(md, coins: Sequence[str], usdt_krw: float, samples: int 
     return out
 
 
+# 출처 라벨. '기록' 과 '코인별 설정' 만 믿을 만한 값으로 본다 (아래 is_rough)
+SOURCE_RECORDS = "기록"
+SOURCE_ENV = "코인별 설정"
+SOURCE_LIVE = f"지금 호가 {LIVE_SAMPLES}번 중간값"
+SOURCE_DEFAULT = "기본 설정"
+
+
+def is_rough(source: str) -> bool:
+    """
+    이 출처는 '대충 값' 인가 (= 실행마다 결과가 바뀔 수 있나)
+
+    '지금 호가' 와 '기본 설정' 은 과거 기간과 상관없는 값이라 시뮬레이션 숫자를 못 믿는다.
+    실제로 같은 기간을 돌렸는데 실행마다 CAP 호가가 0.125% / 0.266% 로 잡혀서
+    거래 수가 115건 / 76건, 손익이 +63 / +42 USDT 로 갈렸다. (2026-10-22)
+    """
+    return source.startswith(SOURCE_LIVE[:6]) or source == SOURCE_DEFAULT
+
+
+def accumulate_hint(coins: Sequence[str], rough_flag: str = "--rough-spread") -> str:
+    """호가 기록을 쌓는 방법 안내 (시뮬레이션이 막혔을 때 그대로 보여준다)"""
+    names = ",".join(coins)
+    win = "    ." + '\\' + ".venv" + '\\' + "Scripts" + '\\' + "python.exe main.py"
+    lines = [
+        f"호가 간격 기록이 없어서 숫자를 믿을 수 없습니다: {names}",
+        "",
+        "과거 호가창은 거래소가 주지 않습니다. 봇을 페이퍼로 돌려 직접 쌓아야 합니다",
+        f"(코인마다 1분에 1건. {MIN_SNAPSHOTS_FOR_SPREAD}건만 넘으면 자동으로 그 값을 씁니다).",
+        "",
+        "  윈도우 PowerShell",
+        f'    $env:COINS="{names}"; $env:SCAN_INTERVAL_SEC="20"; $env:CARRY_ENABLED="false"',
+        win,
+        "",
+        "  맥 / Git Bash",
+        f"    COINS={names} SCAN_INTERVAL_SEC=20 CARRY_ENABLED=false python main.py",
+        "",
+        "자세한 설명: docs/commands.md '호가 기록 쌓기'",
+        f"그래도 지금 대충이라도 돌려보려면 {rough_flag} 를 붙이세요 (숫자는 실행마다 바뀝니다).",
+    ]
+    return chr(10).join(lines)
+
+
 def resolve_spreads(coins: Sequence[str], db_path: str, default_percent: float,
                     live: Optional[Dict[str, Optional[float]]] = None,
                     min_snapshots: int = MIN_SNAPSHOTS_FOR_SPREAD) -> Tuple[Dict[str, float], Dict[str, str]]:
@@ -161,11 +202,11 @@ def resolve_spreads(coins: Sequence[str], db_path: str, default_percent: float,
         env_value = os.getenv(f"{coin}_SIM_SPREAD_PERCENT", "").strip()
         live_value = (live or {}).get(coin)
         if avg_n and avg_n[1] >= min_snapshots:
-            spreads[coin], sources[coin] = avg_n[0], f"기록 {avg_n[1]:,}건"
+            spreads[coin], sources[coin] = avg_n[0], f"{SOURCE_RECORDS} {avg_n[1]:,}건"
         elif env_value:
-            spreads[coin], sources[coin] = float(env_value), "코인별 설정"
+            spreads[coin], sources[coin] = float(env_value), SOURCE_ENV
         elif live_value is not None:
-            spreads[coin], sources[coin] = live_value, f"지금 호가 {LIVE_SAMPLES}번 중간값"
+            spreads[coin], sources[coin] = live_value, SOURCE_LIVE
         else:
-            spreads[coin], sources[coin] = default_percent, "기본 설정"
+            spreads[coin], sources[coin] = default_percent, SOURCE_DEFAULT
     return spreads, sources

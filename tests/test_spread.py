@@ -107,5 +107,36 @@ class ResolveSpreadTest(unittest.TestCase):
                 pass
 
 
+class RoughSpreadTest(unittest.TestCase):
+    """기록이 없으면 '대충 값' 으로 보고, 시뮬레이션은 멈춘다"""
+
+    def test_is_rough(self):
+        from kimp.spread import SOURCE_DEFAULT, SOURCE_ENV, SOURCE_LIVE, is_rough
+        self.assertTrue(is_rough(SOURCE_LIVE))      # 지금 호가 → 실행마다 바뀜
+        self.assertTrue(is_rough(SOURCE_DEFAULT))   # 기본값 0.1% → 과거와 무관
+        self.assertFalse(is_rough(SOURCE_ENV))      # 사람이 정한 값
+        self.assertFalse(is_rough("기록 1,440건"))   # 봇이 쌓은 실측
+
+    def test_hint_has_command_and_coins(self):
+        from kimp.spread import accumulate_hint
+        text = accumulate_hint(["CAP", "SEI"])
+        self.assertIn("CAP,SEI", text)
+        self.assertIn("main.py", text)
+        self.assertIn("--rough-spread", text)
+
+    def test_simulate_decide_spreads_marks_rough(self):
+        """시뮬레이션의 호가 결정도 같은 규칙 (md 없고 기록 없으면 기본값 → 대충)"""
+        from dataclasses import replace
+
+        from kimp.config import Settings
+        from kimp.simulate import decide_spreads
+        from kimp.spread import is_rough
+        settings = replace(Settings(coins=["CAP"], db_path="없는파일.db"), sim_default_spread_percent=0.1)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            spreads, sources = decide_spreads(settings, ["CAP"])
+        self.assertAlmostEqual(spreads["CAP"], 0.1)
+        self.assertTrue(is_rough(sources["CAP"]))
+
+
 if __name__ == "__main__":
     unittest.main()

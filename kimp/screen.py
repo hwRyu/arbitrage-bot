@@ -57,11 +57,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
-from collections import Counter
+import os
 import statistics
 import time
+from collections import Counter
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -77,7 +80,7 @@ from kimp.history import (
 )
 from kimp.market_data import USDT_KRW_SYMBOL, bybit_symbol, upbit_symbol
 from kimp.simulate import tick_floor_percent, usdt_tick_percent
-from kimp.spread import LIVE_SAMPLES, median_spread_depth, resolve_spreads
+from kimp.spread import LIVE_SAMPLES, is_rough, median_spread_depth, resolve_spreads
 
 logger = logging.getLogger(__name__)
 
@@ -775,6 +778,38 @@ def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, fl
     return scores
 
 
+def save_json(ranked: Sequence[CoinScore], top: int, note: str, snippet: str, path: str) -> None:
+    """
+    결과를 JSON 으로 저장 (로컬 화면 `python -m kimp.webui` 가 읽는다)
+
+    화면에서 표를 다시 그리기 위한 것이라, 표에 보이는 값만 담는다.
+    """
+    import statistics as _stat
+
+    rows = []
+    for i, s in enumerate(ranked[:top], 1):
+        f = s.full
+        rows.append({
+            "rank": i, "coin": s.coin, "timeframe": s.timeframe, "score": s.score,
+            "monthly": s.monthly, "test_monthly": s.test_monthly,
+            "trades": f.trades if f else 0, "wins": f.wins if f else 0,
+            "threshold": f.threshold if f else None,
+            "holding_hours": _stat.fmean(f.holding_hours) if f and f.holding_hours else 0.0,
+            "cycle_hours": s.cycle_hours, "occupancy": s.occupancy,
+            "spread_percent": s.spread_percent, "cost_percent": s.cost_percent,
+            "funding_8h": s.funding_8h, "median": s.stats.median, "band_shift": s.stats.band_shift,
+            "upbit_krw_24h": s.live.upbit_krw_24h, "bybit_usdt_24h": s.live.bybit_usdt_24h,
+            "flags": list(s.flags),
+        })
+    data = {"created_at": datetime.now(timezone.utc).isoformat(), "note": note,
+            "env_snippet": snippet, "rows": rows}
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, ensure_ascii=False, indent=1)
+    print()
+    print(f"결과 저장: {path} (로컬 화면에서 보려면 python -m kimp.webui)")
+
+
 def default_size_usdt(settings: Settings) -> float:
     """포지션 크기: 설정값, 없으면 페이퍼 시작 자본으로 자동 계산한 값 (봇과 같은 식)"""
     if settings.position_size_usdt:
@@ -792,6 +827,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--top", type=int, default=20, help="몇 위까지 보여줄지 (기본 20)")
     parser.add_argument("--timeframe", default="15m", choices=sorted(TIMEFRAME_MS), help="캔들 간격 (기본 15m)")
     parser.add_argument("--coins", default=None, help="이 코인들만 보기 예: XRP,SOL (안 적으면 전체)")
+    parser.add_argument("--json-path", default="data/screen_latest.json",
+                        help="결과를 저장할 JSON 경로 (로컬 화면이 읽는다)")
     parser.add_argument("--refine-top", type=int, default=REFINE_TOP,
                         help=f"1단계 상위 몇 개를 짧은 봉으로 다시 평가할지 (기본 {REFINE_TOP}, 0 이면 2단계 생략)")
     parser.add_argument("--refine-timeframe", default=REFINE_TIMEFRAME, choices=sorted(TIMEFRAME_MS),
@@ -903,9 +940,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"코인 호가 간격 출처: {', '.join(f'{k} {v}개' for k, v in used.most_common())} "
             f"(호가 단위보다 좁으면 호가 단위로 올림)")
     print()
+    rough = [c for c in data if is_rough(spread_sources.get(c, ""))]
+    if rough:
+        print(f"[주의] 호가 간격을 '지금 호가' 로 잰 코인 {len(rough)}개 — 순위가 실행마다 흔들립니다.")
+        print("       봇을 페이퍼로 돌려 기록을 쌓으면 고정됩니다 (docs/commands.md '호가 기록 쌓기').")
+        print()
     print(format_table(ranked, args.top, note))
     print(LEGEND)
-    print(env_snippet(ranked, args.top, settings.max_open_positions))
+    snippet = env_snippet(ranked, args.top, settings.max_open_positions)
+    print(snippet)
+    save_json(ranked, args.top, note, snippet, args.json_path)
     return 0
 
 

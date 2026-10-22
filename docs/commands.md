@@ -66,6 +66,7 @@ python main.py
 | 펀딩비 전략 코인 순위 | `python -m kimp.carry_backtest screen` | 처음 약 2분 |
 | 펀딩비 전략 과거 시뮬레이션 | `python -m kimp.carry_backtest run --from 2026-09-22` | 처음 1~2분 |
 | 봇이 쌓은 김프 기록 분석 | `python -m kimp.report` | 몇 초 |
+| **브라우저로 보기 (설정·김프 차트·추천·시뮬 결과)** | `python -m kimp.webui` | 바로 |
 
 > 가상환경을 켠 상태 기준이다 (0-2 번). 맥에서 안 켰으면 `python` → `python3`.
 > 윈도우 venv 에는 `python3.exe` 가 없어서, 켜고도 `python3` 를 치면 **전역 파이썬**이 돌아간다 → 꼭 `python`.
@@ -145,11 +146,16 @@ COINS=CAP,SEI,LIT,GRVT,MEW,WAVES SCAN_INTERVAL_SEC=20 CARRY_ENABLED=false python
 - 봇을 두 개 돌리면 업비트 요청 제한(IP 기준 초당 10회)을 넘을 수 있다 → 기록용은 `SCAN_INTERVAL_SEC` 를 늘릴 것.
 
 ### 과거 시뮬레이션 — `python -m kimp.simulate`
+> **호가 간격 기록이 없으면 시뮬레이션이 멈춥니다.** 믿을 수 없는 숫자를 내놓지 않기 위해서입니다.
+> 같은 기간을 돌렸는데 실행마다 CAP 호가가 0.125% / 0.266% 로 잡혀서 거래 115건 / 76건,
+> 손익 +63 / +42 USDT 로 갈린 적이 있습니다. 먼저 아래 '호가 기록 쌓기' 를 하거나,
+> 대충이라도 보려면 `--rough-spread` 를 붙이세요.
 ```bash
 python -m kimp.simulate --from 2026-09-22                       # 9/22 0시부터 지금까지
 python -m kimp.simulate --from 2026-09-22 --to 2026-10-15
 python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP --verbose   # 거래 하나하나 보기
 python -m kimp.simulate --from 2026-09-22 --no-save             # 결과를 DB 에 안 남김
+python -m kimp.simulate --from 2026-09-22 --rough-spread        # 호가 기록이 없어도 '지금 호가' 로 강행
 ```
 
 ### 김프 기록 분석 — `python -m kimp.report`
@@ -158,6 +164,26 @@ python -m kimp.report              # 최근 7일
 python -m kimp.report --hours 24
 ```
 봇을 돌리면서 쌓인 기록이 있어야 나온다.
+
+### 브라우저로 보기 — `python -m kimp.webui`
+```bash
+python -m kimp.webui                 # http://127.0.0.1:8765 (브라우저가 자동으로 열림)
+python -m kimp.webui --port 9000     # 포트 바꾸기
+python -m kimp.webui --no-open       # 브라우저 자동 열기 끄기
+```
+표준 라이브러리로 만든 작은 로컬 서버다. 외부 프레임워크·CDN 을 쓰지 않아서 인터넷이 끊겨도 화면은 뜬다.
+`127.0.0.1` 에만 열려서 다른 PC 에서는 접근할 수 없고, **API 키는 화면에 보내지 않는다** (있는지 여부만).
+
+| 탭 | 내용 |
+|---|---|
+| 지금 김프 | 거래소 호가창을 그 자리에서 조회한 진입·청산 김프, 호가 간격, 펀딩비율, 테더 프리미엄. '10초마다 새로고침' 체크 가능 |
+| 김프 차트 | 코인·기간을 골라서 봇 김프 흐름을 그린다. 진입 기준선이 점선으로 같이 나와서 "얼마나 더 떨어져야 진입인지" 가 보인다 |
+| 추천 코인 | `python -m kimp.screen` 이 남긴 `data/screen_latest.json` 을 표로 (점수·점유율·호가·경고와 `.env` 붙여넣기 조각) |
+| 시뮬레이션 | `python -m kimp.simulate` 가 저장한 실행 목록. 한 줄을 누르면 거래 내역이 펼쳐진다 (`--no-save` 로 돌린 건 안 나온다) |
+| 설정 | 지금 `.env` 로 봇이 쓰는 값 (모드·레버리지·자본 비율·코인별 기준·수수료). 설정 경고도 여기 표시 |
+
+- 차트 데이터는 **봇 기록(`premium_snapshots`)이 있으면 그걸**, 없으면 과거 1분봉으로 계산한다 (화면에 출처가 표시된다).
+- 봇을 돌리는 중에도 같이 띄워도 된다 (DB 를 읽기만 한다). 단 거래소 조회가 늘어나니 '10초마다 새로고침' 은 필요할 때만 켤 것.
 
 ## 4. 펀딩비 전략 도구 (자세한 설명: [carry.md](carry.md))
 ```bash
