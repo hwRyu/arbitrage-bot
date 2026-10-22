@@ -73,20 +73,23 @@ class SnapshotBackedTest(unittest.TestCase):
         self.assertEqual(row["records"], 40)
 
     def test_premium_history_from_records(self):
-        """차트 데이터는 [시각, 가운데 김프, 진입 김프, 청산 김프] 네 칸"""
+        """차트 데이터는 지표마다 칸이 있다 (화면에서 골라 그린다)"""
         out = premium_history(self.settings, "CAP", hours=24)
         self.assertEqual(out["source"], "봇 기록")
-        self.assertEqual(len(out["points"]), 40)
-        ts, mid, entry, exit_ = out["points"][0]
-        self.assertGreater(ts, 0)
-        self.assertAlmostEqual(mid, -0.05)
-        self.assertAlmostEqual(entry, 0.16)
-        self.assertAlmostEqual(exit_, -0.26)
+        self.assertEqual(len(out["series"]), 40)
+        row = out["series"][0]
+        self.assertGreater(row["ts"], 0)
+        self.assertAlmostEqual(row["mid"], -0.05)
+        self.assertAlmostEqual(row["entry"], 0.16)
+        self.assertAlmostEqual(row["exit"], -0.26)
+        # 코인 호가 간격 = 진입 − 청산 − USDT 호가 = 0.16 + 0.26 − 0.075
+        self.assertAlmostEqual(row["spread"], 0.345, places=6)
+        self.assertAlmostEqual(row["usdt_krw"], 1_350.0)
 
     def test_premium_history_window(self):
         """요청한 시간 범위보다 오래된 기록은 빼고 준다"""
         out = premium_history(self.settings, "CAP", hours=24, now_ms=10 ** 13)  # 아주 먼 미래
-        self.assertEqual(out["points"], [])
+        self.assertEqual(out["series"], [])
 
 
 class MissingFilesTest(unittest.TestCase):
@@ -95,9 +98,57 @@ class MissingFilesTest(unittest.TestCase):
     def test_no_db_no_json(self):
         s = replace(Settings(coins=["CAP"]), db_path="없는파일.db", history_db_path="없는파일2.db")
         self.assertEqual(sim_runs(s), [])
-        self.assertEqual(premium_history(s, "CAP")["points"], [])
+        self.assertEqual(premium_history(s, "CAP")["series"], [])
         self.assertIsNone(screen_latest("없는파일3.json"))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuildCommandTest(unittest.TestCase):
+    """화면에서 받은 값 → 터미널에 치는 명령 (허용한 값만 넘어간다)"""
+
+    def test_screen(self):
+        from kimp.webui import build_command
+        cmd, env = build_command("screen", {"days": "30", "coins": "CAP,SEI", "refine_top": "20", "몰래": "rm"})
+        self.assertEqual(cmd[1:], ["-m", "kimp.screen", "--days", "30", "--coins", "CAP,SEI", "--refine-top", "20"])
+        self.assertEqual(env, {})
+
+    def test_sim_env_and_flags(self):
+        from kimp.webui import build_command
+        cmd, env = build_command("sim", {"start": "2026-09-22", "end": "2026-10-22", "coins": "CAP",
+                                         "seed": "1500", "size": "50", "rough": "1",
+                                         "thresholds": "CAP=-0.55, SEI=-0.45"})
+        self.assertIn("--rough-spread", cmd)
+        self.assertEqual(env["PAPER_INITIAL_TOTAL_USDT"], "1500")
+        self.assertEqual(env["POSITION_SIZE_USDT"], "50")
+        self.assertEqual(env["COINS"], "CAP")
+        self.assertEqual(env["CAP_ENTRY_PREMIUM_THRESHOLD_PERCENT"], "-0.55")
+        self.assertEqual(env["SEI_ENTRY_PREMIUM_THRESHOLD_PERCENT"], "-0.45")
+
+    def test_bot_is_always_paper(self):
+        """화면에서 켜는 봇은 반드시 페이퍼 (실거래를 켤 수 없다)"""
+        from kimp.webui import build_command
+        cmd, env = build_command("bot", {"coins": "CAP", "scan": "20", "quiet": "1",
+                                         "live": "1", "PAPER_TRADING": "false"})
+        self.assertEqual(cmd[1:], ["main.py"])
+        self.assertEqual(env["PAPER_TRADING"], "true")
+        self.assertEqual(env["SCAN_INTERVAL_SEC"], "20")
+        self.assertEqual(env["CARRY_ENABLED"], "false")
+        self.assertEqual(env["TELEGRAM_BOT_TOKEN"], "")
+
+    def test_unknown_kind(self):
+        from kimp.webui import build_command
+        with self.assertRaises(ValueError):
+            build_command("아무거나", {})
+
+
+class FundingConvertTest(unittest.TestCase):
+    def test_8h_conversion(self):
+        """정산 주기가 달라도 8시간 기준으로 맞춰서 비교한다"""
+        from kimp.webui import _funding_8h_percent
+        self.assertAlmostEqual(_funding_8h_percent(0.0001, 8), 0.01)     # 8시간마다 0.01%
+        self.assertAlmostEqual(_funding_8h_percent(0.0001, 1), 0.08)     # 1시간마다 → 8배
+        self.assertAlmostEqual(_funding_8h_percent(0.0001, 4), 0.02)
+        self.assertIsNone(_funding_8h_percent(None, 8))
