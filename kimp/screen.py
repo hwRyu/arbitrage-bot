@@ -84,7 +84,13 @@ logger = logging.getLogger(__name__)
 DAY_MS = 86_400_000
 
 # 캔들 간격 이름 → 밀리초
-TIMEFRAME_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
+TIMEFRAME_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
+
+# 2단계(정밀 재평가) 기본값: 1단계에서 고른 상위 몇 개를, 어떤 봉으로 다시 볼지
+# 1분봉이 시뮬레이션과 같은 기준이다. 15분봉으로만 보면 짧게 내려갔다 올라온 기회를 못 봐서
+# 스크리너 순위와 시뮬레이션 결과가 어긋난다 (CAP: 15분봉 9건 vs 1분봉 80건)
+REFINE_TOP = 20
+REFINE_TIMEFRAME = "1m"
 
 # 스테이블코인은 김프 헷지 대상이 아님 (가격이 안 움직이니 기회도 없음)
 STABLECOINS = {"USDT", "USDC", "DAI", "USDE", "FDUSD", "TUSD", "USD1", "PYUSD", "USDS", "BUSD"}
@@ -438,6 +444,7 @@ class CoinScore:
     test_days: float
     flags: List[str] = field(default_factory=list)
     cycle_good_hours: float = CYCLE_GOOD_HOURS
+    timeframe: str = ""  # 이 점수를 어떤 봉으로 계산했는지 (2단계에서 1분봉으로 다시 본 코인 구분)
 
     @property
     def abnormal(self) -> bool:
@@ -599,7 +606,7 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
         "점수 = min(전체 월수익, 검증 월수익) ÷ 자리 점유율 × 띠 가중치 · 수익은 포지션 금액 대비 % "
         "(한 번에 포지션 1개, 펀딩비 포함)",
         "",
-        f"{'순위':>3} {'코인':<7}{'점수':>6} {'전체/월':>7} {'검증/월':>7} {'거래':>4} {'승':>3} "
+        f"{'순위':>3} {'코인':<7}{'봉':>4}{'점수':>7} {'전체/월':>7} {'검증/월':>7} {'거래':>4} {'승':>3} "
         f"{'진입기준':>7} {'보유h':>5} {'주기h':>5} {'점유':>5} {'가중':>4} │ {'중간값':>6} {'범위(5~95%)':>13} {'횡보':>4} "
         f"{'띠이동':>5} {'반감h':>5} "
         f"│ {'호가':>5} {'비용':>5} {'업비트(억)':>9} {'바이비트(M$)':>11} {'펀딩/8h':>7}  경고",
@@ -608,7 +615,7 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
         f = s.full
         hold = statistics.fmean(f.holding_hours) if f and f.holding_hours else 0.0
         lines.append(
-            f"{i:>3}. {s.coin:<7}{(f'{s.score:+.2f}' if f else '-'):>6} {s.monthly:>+7.2f} {s.test_monthly:>+7.2f} "
+            f"{i:>3}. {s.coin:<7}{s.timeframe:>4}{(f'{s.score:+.2f}' if f else '-'):>7} {s.monthly:>+7.2f} {s.test_monthly:>+7.2f} "
             f"{(f.trades if f else 0):>4} {(f.wins if f else 0):>3} "
             f"{(f'{f.threshold:+.2f}' if f else '-'):>7} {hold:>5.1f} {_hl(s.cycle_hours):>5} "
             f"{s.occupancy * 100:>4.0f}% {s.weight:>4.2f} │ "
@@ -622,6 +629,7 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
 
 LEGEND = """
 열 설명
+  봉       이 점수를 계산한 캔들 간격. 1m = 2단계에서 시뮬레이션과 같은 기준으로 다시 본 코인
   전체/월  전체 기간에 가장 좋았던 진입 기준으로 돌렸을 때 월 환산 수익 (%)
   검증/월  앞 2/3 기간에서 고른 기준을 뒤 1/3 기간에 그대로 썼을 때 월 환산 수익 (%)
   거래/승  전체 기간 닫은 거래 수 / 그중 이익 / 진입기준: 그때 쓴 진입 김프 기준 (%)
@@ -713,6 +721,60 @@ def fetch_live(md, coins: List[str]) -> Dict[str, CoinLive]:
     return live
 
 
+def load_series(store: HistoryStore, md, coins: Sequence[str], timeframe: str, start_ms: int, now_ms: int,
+                src, retrying, with_funding: bool = True, progress: bool = True):
+    """
+    코인별 (업비트 종가, 바이비트 종가, 펀딩비 기록) 받아오기
+
+    Returns:
+        ({코인: (업비트, 바이비트, 펀딩)}, 업비트 USDT 종가, USDT 호가 간격 %, 지금 USDT 가격)
+        USDT 캔들을 못 받으면 (None, ...) 가 아니라 빈 dict 와 None 들을 돌려준다
+    """
+    bar_ms = TIMEFRAME_MS[timeframe]
+    store.ensure_candles(src(UPBIT_USDT, timeframe), "USDT", start_ms, now_ms,
+                         ccxt_candle_fetcher(md.upbit, USDT_KRW_SYMBOL, timeframe), step_ms=bar_ms)
+    usdt = store.load_closes(src(UPBIT_USDT, timeframe), "USDT", start_ms, now_ms)
+    if not usdt:
+        return {}, {}, None, None
+    data = {}
+    for i, c in enumerate(coins, 1):
+        if progress:
+            print(f"  [{i}/{len(coins)}] {c}        ", end='\r')
+        try:
+            store.ensure_candles(src(UPBIT, timeframe), c, start_ms, now_ms,
+                                 retrying(ccxt_candle_fetcher(md.upbit, upbit_symbol(c), timeframe)), step_ms=bar_ms)
+            store.ensure_candles(src(BYBIT, timeframe), c, start_ms, now_ms,
+                                 retrying(ccxt_candle_fetcher(md.bybit, bybit_symbol(c), timeframe)), step_ms=bar_ms)
+            if with_funding:
+                store.ensure_funding(c, start_ms, now_ms, retrying(ccxt_funding_fetcher(md.bybit, bybit_symbol(c))))
+        except Exception as exc:
+            print('\n' + f"  {c} 데이터 받기 실패 (건너뜀): {exc}")
+            continue
+        data[c] = (store.load_closes(src(UPBIT, timeframe), c, start_ms, now_ms),
+                   store.load_closes(src(BYBIT, timeframe), c, start_ms, now_ms),
+                   [r for r in store.load_funding(c, start_ms, now_ms) if r[0] < now_ms])
+    if progress:
+        print("")  # 한 줄 띄우기
+    return data, usdt, usdt_tick_percent(list(usdt.values())), usdt[max(usdt)]
+
+
+def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, float], usdt_spread: float,
+                 fixed: float, target: float, stop: float, live: Dict[str, CoinLive],
+                 size: float, cycle_hours: float) -> List[CoinScore]:
+    """받아둔 종가로 코인마다 점수 계산 (호가 간격은 미리 정해둔 resolved 값 사용)"""
+    bar_ms = TIMEFRAME_MS[timeframe]
+    scores = []
+    for c, (up, by, funding) in data.items():
+        floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
+        spread = max(resolved.get(c, 0.0), floor)
+        s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, days, spread, usdt_spread,
+                          fixed, target, stop, funding, live[c], size, cycle_hours)
+        if s:
+            s.timeframe = timeframe
+            scores.append(s)
+    return scores
+
+
 def default_size_usdt(settings: Settings) -> float:
     """포지션 크기: 설정값, 없으면 페이퍼 시작 자본으로 자동 계산한 값 (봇과 같은 식)"""
     if settings.position_size_usdt:
@@ -730,6 +792,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--top", type=int, default=20, help="몇 위까지 보여줄지 (기본 20)")
     parser.add_argument("--timeframe", default="15m", choices=sorted(TIMEFRAME_MS), help="캔들 간격 (기본 15m)")
     parser.add_argument("--coins", default=None, help="이 코인들만 보기 예: XRP,SOL (안 적으면 전체)")
+    parser.add_argument("--refine-top", type=int, default=REFINE_TOP,
+                        help=f"1단계 상위 몇 개를 짧은 봉으로 다시 평가할지 (기본 {REFINE_TOP}, 0 이면 2단계 생략)")
+    parser.add_argument("--refine-timeframe", default=REFINE_TIMEFRAME, choices=sorted(TIMEFRAME_MS),
+                        help=f"2단계에서 쓸 캔들 간격 (기본 {REFINE_TIMEFRAME} = 시뮬레이션과 같은 기준)")
     parser.add_argument("--end", default=None,
                         help="이 날짜(한국 시간)까지의 데이터로 순위 매기기 예: 2026-09-22 (안 적으면 지금). "
                              "과거 한 달로 고르고 다음 한 달에 시뮬레이션해 보는 검증용")
@@ -775,37 +841,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"{args.end} 까지의 데이터로 봅니다 (거래량·호가 간격·물량은 '지금' 값이라 참고만)")
     start_ms = now_ms - int(args.days * DAY_MS)
     store = HistoryStore(make_history_session_factory(settings.history_db_path))
-    src = lambda s: f"{s}@{args.timeframe}"  # 1분봉(시뮬레이션용)과 따로 저장
+    def src(base: str, timeframe: str) -> str:
+        """
+        캔들 저장 이름. 1분봉은 시뮬레이션과 **같은 이름**으로 저장해서 서로 재사용한다.
+        (1분봉 외에는 'upbit@15m' 처럼 간격을 붙여 따로 저장)
+        """
+        return base if timeframe == "1m" else f"{base}@{timeframe}"
+
     retrying = lambda fetch: (lambda *a: with_retry(fetch, *a))
 
-    print(f"{args.timeframe} 캔들 받는 중 (처음엔 시간이 걸리고, 다음부터는 모자란 구간만 받음)...")
-    store.ensure_candles(src(UPBIT_USDT), "USDT", start_ms, now_ms,
-                         ccxt_candle_fetcher(md.upbit, USDT_KRW_SYMBOL, args.timeframe), step_ms=bar_ms)
-    usdt = store.load_closes(src(UPBIT_USDT), "USDT", start_ms, now_ms)
-    if not usdt:
+    print(f"1단계: {args.timeframe} 캔들 받는 중 (처음엔 시간이 걸리고, 다음부터는 모자란 구간만 받음)...")
+    data, usdt, usdt_spread, usdt_now = load_series(store, md, coins, args.timeframe, start_ms, now_ms, src, retrying)
+    if not data:
         print("업비트 USDT 캔들을 못 받았습니다.")
         return 2
-    usdt_spread = usdt_tick_percent(list(usdt.values()))
-    usdt_now = usdt[max(usdt)]
 
-    data = {}
-    for i, c in enumerate(coins, 1):
-        print(f"  [{i}/{len(coins)}] {c}        ", end="\r")
-        try:
-            store.ensure_candles(src(UPBIT), c, start_ms, now_ms,
-                                 retrying(ccxt_candle_fetcher(md.upbit, upbit_symbol(c), args.timeframe)),
-                                 step_ms=bar_ms)
-            store.ensure_candles(src(BYBIT), c, start_ms, now_ms,
-                                 retrying(ccxt_candle_fetcher(md.bybit, bybit_symbol(c), args.timeframe)),
-                                 step_ms=bar_ms)
-            store.ensure_funding(c, start_ms, now_ms, retrying(ccxt_funding_fetcher(md.bybit, bybit_symbol(c))))
-        except Exception as exc:
-            print(f"\n  {c} 데이터 받기 실패 (건너뜀): {exc}")
-            continue
-        data[c] = (store.load_closes(src(UPBIT), c, start_ms, now_ms),
-                   store.load_closes(src(BYBIT), c, start_ms, now_ms),
-                   [r for r in store.load_funding(c, start_ms, now_ms) if r[0] < now_ms])
-    print("")  # 한 줄 띄우기
     print(f"지금 호가창 확인 중... ({LIVE_SAMPLES}번 재서 중간값. 한 번만 재면 그 순간 호가에 순위가 휘둘린다)")
     books = median_spread_depth(md, list(data), usdt_now, retry=with_retry,
                                 progress=lambda n, total: print(f"  {n}/{total}번째", flush=True))
@@ -813,21 +863,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     resolved, spread_sources = resolve_spreads(list(data), settings.db_path,
                                                settings.sim_default_spread_percent,
                                                {c: v[0] for c, v in books.items()})
+    for c in data:
+        live[c].spread_percent, live[c].depth_usdt = books.get(c, (None, None))
 
-    scores = []
-    for c, (up, by, funding) in data.items():
-        spread_live, depth = books.get(c, (None, None))
-        live[c].spread_percent, live[c].depth_usdt = spread_live, depth
-        floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
-        spread = max(resolved[c], floor)
-        s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, args.days, spread, usdt_spread,
-                          fixed, target, settings.stop_loss_percent, funding, live[c], size, args.cycle_hours)
-        if s:
-            scores.append(s)
+    scores = evaluate_all(data, usdt, args.timeframe, args.days, resolved, usdt_spread, fixed, target,
+                          settings.stop_loss_percent, live, size, args.cycle_hours)
+
+    # 2단계: 1단계 상위 코인만 더 짧은 봉으로 다시 평가 (시뮬레이션과 같은 기준으로 맞추기)
+    refined_timeframe = None
+    if args.refine_top and args.refine_timeframe != args.timeframe:
+        picks = [x.coin for x in rank(scores) if not x.abnormal][:args.refine_top]
+        if picks:
+            refined_timeframe = args.refine_timeframe
+            print(f"2단계: 상위 {len(picks)}개를 {refined_timeframe} 봉으로 다시 평가합니다 "
+                  f"({args.timeframe} 봉은 짧게 벌어졌다 메워진 기회를 놓칩니다. "
+                  f"받은 1분봉은 시뮬레이션에서도 그대로 쓰입니다)")
+            r_bar = TIMEFRAME_MS[refined_timeframe]
+            r_now = now_ms // r_bar * r_bar
+            r_start = r_now - int(args.days * DAY_MS)
+            r_data, r_usdt, r_usdt_spread, _ = load_series(store, md, picks, refined_timeframe, r_start, r_now,
+                                                           src, retrying, with_funding=False)
+            if r_data:
+                refined = evaluate_all(r_data, r_usdt, refined_timeframe, args.days, resolved, r_usdt_spread,
+                                       fixed, target, settings.stop_loss_percent, live, size, args.cycle_hours)
+                done = {x.coin for x in refined}
+                scores = refined + [x for x in scores if x.coin not in done]
+                usdt_spread = r_usdt_spread
+            else:
+                print("  2단계 캔들을 못 받아서 1단계 결과로 보여줍니다.")
+                refined_timeframe = None
 
     ranked = rank(scores)
     used = Counter(spread_sources[s.coin] for s in scores)
-    note = (f"{'~' + args.end + ' ' if args.end else '최근 '}{args.days:g}일 · {args.timeframe}봉 · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
+    bars = (f"{args.timeframe}봉 → 상위 {args.refine_top}개는 {refined_timeframe}봉 재평가"
+            if refined_timeframe else f"{args.timeframe}봉")
+    note = (f"{'~' + args.end + ' ' if args.end else '최근 '}{args.days:g}일 · {bars} · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
             f"손절 {settings.stop_loss_percent:g}% · 포지션 {size:,.0f} USDT · "
             f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}%\n"
             f"코인 호가 간격 출처: {', '.join(f'{k} {v}개' for k, v in used.most_common())} "

@@ -184,6 +184,25 @@ class ScoreTest(unittest.TestCase):
         self.assertLessEqual(used, 3 * 0.8 + 1e-9)
         self.assertIn("자리가 모자라 빠진 코인", out)
 
+    def test_timeframe_recorded(self):
+        """2단계에서 다시 본 코인을 구분하려고 어떤 봉으로 평가했는지 남긴다"""
+        from kimp.screen import evaluate_all
+        up = {i * 900_000: 100.0 for i in range(300)}
+        by = {i * 900_000: 1.0 for i in range(300)}
+        usdt = {i * 900_000: 100.0 for i in range(300)}
+        scores = evaluate_all({"X": (up, by, [])}, usdt, "15m", days=3.0, resolved={"X": 0.05},
+                              usdt_spread=0.05, fixed=0.4, target=1.0, stop=-5.0,
+                              live={"X": CoinLive()}, size=1000, cycle_hours=24.0)
+        for s in scores:
+            self.assertEqual(s.timeframe, "15m")
+
+    def test_cache_name_shares_1m_with_simulate(self):
+        """1분봉은 시뮬레이션과 같은 이름으로 저장해서 서로 재사용한다 (15분봉은 따로)"""
+        def src(base, timeframe):  # screen.main 안의 규칙과 같은 식
+            return base if timeframe == "1m" else f"{base}@{timeframe}"
+        self.assertEqual(src("upbit", "1m"), "upbit")
+        self.assertEqual(src("upbit", "15m"), "upbit@15m")
+
     def test_abnormal_goes_last(self):
         wave = ([-1.5] * 5 + [0.8] * 5) * 30
         bad = self._eval("BAD", [v - 20 for v in wave])  # 김프 -20% 근처: 입출금 막힘 같은 상황
