@@ -75,6 +75,7 @@ class Trade:
         return self.net_usdt - self.funding_usdt + self.cost_usdt
 
     def as_dict(self) -> Dict[str, Any]:
+        """화면에 보낼 모양 (JSON). 시각은 밀리초 숫자로 보내고 화면에서 한국 시간으로 바꾼다"""
         return {
             "id": self.id, "coin": self.coin, "opened_ms": self.opened_ms, "closed_ms": self.closed_ms,
             "entry_premium": self.entry_premium, "exit_premium": self.exit_premium,
@@ -104,6 +105,10 @@ def _kst_date(ms: int) -> str:
 
 
 def _from_position(p: Position) -> Trade:
+    """봇이 남긴 포지션 → Trade (실거래·드라이런·페이퍼 공통)
+
+    net_pnl_usdt 등이 비어 있을 수 있다 (청산 중에 꺼진 경우) → 0 으로 본다.
+    """
     return Trade(
         id=p.id, coin=p.coin, opened_ms=_ms(p.opened_at) or 0, closed_ms=_ms(p.closed_at),
         entry_premium=p.entry_premium, exit_premium=p.exit_premium, exit_reason=p.exit_reason,
@@ -114,6 +119,11 @@ def _from_position(p: Position) -> Trade:
 
 
 def _from_sim_trade(t: SimTrade) -> Trade:
+    """시뮬레이션 거래 → Trade (봇 포지션과 같은 모양으로 맞춘다)
+
+    시뮬레이션은 포지션 금액을 따로 적지 않아서 손익 ÷ 손익률 로 거꾸로 구한다.
+    예) 1.0 USDT / 2.0% → 50 USDT. 손익률이 0 이면 구할 수 없어 None 이다.
+    """
     return Trade(
         id=t.id, coin=t.coin, opened_ms=_ms(t.opened_at) or 0, closed_ms=_ms(t.closed_at),
         entry_premium=t.entry_premium, exit_premium=t.exit_premium, exit_reason=t.exit_reason,

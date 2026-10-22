@@ -294,6 +294,7 @@ def _funding_8h_percent(rate: Optional[float], interval_hours: Optional[float]) 
 
 
 def _utc():
+    """UTC 시간대 (SQLite 가 시간대 없이 저장하므로 읽을 때 붙여 준다)"""
     from datetime import timezone
     return timezone.utc
 
@@ -654,7 +655,10 @@ def start_job(kind: str, params: Dict[str, str]) -> Dict[str, Any]:
     JOBS[job_id] = job
 
     def reader():
-        # 진행률 표시는 캐리지리턴으로 한 줄을 덮어쓴다 → 마지막 조각만 남긴다
+        """자식 프로세스 출력을 읽어 로그에 쌓는다 (따로 스레드)
+
+        진행률 표시는 캐리지리턴으로 한 줄을 덮어쓴다 → 마지막 조각만 남긴다.
+        """
         for line in proc.stdout:
             text = line.rstrip().split('\r')[-1]
             if text:
@@ -692,15 +696,22 @@ class Handler(BaseHTTPRequestHandler):
     market = None  # 거래소 조회는 처음 쓸 때 한 번만 만든다 (마켓 정보 받기가 몇 초 걸린다)
 
     def _market(self):
+        """거래소 조회 객체 (처음 쓸 때 한 번만 만든다)
+
+        MarketData 를 만들 때 마켓 정보를 받아오느라 몇 초 걸린다. 화면을 띄울 때마다
+        만들면 느려서, 클래스 변수에 한 번만 만들어 두고 모든 요청이 같이 쓴다.
+        """
         if Handler.market is None:
             from kimp.market_data import MarketData
             Handler.market = MarketData(depth=self.settings.orderbook_depth)
         return Handler.market
 
-    def log_message(self, fmt, *args):  # 요청마다 찍히는 기본 로그는 끈다
+    def log_message(self, fmt, *args):
+        """요청마다 찍히는 기본 접근 로그를 끈다 (브라우저가 초마다 부르면 터미널이 안 보인다)"""
         pass
 
     def _send(self, body: bytes, content_type: str, status: int = 200) -> None:
+        """응답 보내기. Cache-Control: no-store 로 브라우저가 옛 값을 보여주지 않게 한다"""
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -709,9 +720,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, data: Any, status: int = 200) -> None:
+        """JSON 응답 (ensure_ascii=False — 한글을 그대로 보낸다)"""
         self._send(json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", status)
 
     def do_GET(self) -> None:  # noqa: N802 (http.server 규칙)
+        """
+        주소별 처리 (이 화면은 GET 만 쓴다)
+
+        마지막에 모든 예외를 받아 **500 + 메시지로 돌려준다.** 그러지 않으면 조회 한 번
+        실패에 서버가 응답을 끊어서 화면 전체가 '불러오지 못했습니다' 가 된다.
+        실행 명령(/api/run)도 GET 이다 — 혼자 쓰는 로컬 도구라 127.0.0.1 에만 열고,
+        받을 수 있는 값을 정해진 목록으로 제한했다 (build_command).
+        """
         url = urlparse(self.path)
         query = parse_qs(url.query)
         try:
@@ -797,6 +817,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """
+    화면 서버 띄우기 (python -m kimp.webui)
+
+    127.0.0.1 에만 연다 — 다른 PC 에서는 접근할 수 없다. 혼자 쓰는 도구라 로그인이 없고,
+    실행 명령(/api/run)까지 열려 있으므로 **외부에 열면 안 된다.**
+    봇을 돌리는 중에 같이 띄워도 된다 (DB 를 읽기만 한다).
+    """
     parser = argparse.ArgumentParser(description="작은 로컬 화면 (설정·김프 차트·추천 코인·시뮬레이션 결과)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"포트 (기본 {DEFAULT_PORT})")
     parser.add_argument("--no-open", action="store_true", help="브라우저를 자동으로 열지 않음")

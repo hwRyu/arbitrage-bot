@@ -63,10 +63,15 @@ class CostItem:
     detail: str
 
     def as_dict(self) -> Dict[str, Any]:
+        """화면에 보낼 모양 (JSON). detail 은 사람이 읽는 근거 글이다"""
         return {"key": self.key, "name": self.name, "percent": self.percent, "detail": self.detail}
 
 
 def _median(values: Sequence[Optional[float]]) -> Optional[float]:
+    """None 을 뺀 중간값 (값이 하나도 없으면 None)
+
+    평균이 아니라 중간값을 쓰는 이유: 호가·펀딩비는 가끔 튀는 값이 섞여서 평균이 끌려간다.
+    """
     ok = [v for v in values if v is not None]
     return statistics.median(ok) if ok else None
 
@@ -169,6 +174,7 @@ class Levels:
     still_holding: bool  # 기간 끝에 아직 들고 있었나
 
     def as_dict(self) -> Dict[str, Any]:
+        """화면에 보낼 모양 (JSON)"""
         return {"lcl": self.lcl, "ucl": self.ucl, "round_trips": self.round_trips,
                 "entries": self.entries, "avg_hold_hours": self.avg_hold_hours,
                 "still_holding": self.still_holding}
@@ -228,6 +234,11 @@ def best_levels(points: Sequence[Tuple[int, float]], gap: float,
         return count_round_trips(points, lo, lo + gap), []
 
     def rank(x: Levels):
+        """고르는 순서: 왕복 많은 것 → 평균 보유 짧은 것 → LCL 낮은 것
+
+        보유 시간을 두 번째로 보는 이유: 자리를 빨리 비우는 쪽이 다른 코인의 진입을 안 막는다.
+        보유 시간이 없으면(왕복 0회) 1e9 로 밀어서 맨 뒤로 보낸다.
+        """
         return (-x.round_trips, x.avg_hold_hours if x.avg_hold_hours is not None else 1e9, x.lcl)
 
     found.sort(key=rank)
