@@ -258,14 +258,17 @@ class TopQuote:
 
     @property
     def upbit_mid(self) -> float:
+        """업비트 가운데 가격 = (매수호가 + 매도호가) ÷ 2. 실제로 체결되는 가격은 아니다"""
         return (self.upbit_bid + self.upbit_ask) / 2
 
     @property
     def bybit_mid(self) -> float:
+        """바이비트 가운데 가격"""
         return (self.bybit_bid + self.bybit_ask) / 2
 
     @property
     def usdt_mid(self) -> float:
+        """업비트 USDT/KRW 가운데 가격 (김프 계산의 분모)"""
         return (self.usdt_bid + self.usdt_ask) / 2
 
     @property

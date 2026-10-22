@@ -309,6 +309,13 @@ def run_simulation(
     시뮬레이션 실행 (데이터는 이미 준비돼 있어야 함)
 
     포지션/잔고는 메모리 DB 에서만 움직이고 실시간 봇 DB 는 건드리지 않는다.
+
+    **실시간 봇과 똑같은 엔진·브로커를 쓴다.** 시뮬레이션용 판단 코드를 따로 두면 두 쪽이
+    갈라져서, 백테스트에서 좋던 전략이 실거래에서 다르게 움직인다. 그래서 바꿔 끼우는 것은
+    세 개뿐이다 — 시세(HistoricalMarket), 시계(SimClock), 환율(SimFx).
+
+    1분씩 시계를 밀면서 engine.step() 을 한 번씩 부른다. 즉 실거래에서 20초마다 하는 판단을
+    여기서는 1분마다 하는 것이고, 그래서 1분봉보다 짧은 기회는 못 본다.
     """
     # 시뮬레이션용 설정: 메모리 DB, 김프 기록/현황 로그는 끔 (필요 없고 느려짐)
     sim_settings = replace(settings, db_path=":memory:", snapshot_interval_sec=float("inf"))
@@ -320,6 +327,8 @@ def run_simulation(
                          upbit_min_order_krw=settings.upbit_min_order_krw, **broker_kwargs(settings, safety))
     engine = Engine(sim_settings, market, fx, broker, session_factory, list(coins), clock=clock)
 
+    # 첫 봉이 '막 끝난' 시각에서 시작한다. 봉 시작 시각으로 두면 아직 안 끝난 봉의 종가를
+    # 보게 되어 미래를 엿보는 셈이 된다 (look-ahead).
     clock.now_sec = (start_ms + MINUTE_MS) / 1000
     engine.startup()
     result = SimResult(
@@ -332,6 +341,7 @@ def run_simulation(
     total = (end_ms - start_ms) // MINUTE_MS
     last_quotes: Dict[str, Quote] = {}
     for i, minute in enumerate(range(start_ms, end_ms, MINUTE_MS)):
+        # 이 분봉이 막 끝난 순간으로 시계를 맞춘 뒤 판단한다 (그 봉의 종가까지만 알 수 있다)
         clock.now_sec = (minute + MINUTE_MS) / 1000  # 이 분봉이 막 끝난 순간
         engine.step()
         quotes = market.fetch_quotes(list(coins))

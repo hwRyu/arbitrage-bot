@@ -312,15 +312,22 @@ def run_swing(series: Sequence[Tuple[int, float]], threshold: float, costs: Swin
     net = 0.0
     for ts, p in series:
         # 이번 봉까지 지나간 펀딩비 정산 반영 (들고 있을 때만)
+        # fi 를 앞으로만 움직여서 펀딩비를 두 번 세지 않는다 (봉마다 처음부터 훑으면 O(n²)).
+        # '들고 있을 때 + 진입 시각 이후' 정산만 더한다 — 진입 전 정산은 우리 돈이 아니다.
         while fi < len(funding) and funding[fi][0] <= ts:
             if entry is not None and funding[fi][0] > entry[0]:
                 fund += funding[fi][1] * 100  # 비율 0.0001 → 0.01%
             fi += 1
         if entry is None:
+            # 진입 판단은 **종가에 호가 간격을 더한 값**으로 한다 (살 때는 불리한 쪽이므로).
+            # 종가 그대로 판단하면 실제로는 못 들어갈 자리에 들어간 것으로 계산돼 가짜 수익이 난다.
             if p + costs.leg_spread <= threshold:
                 entry, fund = (ts, p + costs.leg_spread), 0.0
                 net = -2 * costs.leg_spread - costs.fixed  # 바로 판다면 (호가 간격 + 수수료만큼 손해)
             continue
+        # 평가 순손익: 청산은 종가에서 호가 간격을 **빼고**(팔 때도 불리한 쪽), 진입 김프를 빼고,
+        # 수수료·전송비를 빼고, 그동안 받은(낸) 펀딩비를 더한다.
+        # 호가 간격이 진입·청산에 한 번씩 들어가므로 왕복으로 2배가 비용이 된다.
         net = (p - costs.leg_spread) - entry[1] - costs.fixed + fund
         res.worst = min(res.worst, net)
         hit_target = net >= costs.target
@@ -332,6 +339,8 @@ def run_swing(series: Sequence[Tuple[int, float]], threshold: float, costs: Swin
             res.funding += fund
             res.holding_hours.append((ts - entry[0]) / 3_600_000)
             entry = None
+    # 기간이 끝났는데 아직 들고 있으면 '닫은 거래' 로 세지 않고 따로 표시한다.
+    # 닫지 못한 것을 수익으로 세면, 끝까지 물려 있던 코인이 좋아 보이게 된다 (물림 경고).
     if entry is not None:
         res.is_open_at_end = True
         res.open_net = net
@@ -345,6 +354,9 @@ def threshold_candidates(series: Sequence[Tuple[int, float]], leg_spread: float)
 
     예) 진입 김프가 하위 5% 일 때 -0.83% → 후보 -0.85
     """
+    # 기준 후보를 '그 코인이 실제로 지나간 김프 분포' 에서 뽑는다. 고정 격자(-0.1, -0.2 …)로
+    # 훑으면 김프가 늘 +0.2 근처인 코인은 후보가 전부 통과하거나 전부 탈락해 비교가 안 된다.
+    # 0.05% 단위로 둥글리는 이유: 소수점까지 맞춘 기준은 그 기간에만 맞는 과최적화다.
     entries = [p + leg_spread for _, p in series]
     return sorted({round(round(quantile(entries, q) / 0.05) * 0.05, 2) for q in THRESHOLD_QUANTILES})
 
@@ -363,7 +375,9 @@ def best_swing(series: Sequence[Tuple[int, float]], costs: SwingCosts,
     for t in candidates:
         r = run_swing(series, t, costs, funding)
         if r.trades == 0:
-            continue
+            continue  # 한 번도 못 닫은 기준은 '통했다' 고 볼 수 없다
+        # 총손익이 같으면 거래가 많은 쪽을 고른다 — 한 번 크게 번 것보다 여러 번 반복된 쪽이
+        # 다음 기간에도 재현될 가능성이 높다.
         if best is None or (r.total, r.trades) > (best.total, best.trades):
             best = r
     return best

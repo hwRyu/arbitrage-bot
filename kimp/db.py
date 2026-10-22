@@ -249,6 +249,7 @@ class Transfer(Base):
 
     @property
     def to_bybit(self) -> bool:
+        """업비트 → 바이비트 방향인가 (수수료·입금 확인 쪽이 방향마다 달라서 자주 묻는다)"""
         return self.direction == "upbit->bybit"
 
 

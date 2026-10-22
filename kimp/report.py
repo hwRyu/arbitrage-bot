@@ -110,6 +110,8 @@ def _percentile(sorted_values: Sequence[float], p: float) -> float:
     """
     if not sorted_values:
         raise ValueError("값이 없습니다")
+    # 두 값 사이에 걸치면 비율만큼 섞는다 (선형 보간). 그냥 반올림하면 값이 띄엄띄엄 튀어서
+    # 진입 기준을 정할 때 0.05%p 단위로 흔들린다.
     k = (len(sorted_values) - 1) * p / 100
     lo, hi = int(k), min(int(k) + 1, len(sorted_values) - 1)
     return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (k - lo)

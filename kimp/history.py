@@ -186,10 +186,16 @@ class HistoryStore:
 
     # ---------------- 받아본 구간 ----------------
     def _have(self, session: Session, kind: str, coin: str) -> List[Tuple[int, int]]:
+        """이미 받아 본 구간들 [(시작, 끝), ...]
+
+        '캔들이 있나' 로 판단하면 안 된다 — 거래가 없어서 캔들이 비는 구간이 실제로 있고,
+        그걸 '못 받았다' 로 보면 매번 다시 받으러 간다. 그래서 받아 본 구간을 따로 적어 둔다.
+        """
         rows = session.scalars(select(FetchedRange).where(FetchedRange.kind == kind, FetchedRange.coin == coin))
         return [(r.start_ms, r.end_ms) for r in rows]
 
     def _mark(self, session: Session, kind: str, coin: str, start: int, end: int) -> None:
+        """이 구간을 받아 봤다고 적어 둔다 (다음에 건너뛰려고)"""
         session.add(FetchedRange(kind=kind, coin=coin, start_ms=start, end_ms=end))
 
     # ---------------- 캔들 ----------------
@@ -371,6 +377,7 @@ def ccxt_candle_fetcher(exchange, symbol: str, timeframe: str = "1m") -> Callabl
     limit = 200 if exchange.id == "upbit" else 1000
 
     def fetch(since_ms: int, _limit: int) -> List[list]:
+        """한 번 받기. _limit 은 쓰지 않는다 — 거래소가 정한 상한(위 limit)을 쓴다"""
         return _retry(lambda: exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit),
                       f"{exchange.id} {symbol} 캔들")
 
@@ -381,6 +388,11 @@ def ccxt_funding_fetcher(exchange, symbol: str) -> Callable[[int], List[Tuple[in
     """ccxt 바이비트로 펀딩비 이력을 받아오는 함수 만들기"""
 
     def fetch(since_ms: int) -> List[Tuple[int, float]]:
+        """한 칸(FUNDING_WINDOW_MS) 안의 펀딩 정산만 받는다
+
+        until 을 안 주면 바이비트가 since 부터 최근까지 아무렇게나 200개를 주는데, 그러면
+        중간이 비는지 알 수 없다. 칸을 정해서 받으면 '이 칸은 받아 봤다' 고 기록할 수 있다.
+        """
         until = since_ms + FUNDING_WINDOW_MS - 1  # 이 칸 안의 정산만 (설명: FUNDING_WINDOW_MS)
         rows = _retry(lambda: exchange.fetch_funding_rate_history(
             symbol, since=since_ms, limit=200, params={"until": until}), f"{symbol} 펀딩비")
