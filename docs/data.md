@@ -295,6 +295,14 @@ SELECT source, COUNT(*) AS 개수, COUNT(DISTINCT coin) AS 코인수 FROM candle
 같은 구간은 다시 받지 않으므로, 매일 돌리면 하루치(코인당 약 0.26MB)만 늘어난다.
 폭증하는 건 **새 코인·새 간격을 처음 받을 때**뿐이다.
 
+### 미리 받아두기
+```bash
+python -m kimp.history fetch --coins CAP,SEI --days 30              # 1분봉 30일치
+python -m kimp.history fetch --coins CAP --days 7 --timeframe 15m
+```
+시뮬레이션·차트는 필요한 구간을 그때그때 받는다. 미리 받아두면 그다음부터 바로 그려진다.
+로컬 화면 '데이터' 탭에서도 할 수 있다.
+
 ### 정리 명령 (직접 SQL 쓰지 말 것)
 ```bash
 python -m kimp.history info                      # 간격별 개수·크기·기간

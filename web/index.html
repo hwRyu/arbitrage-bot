@@ -84,6 +84,7 @@
   <button data-tab="screen">추천 코인</button>
   <button data-tab="sim">시뮬레이션</button>
   <button data-tab="bot">페이퍼 봇</button>
+  <button data-tab="data">데이터</button>
   <button data-tab="config">설정</button>
 </div>
 
@@ -196,6 +197,40 @@
     <div class="wrap"><table id="botDone"></table></div>
   </section>
 
+  <section id="data">
+    <div class="cards" id="dataCards"></div>
+    <h3 style="font-size:14px;margin:18px 0 8px">간격별 캔들</h3>
+    <div class="wrap"><table id="dataTable"></table></div>
+
+    <h3 style="font-size:14px;margin:20px 0 8px">미리 받아두기</h3>
+    <div class="panel">
+      <div class="row">
+        <label>코인 <input id="fcCoins" placeholder="CAP,SEI (쉼표로)" style="width:220px"></label>
+        <label>기간 <input id="fcDays" type="number" value="30" min="1" max="365" style="width:70px">일</label>
+        <label>간격
+          <select id="fcTf"><option value="1m" selected>1분봉 (시뮬레이션과 같음)</option>
+            <option value="5m">5분봉</option><option value="15m">15분봉</option></select>
+        </label>
+        <button class="act" id="fcRun">받아오기</button>
+      </div>
+      <div class="row"><span class="muted">코인 1개 30일 1분봉이 약 7.7MB · 20초쯤 걸립니다. 이미 받은 구간은 다시 받지 않습니다.</span></div>
+    </div>
+
+    <h3 style="font-size:14px;margin:20px 0 8px">정리하기</h3>
+    <div class="panel">
+      <div class="row">
+        <label>간격 <select id="prSource"></select></label>
+        <label>이것보다 오래된 것만 <input id="prDays" type="number" placeholder="비우면 전부" style="width:90px">일</label>
+        <label>코인 <input id="prCoins" placeholder="비우면 전부" style="width:150px"></label>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="prConfirm"> <b>정말 지웁니다</b> (시뮬레이션 결과는 지워지지 않습니다)</label>
+        <button class="act" id="prRun">지우기</button>
+      </div>
+    </div>
+    <p class="note">캔들은 받아둔 캐시라 지워도 다시 받을 수 있습니다. 매매 기록(kimp.db)과 시뮬레이션 결과(sim_runs·sim_trades)는 건드리지 않습니다. 자세한 설명은 docs/data.md.</p>
+  </section>
+
   <section id="config">
     <div class="cards" id="cards"></div>
     <h3 style="font-size:14px;margin:18px 0 8px">코인별 설정</h3>
@@ -232,6 +267,7 @@ document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
   if (b.dataset.tab === "screen") loadScreen();
   if (b.dataset.tab === "sim") loadSims();
   if (b.dataset.tab === "bot") loadBot();
+  if (b.dataset.tab === "data") loadData();
 });
 $("chartCoin").onchange = loadChart;
 $("chartFetch").onchange = loadChart;
@@ -260,8 +296,9 @@ function table(el, cols, rows) {
 }
 
 // ---------- 지금 김프 ----------
-const RUN_BUTTONS = { screen: "scRun", sim: "smRun", bot: "btRun" };
-const RUN_LABELS = { screen: "추천 코인 돌리기", sim: "시뮬레이션 돌리기", bot: "페이퍼 봇 켜기" };
+const RUN_BUTTONS = { screen: "scRun", sim: "smRun", bot: "btRun", fetch: "fcRun", prune: "prRun" };
+const RUN_LABELS = { screen: "추천 코인 돌리기", sim: "시뮬레이션 돌리기", bot: "페이퍼 봇 켜기",
+                     fetch: "받아오기", prune: "지우기" };
 
 async function loadLive() {
   const scope = $("liveScope").value;
@@ -523,6 +560,42 @@ async function showTrades(id) {
   }
 }
 
+// ---------- 데이터 (캔들 현황 · 받아오기 · 정리) ----------
+async function loadData() {
+  try {
+    const d = await api("/api/candles");
+    $("dataCards").innerHTML = [
+      ["과거 캔들 DB", d.db],
+      ["파일 크기", d.size_mb === null ? "없음" : d.size_mb.toLocaleString() + " MB"],
+      ["캔들 개수", d.rows.toLocaleString() + "개"],
+      ["간격 종류", d.sources.length + "개"],
+    ].map(([k, v]) => `<div class="card"><b>${k}</b><span>${v}</span></div>`).join("");
+    table($("dataTable"), [
+      { t: "간격", v: (r) => r.source },
+      { t: "캔들", v: (r) => r.rows.toLocaleString() },
+      { t: "코인", v: (r) => r.coins },
+      { t: "크기(MB)", v: (r) => fmt(r.size_mb, 1) },
+      { t: "기간", v: (r) => `${kst(r.from_ms).slice(0, 12)} ~ ${kst(r.to_ms).slice(0, 12)}` },
+    ], d.sources);
+    const sel = $("prSource"), keep = sel.value;
+    sel.innerHTML = `<option value="">전부</option>` +
+      d.sources.map((x) => `<option value="${x.source}">${x.source} (${fmt(x.size_mb, 1)}MB)</option>`).join("") +
+      `<option value="@5m">@5m (5분봉 전부)</option><option value="@15m">@15m (15분봉 전부)</option>`;
+    if (keep) sel.value = keep;
+  } catch (e) {
+    $("dataCards").innerHTML = `<p class="err">${e.message}</p>`;
+  }
+}
+
+$("fcRun").onclick = () => {
+  if (!$("fcCoins").value.trim()) { alert("코인을 적어 주세요 (예: CAP,SEI)"); return; }
+  runJob("fetch", { coins: $("fcCoins").value, days: $("fcDays").value, timeframe: $("fcTf").value });
+};
+$("prRun").onclick = () => {
+  if (!$("prConfirm").checked) { alert("'정말 지웁니다' 를 체크해야 지울 수 있습니다."); return; }
+  runJob("prune", { source: $("prSource").value, days: $("prDays").value, coins: $("prCoins").value, confirm: "1" });
+};
+
 // ---------- 설정 ----------
 function renderConfig(c) {
   const cards = [
@@ -607,6 +680,7 @@ async function pollJob() {
         if (j.kind === "screen" && j.status === "done") loadScreen();
         if (j.kind === "sim" && j.status === "done") loadSims();
         if (j.kind === "bot") loadBot();
+        if (j.kind === "fetch" || j.kind === "prune") loadData();
       } else if (j.kind === "bot") {
         loadBot();  // 봇이 돌고 있으면 기록이 쌓이는 걸 같이 보여준다
       }
@@ -725,6 +799,7 @@ async function reload() {
   if (on === "screen") loadScreen();
   if (on === "sim") loadSims();
   if (on === "bot") loadBot();
+  if (on === "data") loadData();
   renderPicks();
   attachRunningJob();
 }

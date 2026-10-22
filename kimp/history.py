@@ -478,15 +478,59 @@ def vacuum(db_path: str) -> None:
         conn.execute("VACUUM")
 
 
+def _fetch_cmd(sf, settings, args) -> int:
+    """
+    캔들 미리 받아두기
+
+    왜 필요한가: 시뮬레이션·차트는 필요한 구간을 그때그때 받는다. 코인 하나 30일이면 업비트 216번 요청이라
+    20초쯤 걸린다. 미리 받아두면 그다음부터는 바로 그려진다.
+    같은 구간은 다시 받지 않는다 (fetched_ranges).
+    """
+    from kimp.market_data import USDT_KRW_SYMBOL, MarketData, bybit_symbol, upbit_symbol
+
+    coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
+    tf = args.timeframe
+    bar_ms = {"1m": MINUTE_MS, "5m": 5 * MINUTE_MS, "15m": 15 * MINUTE_MS}[tf]
+    src = (lambda base: base if tf == "1m" else f"{base}@{tf}")  # 1분봉은 시뮬레이션과 같은 이름으로 공유
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000) // bar_ms * bar_ms
+    start_ms = now_ms - int(args.days * 86_400_000)
+    print(f"{tf} 캔들 {args.days:g}일치 받기: {', '.join(coins)}")
+
+    md = MarketData()
+    store = HistoryStore(sf)
+    got = store.ensure_candles(src(UPBIT_USDT), "USDT", start_ms, now_ms,
+                               ccxt_candle_fetcher(md.upbit, USDT_KRW_SYMBOL, tf), step_ms=bar_ms)
+    print(f"  업비트 USDT: 새로 {got:,}개")
+    for i, coin in enumerate(coins, 1):
+        if coin not in md.filter_supported([coin]):
+            print(f"  [{i}/{len(coins)}] {coin}: 양쪽 거래소에 다 있지 않아 건너뜀")
+            continue
+        up = store.ensure_candles(src(UPBIT), coin, start_ms, now_ms,
+                                  ccxt_candle_fetcher(md.upbit, upbit_symbol(coin), tf), step_ms=bar_ms)
+        by = store.ensure_candles(src(BYBIT), coin, start_ms, now_ms,
+                                  ccxt_candle_fetcher(md.bybit, bybit_symbol(coin), tf), step_ms=bar_ms)
+        fund = 0
+        if not args.no_funding:
+            fund = store.ensure_funding(coin, start_ms, now_ms, ccxt_funding_fetcher(md.bybit, bybit_symbol(coin)))
+        print(f"  [{i}/{len(coins)}] {coin}: 업비트 {up:,} / 바이비트 {by:,} / 펀딩비 {fund:,} (새로 받은 개수)")
+    print(f"끝. {settings.history_db_path} 크기 {os.path.getsize(settings.history_db_path) / 1_048_576:,.1f}MB")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """python -m kimp.history info / prune"""
     import argparse
 
     from kimp.config import load_settings
 
-    parser = argparse.ArgumentParser(description="과거 데이터(캔들) 상태 보기와 정리")
+    parser = argparse.ArgumentParser(description="과거 데이터(캔들) 상태 보기 · 받아오기 · 정리")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info", help="간격별 캔들 개수와 크기 보기")
+    f = sub.add_parser("fetch", help="캔들 미리 받아두기 (시뮬레이션·차트가 빨라진다)")
+    f.add_argument("--coins", required=True, help="받을 코인. 예: CAP,SEI")
+    f.add_argument("--days", type=float, default=30, help="며칠치 (기본 30)")
+    f.add_argument("--timeframe", default="1m", choices=("1m", "5m", "15m"), help="간격 (기본 1m)")
+    f.add_argument("--no-funding", action="store_true", help="펀딩비 이력은 받지 않음")
     p = sub.add_parser("prune", help="캔들 지우기 (시뮬레이션 결과는 건드리지 않음)")
     p.add_argument("--days", type=float, default=None, help="이 일수보다 오래된 캔들만 지움 (안 적으면 전부)")
     p.add_argument("--source", default=None,
@@ -513,6 +557,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hi = datetime.fromtimestamp(s["to_ms"] / 1000, timezone.utc).astimezone()
         print(f"{s['source']:14s} {s['rows']:>12,} {s['coins']:>5} {s['rows'] / total * size_mb:>9.1f}  "
               f"{lo:%Y-%m-%d} ~ {hi:%Y-%m-%d}")
+
+    if args.cmd == "fetch":
+        return _fetch_cmd(sf, settings, args)
 
     if args.cmd == "info":
         print()

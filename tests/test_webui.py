@@ -228,3 +228,27 @@ class AutoFetchLimitTest(unittest.TestCase):
         finally:
             w._ensure_candles = orig
         self.assertEqual(len(calls), 1)             # 직접 누르면 받는다
+
+
+class DataJobTest(unittest.TestCase):
+    """데이터 탭: 캔들 받아오기 / 정리 명령"""
+
+    def test_fetch(self):
+        from kimp.webui import build_command
+        cmd, env = build_command("fetch", {"coins": "CAP,SEI", "days": "30", "timeframe": "1m"})
+        self.assertEqual(cmd[1:], ["-m", "kimp.history", "fetch", "--coins", "CAP,SEI",
+                                   "--days", "30", "--timeframe", "1m"])
+        self.assertEqual(env, {})
+
+    def test_prune_needs_confirm(self):
+        """지우기는 '정말 지웁니다' 를 체크(confirm)해야만 명령이 만들어진다"""
+        from kimp.webui import build_command
+        with self.assertRaises(ValueError):
+            build_command("prune", {"source": "@5m"})
+        cmd, _ = build_command("prune", {"source": "@5m", "days": "60", "confirm": "1"})
+        self.assertEqual(cmd[1:], ["-m", "kimp.history", "prune", "--days", "60", "--source", "@5m", "--yes"])
+
+    def test_candle_summary_without_db(self):
+        from kimp.webui import candle_summary
+        out = candle_summary(replace(Settings(coins=["CAP"]), history_db_path="없는파일.db"))
+        self.assertEqual((out["rows"], out["sources"]), (0, []))

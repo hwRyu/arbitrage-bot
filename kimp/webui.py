@@ -376,6 +376,21 @@ def sim_trades(settings: Settings, run_id: int) -> List[Dict[str, Any]]:
         ]
 
 
+def candle_summary(settings: Settings) -> Dict[str, Any]:
+    """과거 캔들 현황 (간격별 개수·코인 수·기간·대략 크기)"""
+    from kimp.history import candle_stats, make_history_session_factory as _hsf
+
+    path = settings.history_db_path
+    size_mb = _file_mb(path) or 0.0
+    if not os.path.exists(path):
+        return {"db": path, "size_mb": None, "rows": 0, "sources": []}
+    stats = candle_stats(_hsf(path))
+    total = sum(x["rows"] for x in stats) or 1
+    for x in stats:
+        x["size_mb"] = round(x["rows"] / total * size_mb, 1)  # 전체 크기를 행 수로 나눠 어림한 값
+    return {"db": path, "size_mb": size_mb, "rows": sum(x["rows"] for x in stats), "sources": stats}
+
+
 def bot_state(settings: Settings) -> Dict[str, Any]:
     """
     봇 DB 에서 지금 상태 읽기 (잔고 · 열린 포지션 · 최근 닫은 거래)
@@ -460,6 +475,13 @@ def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[st
     elif kind == "sim":
         cmd = [sys.executable, "-m", "kimp.simulate"]
         allowed, env_map = SIM_PARAMS, SIM_ENV
+    elif kind == "fetch":
+        cmd = [sys.executable, "-m", "kimp.history", "fetch"]
+        allowed, env_map = {"coins": "--coins", "days": "--days", "timeframe": "--timeframe"}, {}
+    elif kind == "prune":
+        # 지우는 작업이라 화면에서 '정말 지웁니다' 를 체크했을 때만 (confirm=1) 받는다
+        cmd = [sys.executable, "-m", "kimp.history", "prune"]
+        allowed, env_map = {"days": "--days", "source": "--source", "coins": "--coins"}, {}
     elif kind == "bot":
         # 페이퍼 모드로만 켠다 (화면에서 실거래를 켤 수 있으면 사고가 난다)
         cmd = [sys.executable, "main.py"]
@@ -475,6 +497,10 @@ def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[st
         value = (params.get(key) or "").strip()
         if value:
             env[name] = value
+    if kind == "prune":
+        if not params.get("confirm"):
+            raise ValueError("지우기는 '정말 지웁니다' 를 체크해야 합니다")
+        cmd.append("--yes")
     if kind == "bot":
         env["PAPER_TRADING"] = "true"  # 화면에서는 실거래를 켤 수 없다
         env.setdefault("SCAN_INTERVAL_SEC", "20")
@@ -606,6 +632,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(screen_latest() or {"error": "아직 없습니다. python -m kimp.screen 을 한 번 돌리세요"})
             elif url.path == "/api/sims":
                 self._json(sim_runs(self.settings))
+            elif url.path == "/api/candles":
+                self._json(candle_summary(self.settings))
             elif url.path == "/api/bot":
                 self._json(bot_state(self.settings))
             elif url.path == "/api/jobs":
