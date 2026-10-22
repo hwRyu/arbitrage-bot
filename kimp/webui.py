@@ -68,6 +68,8 @@ def config_summary(settings: Settings) -> Dict[str, Any]:
             }
             for c in settings.coins
         ],
+        "target": settings.target_net_profit_percent,
+        "stop": settings.stop_loss_percent,
         "position_size_usdt": settings.position_size_usdt,
         "max_open_positions": settings.max_open_positions,
         "max_position_usdt": settings.max_position_usdt,
@@ -521,10 +523,14 @@ JOB_LOG_LINES = 400  # 로그는 마지막 400줄만 들고 있는다
 
 # 화면에서 받을 수 있는 값만 허용한다 (아무 설정이나 넘기지 못하게)
 SCREEN_PARAMS = {"days": "--days", "top": "--top", "coins": "--coins", "timeframe": "--timeframe",
-                 "refine_top": "--refine-top", "refine_timeframe": "--refine-timeframe", "target": "--target"}
+                 "refine_top": "--refine-top", "refine_timeframe": "--refine-timeframe",
+                 "target": "--target", "recent_days": "--recent-days"}
+# 손절은 스크리너에 옵션이 없고 설정에서 읽는다 → 환경 변수로 넘긴다 (비우면 .env 값)
+SCREEN_ENV = {"stop": "STOP_LOSS_PERCENT"}
 SIM_PARAMS = {"start": "--from", "end": "--to", "coins": "--coins"}
 SIM_ENV = {"seed": "PAPER_INITIAL_TOTAL_USDT", "size": "POSITION_SIZE_USDT",
-           "max_positions": "MAX_OPEN_POSITIONS", "target": "TARGET_NET_PROFIT_PERCENT"}
+           "max_positions": "MAX_OPEN_POSITIONS", "target": "TARGET_NET_PROFIT_PERCENT",
+           "stop": "STOP_LOSS_PERCENT"}
 # 페이퍼 봇(main.py)은 옵션이 없고 설정(환경 변수)으로만 조절한다.
 # 화면에서 켜는 봇은 '호가 기록을 쌓는 용도' 라 스캔을 느리게 하고 펀딩비 전략은 끈다 (요청 제한 여유).
 BOT_ENV = {"coins": "COINS", "scan": "SCAN_INTERVAL_SEC", "seed": "PAPER_INITIAL_TOTAL_USDT",
@@ -545,7 +551,7 @@ def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[st
 
     if kind == "screen":
         cmd = [sys.executable, "-m", "kimp.screen"]
-        allowed, env_map = SCREEN_PARAMS, {}
+        allowed, env_map = SCREEN_PARAMS, SCREEN_ENV
     elif kind == "sim":
         cmd = [sys.executable, "-m", "kimp.simulate"]
         allowed, env_map = SIM_PARAMS, SIM_ENV
