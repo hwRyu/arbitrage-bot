@@ -396,12 +396,21 @@ class LiveExecutor:
         """출금 (네트워크 이름은 보내는 거래소의 이름: 업비트 net_type 'TRX' / 바이비트 chain 'TRC20')"""
         try:
             address, tag = self._deposit_address(to_bybit)
+            # ccxt 는 두 거래소 모두 withdraw(코드, 수량, 주소, params) 다. 태그는 params['tag'] 로 넣는다.
+            # 4번째 인자로 태그를 넘기면 실거래에서 이렇게 터진다 (2026-10-22 실제로 겪음):
+            #   upbit.withdraw() takes from 4 to 5 positional arguments but 6 were given
             if to_bybit:
-                r = self.up.withdraw("USDT", amount_usdt, address, tag, {"net_type": self.s.upbit_transfer_network})
+                params = {"net_type": self.s.upbit_transfer_network}
+                if tag:
+                    params["tag"] = tag
+                r = self.up.withdraw("USDT", amount_usdt, address, params)
             else:
                 # 바이비트는 거래(통합) 계좌 → 펀딩 계좌로 옮긴 뒤 출금
                 self.by.transfer("USDT", amount_usdt, "unified", "funding")
-                r = self.by.withdraw("USDT", amount_usdt, address, tag, {"network": self.s.bybit_transfer_network})
+                params = {"network": self.s.bybit_transfer_network}
+                if tag:
+                    params["tag"] = tag
+                r = self.by.withdraw("USDT", amount_usdt, address, params)
         except Exception as exc:
             raise OrderFailed(f"출금 실패: {exc}") from exc
         self.refresh()

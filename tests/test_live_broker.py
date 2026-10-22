@@ -160,7 +160,7 @@ class FakeUpbit(FakeExchange):
     def fetch_deposit_address(self, code, params=None):
         return {"address": "UPBIT-ADDR", "tag": None}
 
-    def withdraw(self, code, amount, address, tag=None, params=None):
+    def withdraw(self, code, amount, address, params=None):  # ccxt 와 같은 인자 (태그는 params['tag'])
         self._maybe_fail("withdraw")
         self.bal["USDT"] -= amount
         wid = self._id()
@@ -242,7 +242,7 @@ class FakeBybit(FakeExchange):
     def transfer(self, code, amount, from_, to_):
         self.calls.append(("transfer", from_, to_))
 
-    def withdraw(self, code, amount, address, tag=None, params=None):
+    def withdraw(self, code, amount, address, params=None):  # ccxt 와 같은 인자 (태그는 params['tag'])
         self._maybe_fail("withdraw")
         self.free_usdt -= amount
         wid = self._id()
@@ -729,3 +729,49 @@ class TelegramTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WithdrawArgsTest(unittest.TestCase):
+    """
+    ccxt 출금 함수 인자 모양 검증 (실거래에서 터졌던 버그)
+
+    2026-10-22 첫 실거래에서 송금이 이렇게 실패했다.
+        upbit.withdraw() takes from 4 to 5 positional arguments but 6 were given
+    ccxt 는 두 거래소 모두 withdraw(코드, 수량, 주소, params) 이고 태그를 따로 받지 않는다.
+    가짜 거래소가 옛 시그니처(tag 를 4번째로 받음)였기 때문에 테스트가 이 버그를 못 잡았다.
+    → 가짜도 실제와 같은 인자로 맞추고, 실제 ccxt 클래스로 인자 바인딩까지 확인한다.
+    """
+
+    def test_real_ccxt_signature(self):
+        import inspect
+
+        import ccxt
+        for cls, params in ((ccxt.upbit, {"net_type": "TRX"}), (ccxt.bybit, {"network": "TRC20"})):
+            sig = inspect.signature(cls.withdraw)
+            sig.bind(object(), "USDT", 10.0, "주소", params)              # 우리가 쓰는 모양 → 통과해야 한다
+            with self.assertRaises(TypeError):                            # 태그를 4번째로 넘기면 실패해야 한다
+                sig.bind(object(), "USDT", 10.0, "주소", "태그", params)
+
+    def test_tag_goes_into_params(self):
+        """태그가 있으면 params['tag'] 로 들어간다 (트론은 태그가 없어서 보통 비어 있다)"""
+        from dataclasses import replace as dc_replace
+
+        seen = {}
+
+        class OnlyWithdraw:
+            """ccxt 와 같은 인자만 받는 가짜 (태그를 4번째로 넘기면 TypeError 가 난다)"""
+
+            def withdraw(self, code, amount, address, params=None):
+                seen.update({"code": code, "amount": amount, "address": address, "params": params or {}})
+                return {"id": "w-1"}
+
+        prices = Prices()
+        s = dc_replace(settings(), bybit_deposit_address="주소", bybit_deposit_tag="메모123",
+                       upbit_transfer_network="TRX")
+        ex = LiveExecutor(OnlyWithdraw(), FakeBybit(prices), s, sleep=lambda _x: None)
+        with make_session_factory(":memory:")() as session:
+            ex.withdraw(session, True, 100.0, "TRX")
+        self.assertEqual(seen["params"]["net_type"], "TRX")
+        self.assertEqual(seen["params"]["tag"], "메모123")
+        self.assertEqual(seen["address"], "주소")
+        self.assertEqual(seen["amount"], 100.0)
