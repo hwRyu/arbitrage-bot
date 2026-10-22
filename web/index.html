@@ -190,6 +190,24 @@ const cls = (v) => (v === null || v === undefined) ? "" : (v >= 0 ? "plus" : "mi
 const kst = (ms) => new Date(ms).toLocaleString("ko-KR", { hour12: false });
 let CONFIG = null, TIMER = null;
 
+// 탭 전환은 스크립트 맨 앞에서 등록한다. 아래쪽 코드에 문제가 생겨도 탭은 계속 동작하게.
+// ---------- 탭 / 새로고침 ----------
+document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
+  document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll("main section").forEach((s) => s.classList.toggle("on", s.id === b.dataset.tab));
+  if (b.dataset.tab === "chart") loadChart();
+  if (b.dataset.tab === "screen") loadScreen();
+  if (b.dataset.tab === "sim") loadSims();
+  if (b.dataset.tab === "bot") loadBot();
+});
+$("chartCoin").onchange = loadChart;
+$("chartHours").onchange = loadChart;
+$("auto").onchange = (e) => {
+  clearInterval(TIMER);
+  if (e.target.checked) TIMER = setInterval(() => { loadLive(); if ($("chart").classList.contains("on")) loadChart(); }, 10000);
+};
+
+
 async function api(path) {
   const r = await fetch(path);
   const data = await r.json();
@@ -485,8 +503,7 @@ async function pollJob() {
       const j = await api(`/api/job?id=${JOB}`);
       $("jobInfo").textContent = `#${j.id} ${j.kind} · ${j.status}` +
         (j.returncode !== null && j.returncode !== undefined ? ` (코드 ${j.returncode})` : "") + ` · ${j.cmd}`;
-      $("jobLog").textContent = (j.log || []).join("
-") || "시작했습니다…";
+      $("jobLog").textContent = (j.log || []).join("\n") || "시작했습니다…";
       $("jobLog").scrollTop = $("jobLog").scrollHeight;
       if (j.status !== "running") {
         clearInterval(JOB_TIMER);
@@ -563,22 +580,6 @@ async function loadBot() {
     $("botCards").innerHTML = `<p class="err">${e.message}</p>`;
   }
 }
-
-// ---------- 탭 / 새로고침 ----------
-document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
-  document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("on", x === b));
-  document.querySelectorAll("main section").forEach((s) => s.classList.toggle("on", s.id === b.dataset.tab));
-  if (b.dataset.tab === "chart") loadChart();
-  if (b.dataset.tab === "screen") loadScreen();
-  if (b.dataset.tab === "sim") loadSims();
-  if (b.dataset.tab === "bot") loadBot();
-});
-$("chartCoin").onchange = loadChart;
-$("chartHours").onchange = loadChart;
-$("auto").onchange = (e) => {
-  clearInterval(TIMER);
-  if (e.target.checked) TIMER = setInterval(() => { loadLive(); if ($("chart").classList.contains("on")) loadChart(); }, 10000);
-};
 
 async function reload() {
   try {
