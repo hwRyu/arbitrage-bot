@@ -78,9 +78,18 @@ def config_summary(settings: Settings) -> Dict[str, Any]:
         },
         "keys_present": bool(settings.upbit_access_key and settings.bybit_api_key),
         "telegram": bool(settings.telegram_bot_token),
-        "db": {"paper": settings.db_path, "history": settings.history_db_path},
+        "db": {"paper": settings.db_path, "history": settings.history_db_path,
+               "paper_mb": _file_mb(settings.db_path), "history_mb": _file_mb(settings.history_db_path)},
         "warnings": list(settings.config_warnings),
     }
+
+
+def _file_mb(path: str) -> Optional[float]:
+    """파일 크기 (MB). 없으면 None — 과거 캔들 DB 가 얼마나 커졌는지 화면에서 보려고"""
+    try:
+        return round(os.path.getsize(path) / 1_048_576, 1)
+    except OSError:
+        return None
 
 
 def spread_summary(settings: Settings, coins: Sequence[str]) -> List[Dict[str, Any]]:
@@ -98,8 +107,8 @@ def spread_summary(settings: Settings, coins: Sequence[str]) -> List[Dict[str, A
     ]
 
 
-def premium_history(settings: Settings, coin: str, hours: float = 24.0,
-                    now_ms: Optional[int] = None) -> Dict[str, Any]:
+def premium_history(settings: Settings, coin: str, hours: float = 24.0, now_ms: Optional[int] = None,
+                    md=None, force_fetch: bool = False) -> Dict[str, Any]:
     """
     코인 하나의 기록 (차트용). 봇이 남긴 지표를 다 담아서 화면에서 골라 그릴 수 있게 한다.
 
@@ -151,6 +160,12 @@ def premium_history(settings: Settings, coin: str, hours: float = 24.0,
         return {"coin": coin, "source": "봇 기록", "series": series}
 
     store = HistoryStore(make_history_session_factory(settings.history_db_path))
+    skipped = False
+    if md is not None:
+        if hours <= AUTO_FETCH_MAX_HOURS or force_fetch:
+            _ensure_candles(store, md, coin, start_ms, now_ms)
+        else:
+            skipped = True  # 긴 기간은 사용자가 직접 누를 때만 받는다 (DB 가 커지므로)
     upbit = store.load_closes(UPBIT, coin, start_ms, now_ms)
     bybit = store.load_closes(BYBIT, coin, start_ms, now_ms)
     usdt = store.load_closes(UPBIT_USDT, "USDT", start_ms, now_ms)
@@ -165,7 +180,35 @@ def premium_history(settings: Settings, coin: str, hours: float = 24.0,
                 "tether": None, "site": None,
                 "usdt_krw": u, "upbit_krw": upbit[ts], "bybit_usdt": b,
             })
-    return {"coin": coin, "source": "1분봉" if series else "없음", "series": series}
+    out = {"coin": coin, "source": "1분봉" if series else "없음", "series": series}
+    if skipped and len(series) < hours * 60 * 0.9:  # 받아야 할 양에 많이 모자라면 알려준다
+        out["fetch_skipped"] = True
+        out["hint"] = (f"{hours / 24:.0f}일치는 자동으로 받지 않습니다 (코인당 약 {hours * 60 * 2 / 1000:.0f}천 개 캔들). "
+                       f"'지금 받아오기' 를 누르면 받아서 저장합니다 (시뮬레이션에서도 재사용됩니다).")
+    return out
+
+
+def _ensure_candles(store: HistoryStore, md, coin: str, start_ms: int, now_ms: int) -> None:
+    """
+    과거 1분봉이 없으면 그 자리에서 받아온다 (화면에서 아무 코인이나 차트로 보려고)
+
+    24시간이면 1,440개라 업비트 8번·바이비트 2번 요청으로 금방이다.
+    30일(43,200개)이면 업비트 216번이라 20초쯤 걸린다. 받은 캔들은 data/history.db 에 남아
+    시뮬레이션에서도 그대로 쓰인다.
+    """
+    from kimp.history import ccxt_candle_fetcher, ccxt_funding_fetcher
+    from kimp.market_data import USDT_KRW_SYMBOL, bybit_symbol, upbit_symbol
+
+    try:
+        store.ensure_candles(UPBIT_USDT, "USDT", start_ms, now_ms,
+                             ccxt_candle_fetcher(md.upbit, USDT_KRW_SYMBOL))
+        store.ensure_candles(UPBIT, coin, start_ms, now_ms,
+                             ccxt_candle_fetcher(md.upbit, upbit_symbol(coin)))
+        store.ensure_candles(BYBIT, coin, start_ms, now_ms,
+                             ccxt_candle_fetcher(md.bybit, bybit_symbol(coin)))
+        store.ensure_funding(coin, start_ms, now_ms, ccxt_funding_fetcher(md.bybit, bybit_symbol(coin)))
+    except Exception as exc:  # 받기 실패해도 있는 것만 그린다
+        logger.warning("%s 캔들 받기 실패: %s", coin, exc)
 
 
 def _funding_8h_percent(rate: Optional[float], interval_hours: Optional[float]) -> Optional[float]:
@@ -186,34 +229,109 @@ def _utc():
     return timezone.utc
 
 
-def live_premium(md, coins: Sequence[str]) -> List[Dict[str, Any]]:
-    """지금 호가창으로 계산한 김프 (진입/청산/가운데) + 호가 간격·펀딩비율"""
-    quotes = md.fetch_quotes(list(coins))
-    out = []
+# 전체 코인을 볼 때 쓰는 값들
+UNIVERSE_TTL_SEC = 600.0  # 코인 목록·거래량은 10분 캐시 (매번 받을 필요 없다)
+
+# 차트에서 기록이 없는 코인의 1분봉을 '자동으로' 받아줄 최대 기간 (시간).
+# 24시간이면 코인당 1분봉 2,880개(약 100KB)라 2~3초면 끝난다.
+# 30일은 코인당 약 17만 개(6MB)라, 여러 코인을 눌러보면 DB 가 금방 커진다 → 사용자가 직접 누를 때만 받는다.
+AUTO_FETCH_MAX_HOURS = 24.0
+_UNIVERSE: Dict[str, Any] = {"at": 0.0, "coins": [], "volume": {}}
+
+
+def universe(md, force: bool = False) -> Dict[str, Any]:
+    """
+    업비트 원화 마켓과 바이비트 USDT 무기한에 **둘 다 있는** 코인 목록 + 24시간 거래대금
+
+    김프 헷지는 양쪽에서 동시에 거래해야 하므로 한쪽에만 있는 코인은 쓸 수 없다.
+    목록과 거래량은 10분 동안 캐시한다 (티커 조회 2번).
+    """
+    import time as _time
+
+    from kimp.market_data import bybit_symbol, upbit_symbol
+    from kimp.screen import list_universe
+
+    if not force and _UNIVERSE["coins"] and _time.time() - _UNIVERSE["at"] < UNIVERSE_TTL_SEC:
+        return _UNIVERSE
+    coins = list_universe(md)
+    up_t = md.upbit.fetch_tickers([upbit_symbol(c) for c in coins])
+    by_t = md.bybit.fetch_tickers()
+    volume = {}
     for c in coins:
-        q = quotes.get(c)
-        if not q:
-            out.append({"coin": c, "error": "시세 없음"})
+        up = up_t.get(upbit_symbol(c)) or {}
+        by = by_t.get(bybit_symbol(c)) or {}
+        volume[c] = {"upbit_krw": float(up.get("quoteVolume") or 0),
+                     "bybit_usdt": float(by.get("quoteVolume") or 0)}
+    coins.sort(key=lambda c: volume[c]["upbit_krw"], reverse=True)  # 거래대금 큰 순
+    _UNIVERSE.update({"at": _time.time(), "coins": coins, "volume": volume})
+    return _UNIVERSE
+
+
+def live_premium(md, coins: Sequence[str]) -> List[Dict[str, Any]]:
+    """
+    지금 김프 (여러 코인을 한 번에)
+
+    요청을 적게 쓰려고 이렇게 받는다.
+        업비트  호가창을 50개씩 묶어서 (코인 150개면 3번)
+        바이비트 티커 1번 — 맨 앞 호가·펀딩비율이 다 들어 있다 (913개가 1초)
+    그래서 코인이 많아도 몇 초면 끝난다. 호가창을 코인마다 따로 받으면 150번이 된다.
+    """
+    from kimp.market_data import USDT_KRW_SYMBOL, bybit_symbol, upbit_symbol
+
+    coins = list(coins)
+    books: Dict[str, Any] = {}
+    symbols = [upbit_symbol(c) for c in coins] + [USDT_KRW_SYMBOL]
+    for i in range(0, len(symbols), 50):
+        books.update(md.upbit.fetch_order_books(symbols[i:i + 50], 5))
+    usdt = books.get(USDT_KRW_SYMBOL) or {}
+    usdt_bid = (usdt.get("bids") or [[None]])[0][0]
+    usdt_ask = (usdt.get("asks") or [[None]])[0][0]
+    if not usdt_bid or not usdt_ask:
+        return [{"coin": c, "error": "업비트 USDT 호가 없음"} for c in coins]
+    usdt_mid = (usdt_bid + usdt_ask) / 2
+    tickers = md.bybit.fetch_tickers()
+    vol = universe(md)["volume"]
+
+    out: List[Dict[str, Any]] = []
+    for c in coins:
+        up = books.get(upbit_symbol(c)) or {}
+        by = tickers.get(bybit_symbol(c)) or {}
+        up_bid = (up.get("bids") or [[None]])[0][0]
+        up_ask = (up.get("asks") or [[None]])[0][0]
+        by_bid, by_ask = by.get("bid"), by.get("ask")
+        if not (up_bid and up_ask and by_bid and by_ask):
+            out.append({"coin": c, "error": "호가 없음"})
             continue
-        funding = md.fetch_funding(c)
-        coin_spread = None
-        if q.entry_premium_top is not None and q.exit_premium_top is not None:
-            coin_spread = q.entry_premium_top - q.exit_premium_top - (q.usdt_spread_percent or 0.0)
+        up_mid, by_mid = (up_bid + up_ask) / 2, (by_bid + by_ask) / 2
+        prem = lambda u, b, t: (u / (b * t) - 1) * 100  # noqa: E731 (김프 공식: 2번 문서)
+        info = by.get("info") or {}
+        rate = info.get("fundingRate")
+        interval = _bybit_funding_interval_hours(md, c)
         out.append({
             "coin": c,
-            "mid": q.mid_premium,
-            "entry": q.entry_premium_top,
-            "exit": q.exit_premium_top,
-            "usdt_spread": q.usdt_spread_percent,
-            "coin_spread": coin_spread,
-            "upbit_krw": q.upbit.mid,
-            "bybit_usdt": q.bybit.mid,
-            "usdt_krw": q.usdt_krw,
-            "tether_premium": q.tether_premium,
-            "site_premium": q.site_premium,
-            "funding_8h": (funding.rate * 100) if funding else None,
+            "mid": prem(up_mid, by_mid, usdt_mid),
+            "entry": prem(up_ask, by_bid, usdt_bid),   # 살 때(ask) / 숏 칠 때(bid) / USDT 팔 때(bid)
+            "exit": prem(up_bid, by_ask, usdt_ask),    # 팔 때(bid) / 숏 닫을 때(ask) / USDT 살 때(ask)
+            "coin_spread": (up_ask / up_bid - 1) * 100 + (by_ask / by_bid - 1) * 100,
+            "usdt_spread": (usdt_ask / usdt_bid - 1) * 100,
+            "upbit_krw": up_mid, "bybit_usdt": by_mid, "usdt_krw": usdt_mid,
+            "funding_8h": _funding_8h_percent(float(rate) if rate not in (None, "") else None, interval),
+            "upbit_krw_24h": (vol.get(c) or {}).get("upbit_krw"),
+            "bybit_usdt_24h": (vol.get(c) or {}).get("bybit_usdt"),
         })
     return out
+
+
+def _bybit_funding_interval_hours(md, coin: str) -> float:
+    """바이비트 펀딩 정산 주기 (시간). 마켓 정보의 fundingInterval 은 분 단위다 (480분 = 8시간)"""
+    from kimp.market_data import bybit_symbol
+
+    try:
+        info = (md.bybit.market(bybit_symbol(coin)) or {}).get("info") or {}
+        minutes = float(info.get("fundingInterval") or 480)
+        return minutes / 60 if minutes else 8.0
+    except Exception:
+        return 8.0
 
 
 def screen_latest(path: str = SCREEN_JSON) -> Optional[Dict[str, Any]]:
@@ -475,7 +593,13 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/api/premium":
                 coin = (query.get("coin") or [self.settings.coins[0]])[0].upper()
                 hours = float((query.get("hours") or ["24"])[0])
-                self._json(premium_history(self.settings, coin, hours))
+                # fetch=1 이면 기록이 없는 코인도 캔들을 받아서 그린다 (거래소 조회)
+                flag = (query.get("fetch") or ["1"])[0]
+                md = self._market() if flag not in ("0", "") else None
+                self._json(premium_history(self.settings, coin, hours, md=md, force_fetch=(flag == "force")))
+            elif url.path == "/api/universe":
+                u = universe(self._market())
+                self._json({"coins": u["coins"], "volume": u["volume"], "my": list(self.settings.coins)})
             elif url.path == "/api/live":
                 self._json(live_premium(self._market(), self._coins(query)))
             elif url.path == "/api/screen":
@@ -503,8 +627,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
     def _coins(self, query) -> List[str]:
-        raw = (query.get("coins") or [""])[0]
-        return [c.strip().upper() for c in raw.split(",") if c.strip()] or list(self.settings.coins)
+        """
+        볼 코인 정하기
+
+            (없음)        .env 의 COINS
+            coins=all     양쪽 거래소에 다 있는 코인 전부 (거래대금 큰 순)
+            top=40        거래대금 상위 40개
+            coins=CAP,SEI 적은 것만
+        """
+        raw = (query.get("coins") or [""])[0].strip()
+        top = int((query.get("top") or ["0"])[0] or 0)
+        if raw.lower() == "all" or top:
+            coins = universe(self._market())["coins"]
+            return coins[:top] if top else coins
+        picked = [c.strip().upper() for c in raw.split(",") if c.strip()]
+        return picked or list(self.settings.coins)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

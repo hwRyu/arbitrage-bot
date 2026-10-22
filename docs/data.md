@@ -1,0 +1,314 @@
+# 데이터 파일과 DB 구조
+
+> 어떤 파일에 무엇이 들어 있고, 각 테이블·컬럼이 무슨 뜻인지 정리한 문서.
+> **지워도 되는 것과 지우면 안 되는 것**을 먼저 확인할 것 (아래 0번).
+
+모든 DB 는 **SQLite 파일 한 개**다. 서버를 따로 띄우지 않는다. 테이블은 프로그램이 시작할 때 없으면 만들고,
+예전 DB 에 새 컬럼이 생기면 자동으로 덧붙인다 (`kimp/db.py` 의 `add_missing_columns`).
+
+---
+
+## 0. 파일 한눈에
+
+| 파일 | 무엇이 들어 있나 | 누가 쓰나 | 지워도 되나 |
+|---|---|---|---|
+| `data/kimp.db` | **페이퍼 매매 기록** + 김프 기록(호가 포함) | `main.py` (페이퍼) | ❌ 매매 이력. 처음부터 다시 할 때만 |
+| `data/dryrun.db` | 드라이런 매매 기록 | `main.py` (`PAPER_TRADING=false`, `LIVE_DRY_RUN=true`) | ❌ 같은 이유 |
+| `data/live.db` | **실거래 매매 기록** | `main.py` (실주문) | ❌ **절대** |
+| `data/history.db` | 과거 캔들 **캐시** + **시뮬레이션 결과** | 스크리너 · 시뮬레이션 · 로컬 화면 | ⚠️ 캔들만 지워도 됨 (다시 받음). `sim_*` 는 되살릴 수 없음 |
+| `data/screen_latest.json` | 스크리너 마지막 결과 (화면이 읽음) | `kimp.screen` → `kimp.webui` | ✅ 다시 돌리면 생김 |
+| `data/STOP` | 이 파일이 있으면 신규 진입 중단 | 사람이 만들고 지움 | ✅ |
+| `logs/` | 실행 로그 | `main.py` | ✅ |
+
+- `data/` 와 `logs/` 는 `.gitignore` 에 있어서 git 에 올라가지 않는다.
+- **모드마다 DB 가 따로다.** 페이퍼로 연습한 기록이 실거래 손익에 섞이지 않는다 (`Settings.active_db_path`).
+- 세 모드 파일의 **테이블 구조는 완전히 같다.** 아래 1번 설명이 세 파일에 그대로 적용된다.
+
+### 지금 크기 확인
+```bash
+ls -la data/                     # 맥 / Git Bash
+python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나온다
+```
+
+---
+
+## 1. 매매 기록 DB (`kimp.db` / `dryrun.db` / `live.db`)
+
+| 테이블 | 한 줄 설명 | 언제 쌓이나 |
+|---|---|---|
+| `positions` | 헷지 포지션 하나 = 진입 한 번 | 진입할 때 1줄, 청산하며 채워짐 |
+| `fills` | 체결 한 건 (주문 한 동작) | 포지션당 보통 6줄 (진입 3 + 청산 3) |
+| `funding_events` | 펀딩비 정산 한 번 | 보유 중 8시간마다 (코인에 따라 1·4시간) |
+| `premium_snapshots` | 김프 기록 (호가 포함) | **코인마다 1분에 1줄** — 가장 빨리 쌓인다 |
+| `transfers` | 거래소 간 USDT 송금 한 건 | 리밸런싱할 때만 |
+| `paper_balances` | 페이퍼 가짜 잔고 | 페이퍼·시뮬레이션만 (실거래는 거래소가 진짜) |
+| `carry_positions` / `carry_funding` | 펀딩비 수익 전략 (따로 도는 전략) | `CARRY_ENABLED=true` 일 때 |
+
+### 1-1. `positions` — 포지션 하나
+업비트에서 USDT 를 팔아 코인을 사고, 바이비트에 같은 금액 숏을 친 **한 세트**. 손익은 모두 USDT.
+
+**기본**
+
+| 컬럼 | 뜻 |
+|---|---|
+| `id` | 번호. 로그에 `#12` 처럼 나온다 |
+| `coin` | 코인 (예: `CAP`) |
+| `status` | `OPENING` → `OPEN` → `CLOSING` → `CLOSED` / `ABORTED`(되돌림) / `ERROR`(사람이 정리해야 함) |
+| `is_paper` | 페이퍼 여부 |
+| `opened_at` / `closed_at` | 진입·청산 시각 (UTC) |
+
+**진입할 때 (실제 체결값)**
+
+| 컬럼 | 뜻 | 예 |
+|---|---|---|
+| `usdt_sold` | 업비트에서 판 USDT 개수 (= 숏 금액) | 50.0 |
+| `entry_usdt_price_krw` | USDT 판 평균가 (원) | 1,332.5 |
+| `entry_usdt_fee_krw` | 그 매도 수수료 (원) | 33 |
+| `upbit_qty` | 산 코인 개수 | 728.4 |
+| `entry_upbit_price_krw` | 코인 평균 매수가 (원) | 91.4 |
+| `entry_upbit_fee_krw` | 코인 매수 수수료 (원) | 33 |
+| `bybit_qty` | 숏 개수 | 730 |
+| `entry_bybit_price_usdt` | 평균 숏 가격 | 0.0685 |
+| `entry_bybit_fee_usdt` | 숏 수수료 | 0.0275 |
+| `entry_premium` | **진입 김프 (코인 몫, %)** — 실제 체결가 기준 | −0.55 |
+| `entry_tether_premium` · `entry_site_premium` · `entry_fx_krw` | 참고용 (손익 계산에는 안 씀) | +0.84 / +0.29 / 1,321 |
+
+**레버리지·증거금**
+
+| 컬럼 | 뜻 |
+|---|---|
+| `leverage` | 그때 쓴 레버리지 (`BYBIT_LEVERAGE`) |
+| `bybit_margin_usdt` | 이 포지션에 묶인 증거금 = 숏 금액 ÷ 레버리지 |
+| `liquidation_price` | 숏 강제청산 가격. 1배면 진입가의 약 2배 |
+
+**진입할 때 고정한 기준** (들고 있는 중 `.env` 를 바꿔도 이 값으로 청산한다)
+
+| 컬럼 | 뜻 |
+|---|---|
+| `entry_threshold_percent` | 그때 쓴 진입 기준 |
+| `target_net_profit_percent` | 목표 순이익 (기본 1%) |
+| `stop_loss_percent` | 손절 (기본 −5%) |
+
+**들고 있는 동안 갱신되는 값**
+
+| 컬럼 | 뜻 |
+|---|---|
+| `funding_usdt` | 펀딩비 합계 (+ 받음 / − 냄) |
+| `next_funding_ms` · `pending_funding_rate` | 다음 정산 시각과 예고 비율 |
+| `last_net_percent` | 마지막으로 계산한 평가 순손익률 (%) |
+| `last_exit_premium` | 마지막으로 계산한 청산 김프 |
+| `last_liq_distance_percent` | 강제청산까지 남은 상승폭 (%). 15% 미만이면 긴급 경고 |
+
+**청산할 때 / 확정 손익**
+
+| 컬럼 | 뜻 |
+|---|---|
+| `exit_upbit_price_krw` · `exit_upbit_fee_krw` | 코인 판 평균가·수수료 |
+| `exit_usdt_price_krw` · `exit_usdt_fee_krw` · `usdt_bought` | USDT 되산 평균가·수수료·**되산 개수** |
+| `exit_bybit_price_usdt` · `exit_bybit_fee_usdt` | 숏 닫은 평균가·수수료 |
+| `exit_premium` | 청산 김프 (코인 몫, %) |
+| `exit_reason` | `TAKE_PROFIT`(목표 달성) / `STOP_LOSS`(손절) / `LIQUIDATION`(강제청산) / `MANUAL` |
+| `upbit_leg_usdt` | 업비트 몫 손익 = `usdt_bought − usdt_sold` |
+| `bybit_leg_usdt` | 바이비트 몫 손익 = 숏 개수 × (진입가 − 청산가) |
+| `gross_pnl_usdt` | 비용 빼기 전 손익 |
+| `total_cost_usdt` | 수수료 + 전송비 합 |
+| `net_pnl_usdt` | **최종 순손익 (USDT)** |
+| `net_pnl_percent` | 순손익률 = 순손익 ÷ 숏 진입 금액 |
+
+### 1-2. `fills` — 체결 한 건
+주문을 내기 **전에** `SENT` 로 먼저 적는다. 응답이 끊기거나 프로그램이 꺼져도 추적번호로 거래소에 조회해서
+결과를 채울 수 있다 (레그 리스크 대비, `docs/live.md` 2번).
+
+| 컬럼 | 뜻 |
+|---|---|
+| `position_id` | 어느 포지션의 체결인지 |
+| `exchange` | `upbit` / `bybit` |
+| `side` | `sell_usdt`(USDT 매도) · `buy`(코인 매수) · `sell`(코인 매도) · `buy_usdt`(USDT 매수) · `open_short` · `close_short` · `liquidated` · `trim_*`(크기 맞추기) · `unwind_*`(되돌리기) |
+| `qty` · `avg_price` · `cost` | 개수 · 평균가 · 금액 (업비트는 원, 바이비트는 USDT) |
+| `fee` · `fee_currency` | 수수료와 통화 (`KRW` / `USDT`) |
+| `slippage_percent` | 맨 앞 호가보다 얼마나 밀렸나 (%) |
+| `order_id` | 거래소 주문 번호 (페이퍼는 `paper-…`) |
+| `client_id` | **우리가 붙인 추적번호** (바이비트 `orderLinkId`, 업비트 `identifier`) |
+| `state` | `SENT`(결과 모름) / `DONE`(체결 확인) / `VOID`(주문 안 들어감) |
+
+### 1-3. `premium_snapshots` — 김프 기록 (가장 중요한 분석 자료)
+코인마다 1분에 1줄. **과거 호가창은 거래소가 주지 않으므로, 이 기록이 유일한 호가 간격 실측값이다.**
+스크리너·시뮬레이션이 30건 이상 쌓이면 자동으로 이 값을 쓴다 (`kimp/spread.py`).
+
+| 컬럼 | 뜻 |
+|---|---|
+| `coin` · `created_at` | 코인 · 기록 시각 (UTC) |
+| `mid_premium` | **봇 김프 (코인 몫)** — 가운데 가격 기준. "보통 시세" |
+| `entry_premium_top` | 맨 앞 호가로 **지금 진입하면** 나오는 김프 |
+| `exit_premium_top` | 맨 앞 호가로 **지금 청산하면** 나오는 김프 |
+| `usdt_spread_percent` | 업비트 USDT/KRW 호가 간격 (%) |
+| `usdt_krw` | 업비트 USDT 가운데 가격 (원) |
+| `upbit_mid_krw` · `bybit_mid_usdt` | 각 거래소 코인 가운데 가격 |
+| `fx_krw` · `tether_premium` · `site_premium` | 달러 환율 · 테더 프리미엄 · 사이트식 김프 (표시용) |
+| `funding_rate` · `next_funding_ms` · `funding_interval_hours` | 다음 펀딩비율 · 정산 시각 · 정산 주기(1·4·8시간) |
+
+```sql
+-- 코인 호가 간격 실측 평균 (스크리너·시뮬레이션이 쓰는 식)
+SELECT coin, COUNT(*),
+       AVG(entry_premium_top - exit_premium_top - COALESCE(usdt_spread_percent, 0)) AS 호가간격
+FROM premium_snapshots GROUP BY coin;
+```
+
+### 1-4. `funding_events` — 펀딩비 정산
+
+| 컬럼 | 뜻 |
+|---|---|
+| `position_id` | 어느 포지션 |
+| `rate` | 펀딩비율 (소수. `0.0001` = 0.01%) |
+| `mark_price` | 정산 때 가격 |
+| `amount_usdt` | 실제 금액 (+ 받음 / − 냄) |
+| `funding_time_ms` | 정산 시각 (UTC ms) |
+
+### 1-5. `transfers` — 거래소 간 송금
+
+| 컬럼 | 뜻 |
+|---|---|
+| `direction` | `upbit->bybit` 또는 `bybit->upbit` |
+| `amount_usdt` · `fee_usdt` | 보낸 양 · 출금 수수료 (받는 양 ≈ 보낸 양 − 수수료) |
+| `network` | 체인 (트론이면 업비트 `TRX` / 바이비트 `TRC20`) |
+| `status` | `REQUESTED`(출금 요청) → `CONFIRMED`(입금 확인) / `FAILED` |
+| `withdraw_id` · `reason` · `note` | 거래소 출금 번호 · 사유(시작/청산 후/진입 막힘) · 메모 |
+| `requested_at` · `confirmed_at` · `alerted` | 요청·확인 시각 · 늦어서 긴급 알림을 보냈는지 |
+
+### 1-6. `paper_balances` — 페이퍼 가짜 잔고
+`asset` 이름은 `<거래소>:<자산>` 꼴이다.
+
+| asset | 뜻 |
+|---|---|
+| `upbit:USDT` | 업비트 USDT |
+| `upbit:KRW` | 매매 중 생기는 자투리 원화 (거의 0) |
+| `upbit:<코인>` | 업비트에 들고 있는 코인 개수 |
+| `bybit:USDT` | 바이비트 남은 USDT (**증거금 제외**) |
+| `carry:USDT` · `carry:<코인>` | 펀딩비 전략 잔고 (김프 전략과 따로) |
+
+### 1-7. `carry_positions` / `carry_funding` — 펀딩비 수익 전략
+바이비트 현물 매수 + 같은 개수 숏 → 가격 변동은 상쇄되고 펀딩비(+)를 숏이 받는다 (`docs/carry.md`).
+주요 컬럼: `qty`(현물=숏 개수), `entry_spot_price` / `entry_perp_price`, `entry_basis_percent`(선물가 ÷ 현물가 − 1),
+`entry_daily_funding_percent`(진입 때 하루 평균 펀딩), `margin_usdt`, `liquidation_price`,
+`funding_usdt` / `funding_count`, `spot_leg_usdt` / `perp_leg_usdt`, `net_pnl_usdt` / `net_pnl_percent`.
+
+---
+
+## 2. 과거 데이터 DB (`history.db`)
+
+**두 가지가 섞여 있다.** 캔들은 캐시(다시 받을 수 있음)이고, 시뮬레이션 결과는 기록(되살릴 수 없음)이다.
+
+| 테이블 | 한 줄 설명 | 성격 |
+|---|---|---|
+| `candles` | 과거 봉 (분·5분·15분) | 캐시 — 지워도 다시 받음 |
+| `funding_history` | 바이비트 펀딩비 정산 이력 | 캐시 (받기가 느려서 두는 게 좋다) |
+| `fx_hourly` | 달러 환율 1시간봉 | 캐시 |
+| `fetched_ranges` | "이 구간은 받아봤다" 기록 | 캐시와 짝 — 같이 지워야 함 |
+| `sim_runs` | 시뮬레이션 실행 한 번 | **기록** |
+| `sim_trades` | 시뮬레이션 안의 거래 한 건 | **기록** |
+
+### 2-1. `candles`
+
+| 컬럼 | 뜻 |
+|---|---|
+| `source` | 어디 봉인지. `upbit`(업비트 코인/KRW) · `bybit`(무기한) · `upbit_usdt`(USDT/KRW). **1분봉은 이름 그대로, 다른 간격은 `upbit@15m` 처럼 붙는다** |
+| `coin` | 코인 (`upbit_usdt` 는 `USDT`) |
+| `ts_ms` | 봉 시작 시각 (UTC ms) |
+| `open` · `high` · `low` · `close` · `volume` | 시가·고가·저가·종가·거래량 |
+
+- 1분봉 이름을 간격 없이 쓰는 이유: **스크리너 2단계와 시뮬레이션이 같은 캔들을 공유**하려고.
+- 강제청산 판정은 **고가(`high`)** 로 한다 (종가만 보면 잠깐 치솟은 순간을 놓친다).
+- 크기 감각: 캔들 1개 ≈ 94바이트. **코인 1개 30일 1분봉(업비트+바이비트) ≈ 7.7MB.**
+
+### 2-2. `fetched_ranges` (왜 필요한가)
+업비트는 **거래가 없던 분에는 캔들을 안 준다.** 그래서 "비어 있으면 다시 받기" 로 만들면 영원히 다시 받는다.
+받아본 구간을 적어 두고 그 구간은 건너뛴다.
+
+| 컬럼 | 뜻 |
+|---|---|
+| `kind` | `candle:upbit` · `candle:bybit` · `candle:upbit@15m` · `fx` · `funding` |
+| `coin` · `start_ms` · `end_ms` | 코인 · 받아본 구간 |
+
+### 2-3. `sim_runs` / `sim_trades` — 시뮬레이션 결과
+
+| `sim_runs` 컬럼 | 뜻 |
+|---|---|
+| `id` | 실행 번호 (로컬 화면 '시뮬레이션' 탭에 나오는 번호) |
+| `created_at` | 돌린 시각 (UTC ISO) |
+| `from_ms` · `to_ms` | 시뮬레이션 기간 |
+| `coins` | 쉼표로 이은 코인 목록 |
+| `settings_json` | **그때 쓴 설정 전부** (진입 기준·목표·비용·레버리지·호가 간격과 그 출처) |
+| `summary_json` | 결과 요약: `total_net_usdt` · `realized_usdt`(확정) · `unrealized_usdt`(평가) · `return_percent` · `capital_start_usdt` · `closed_trades` · `open_positions` · `minutes_simulated` |
+
+| `sim_trades` 컬럼 | 뜻 |
+|---|---|
+| `run_id` | 어느 실행 |
+| `coin` · `opened_at` · `closed_at` | 코인 · 진입 · 청산 (끝까지 들고 있었으면 `closed_at` 이 비어 있음) |
+| `entry_premium` · `exit_premium` | 진입·청산 김프 (%) |
+| `exit_reason` | `TAKE_PROFIT` / `STOP_LOSS` / `LIQUIDATION` / `OPEN`(끝까지 보유) |
+| `net_pnl_usdt` · `net_pnl_percent` | 순손익과 손익률 |
+| `funding_usdt` · `cost_usdt` | 펀딩비 · 비용 |
+
+`--no-save` 로 돌리면 **저장하지 않는다** (화면 목록에도 안 나온다).
+
+---
+
+## 3. 자주 하는 조회
+
+```bash
+# 쌓인 김프 기록 요약 (봇이 돌고 있어야 생긴다)
+python -m kimp.report
+
+# 브라우저로 보기 (설정 탭에 DB 크기, 페이퍼 봇 탭에 코인별 기록 건수)
+python -m kimp.webui
+```
+
+```sql
+-- 닫은 거래 손익 (페이퍼)
+SELECT coin, COUNT(*) AS 건수, ROUND(SUM(net_pnl_usdt), 2) AS 손익,
+       ROUND(AVG(net_pnl_percent), 2) AS 평균률
+FROM positions WHERE status = 'CLOSED' GROUP BY coin;
+
+-- 지금 들고 있는 포지션
+SELECT id, coin, status, entry_premium, last_net_percent, last_liq_distance_percent FROM positions
+WHERE status IN ('OPENING', 'OPEN', 'CLOSING', 'ERROR');
+
+-- 간격별 캔들 크기 (history.db)
+SELECT source, COUNT(*) AS 개수, COUNT(DISTINCT coin) AS 코인수 FROM candles GROUP BY source ORDER BY 2 DESC;
+```
+
+---
+
+## 4. 유지보수
+
+### 커지는 건 캔들뿐이다
+매매 기록 쪽은 다 합쳐도 1MB 미만이다. `premium_snapshots` 가 코인 6개로 한 달 돌면 약 26만 줄(≈30MB)로
+가장 빨리 늘지만, 호가 간격 실측값이라 **지우면 시뮬레이션 정확도가 떨어진다.**
+
+| 동작 | `history.db` 증가량 |
+|---|---|
+| 스크리너 1회 (80코인 15분봉, 첫 실행) | 약 40MB |
+| 스크리너 2단계 (상위 20개 1분봉) | 약 150MB |
+| 시뮬레이션 (코인 4개 30일) | 약 31MB |
+| 차트에서 코인 하나 24시간 보기 | 약 0.3MB |
+
+같은 구간은 다시 받지 않으므로, 매일 돌리면 하루치(코인당 약 0.26MB)만 늘어난다.
+폭증하는 건 **새 코인·새 간격을 처음 받을 때**뿐이다.
+
+### 정리 명령 (직접 SQL 쓰지 말 것)
+```bash
+python -m kimp.history info                      # 간격별 개수·크기·기간
+python -m kimp.history prune --source @5m        # 미리보기
+python -m kimp.history prune --source @5m --yes  # 5분봉 전부 지우고 VACUUM
+python -m kimp.history prune --days 60 --yes     # 60일보다 오래된 캔들
+```
+이 명령은 **캔들과 '받아본 구간' 기록을 함께** 손본다. SQL 로 캔들만 지우면 `fetched_ranges` 에
+"이미 받아봤다" 가 남아서 **다시 받지 않는다.** (구간이 걸쳐 있으면 시작 시각만 잘라낸다)
+시뮬레이션 결과는 건드리지 않는다.
+- `sim_runs` / `sim_trades` 는 남겨 둘 것 (**다시 만들 수 없다**).
+- `data/history.db` 를 **파일째 지우면 시뮬레이션 결과도 사라진다.**
+- `kimp.db` / `dryrun.db` / `live.db` 는 매매 이력이다. 페이퍼를 처음부터 다시 하고 싶을 때만 `kimp.db` 를 지운다.
+
+### 백업
+`data/*.db` 를 복사하면 끝이다 (봇을 끈 상태에서). 그중 꼭 챙길 것은 **`live.db`(실거래 이력)** 과
+**`kimp.db` 의 `premium_snapshots`(호가 실측)** 이다. 캔들은 다시 받을 수 있다.

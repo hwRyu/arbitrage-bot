@@ -152,3 +152,79 @@ class FundingConvertTest(unittest.TestCase):
         self.assertAlmostEqual(_funding_8h_percent(0.0001, 1), 0.08)     # 1시간마다 → 8배
         self.assertAlmostEqual(_funding_8h_percent(0.0001, 4), 0.02)
         self.assertIsNone(_funding_8h_percent(None, 8))
+
+
+class UniverseScopeTest(unittest.TestCase):
+    """전체 코인 보기: 양쪽 거래소에 다 있는 코인만, 거래대금 큰 순"""
+
+    class FakeMd:
+        """업비트·바이비트 티커를 흉내내는 가짜 (네트워크 없음)"""
+
+        class _Ex:
+            def __init__(self, tickers, markets):
+                self.markets = markets
+                self._t = tickers
+
+            def fetch_tickers(self, symbols=None):
+                return {s: v for s, v in self._t.items() if symbols is None or s in symbols}
+
+        def __init__(self):
+            up_markets = {f"{c}/KRW": {"base": c, "quote": "KRW", "active": True} for c in ("AAA", "BBB", "CCC")}
+            by_markets = {"AAA/USDT:USDT": {}, "BBB/USDT:USDT": {}}  # CCC 는 바이비트에 없다
+            self.upbit = self._Ex({"AAA/KRW": {"quoteVolume": 100e8}, "BBB/KRW": {"quoteVolume": 300e8},
+                                   "CCC/KRW": {"quoteVolume": 900e8}}, up_markets)
+            self.bybit = self._Ex({"AAA/USDT:USDT": {"quoteVolume": 1e6}, "BBB/USDT:USDT": {"quoteVolume": 5e6}},
+                                  by_markets)
+
+    def test_only_both_exchanges_sorted_by_volume(self):
+        from kimp.webui import universe
+        u = universe(self.FakeMd(), force=True)
+        self.assertEqual(u["coins"], ["BBB", "AAA"])  # CCC 제외(바이비트 없음), 거래대금 큰 순
+        self.assertAlmostEqual(u["volume"]["BBB"]["upbit_krw"], 300e8)
+        self.assertAlmostEqual(u["volume"]["AAA"]["bybit_usdt"], 1e6)
+
+
+class AutoFetchLimitTest(unittest.TestCase):
+    """긴 기간은 자동으로 캔들을 받지 않는다 (DB 가 커지므로 사용자가 직접 누를 때만)"""
+
+    class FakeMd:
+        """받기를 시도하면 기록만 남기는 가짜 (실제로는 안 받음)"""
+
+        def __init__(self):
+            self.tried = 0
+
+    def _settings(self):
+        return replace(Settings(coins=["CAP"]), db_path="없는파일.db", history_db_path="없는파일2.db")
+
+    def test_short_window_tries_fetch(self):
+        import kimp.webui as w
+        calls = []
+        orig, w._ensure_candles = w._ensure_candles, lambda *a: calls.append(a)
+        try:
+            out = w.premium_history(self._settings(), "CAP", hours=24, md=self.FakeMd())
+        finally:
+            w._ensure_candles = orig
+        self.assertEqual(len(calls), 1)            # 24시간은 자동으로 받는다
+        self.assertFalse(out.get("fetch_skipped"))
+
+    def test_long_window_skips_and_hints(self):
+        import kimp.webui as w
+        calls = []
+        orig, w._ensure_candles = w._ensure_candles, lambda *a: calls.append(a)
+        try:
+            out = w.premium_history(self._settings(), "CAP", hours=720, md=self.FakeMd())
+        finally:
+            w._ensure_candles = orig
+        self.assertEqual(calls, [])                 # 30일은 자동으로 받지 않는다
+        self.assertTrue(out["fetch_skipped"])
+        self.assertIn("지금 받아오기", out["hint"])
+
+    def test_force_fetches_anyway(self):
+        import kimp.webui as w
+        calls = []
+        orig, w._ensure_candles = w._ensure_candles, lambda *a: calls.append(a)
+        try:
+            w.premium_history(self._settings(), "CAP", hours=720, md=self.FakeMd(), force_fetch=True)
+        finally:
+            w._ensure_candles = orig
+        self.assertEqual(len(calls), 1)             # 직접 누르면 받는다

@@ -149,5 +149,6 @@ python -m unittest discover -s tests -v
 | `kimp/carry.py` | 펀딩비 수익 전략 (바이비트 현물 + 숏): 엔진, 페이퍼 체결, 실시간 시세 |
 | `kimp/carry_backtest.py` | 펀딩비 전략 코인 순위 / 과거 시뮬레이션 |
 
+- **데이터 파일·DB 테이블·컬럼 설명: [docs/data.md](docs/data.md)**
 - 파일별 자세한 역할: [docs/architecture.md](docs/architecture.md)
 - 이전 버전 분석: [docs/old-analysis.md](docs/old-analysis.md)

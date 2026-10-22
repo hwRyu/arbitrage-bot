@@ -67,6 +67,7 @@ python main.py
 | 펀딩비 전략 과거 시뮬레이션 | `python -m kimp.carry_backtest run --from 2026-09-22` | 처음 1~2분 |
 | 봇이 쌓은 김프 기록 분석 | `python -m kimp.report` | 몇 초 |
 | **브라우저로 보기 (설정·김프 차트·추천·시뮬 결과)** | `python -m kimp.webui` | 바로 |
+| 과거 데이터 상태 보기 / 정리 | `python -m kimp.history info` / `prune` | 몇 초 |
 
 > 가상환경을 켠 상태 기준이다 (0-2 번). 맥에서 안 켰으면 `python` → `python3`.
 > 윈도우 venv 에는 `python3.exe` 가 없어서, 켜고도 `python3` 를 치면 **전역 파이썬**이 돌아간다 → 꼭 `python`.
@@ -197,6 +198,31 @@ python -m kimp.webui --no-open       # 브라우저 자동 열기 끄기
 
 - 차트 데이터는 **봇 기록(`premium_snapshots`)이 있으면 그걸**, 없으면 과거 1분봉으로 계산한다 (화면에 출처가 표시된다).
 - 봇을 돌리는 중에도 같이 띄워도 된다 (DB 를 읽기만 한다). 단 거래소 조회가 늘어나니 '10초마다 새로고침' 은 필요할 때만 켤 것.
+
+### 과거 데이터 정리 — `python -m kimp.history`
+받아둔 캔들은 `data/history.db` 에 계속 쌓인다 (캔들 1개 약 94바이트, **코인 1개 30일 1분봉이 약 7.7MB**).
+한 번 써보고 안 쓰는 간격(예: 5분봉)이 쌓이면 이 명령으로 지운다.
+
+```bash
+python -m kimp.history info                      # 간격별 캔들 개수·크기·기간
+python -m kimp.history prune --source @5m        # 무엇을 지울지 미리보기 (안 지움)
+python -m kimp.history prune --source @5m --yes  # 5분봉 전부 지우고 파일 크기 줄이기
+python -m kimp.history prune --days 60 --yes      # 60일보다 오래된 캔들
+python -m kimp.history prune --coins DOOD,ALT --yes   # 특정 코인만
+```
+| 옵션 | 뜻 |
+|---|---|
+| `--days` | 이 일수보다 오래된 캔들만 (안 적으면 전부) |
+| `--source` | `@5m`(5분봉 전부) · `upbit@15m` · `bybit` 처럼. 끝부분만 적어도 된다 |
+| `--coins` | 코인 지정 |
+| `--yes` | 실제로 지움 (없으면 미리보기만) |
+| `--no-vacuum` | 지운 뒤 파일 크기 줄이기를 건너뜀 |
+
+- **시뮬레이션 결과(`sim_runs`·`sim_trades`)는 지우지 않는다.** 캔들은 다시 받을 수 있지만 그 기록은 되살릴 수 없다.
+- 캔들과 함께 '받아본 구간' 기록도 손봐서, 지운 구간은 다음에 다시 받는다.
+- 매매 기록 DB(`kimp.db`·`live.db`)는 건드리지 않는다. 자세한 구조는 [data.md](data.md).
+
+예) 5분봉을 지웠을 때: `지운 캔들 1,278,986개` → 파일 **307MB → 183MB**
 
 ## 4. 펀딩비 전략 도구 (자세한 설명: [carry.md](carry.md))
 ```bash

@@ -22,7 +22,7 @@ import os
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import Float, Integer, String, Text, create_engine, select
+from sqlalchemy import Float, Integer, String, Text, create_engine, delete, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 logger = logging.getLogger(__name__)
@@ -401,3 +401,153 @@ def yfinance_fx_fetcher(start_ms: int, end_ms: int) -> List[Tuple[int, float]]:
     end = datetime.fromtimestamp(end_ms / 1000, timezone.utc)
     history = yf.Ticker("KRW=X").history(start=start, end=end, interval="1h")
     return [(int(ts.timestamp() * 1000), float(close)) for ts, close in history["Close"].items()]
+
+
+# ======================================================================
+# 정리 (캔들 캐시 줄이기)
+# ======================================================================
+# 캔들은 받아둔 캐시라서 지워도 다시 받을 수 있다. 하지만 같은 파일에 들어 있는
+# sim_runs / sim_trades (시뮬레이션 결과)는 **되살릴 수 없다** → 절대 건드리지 않는다.
+# 자세한 설명: docs/data.md
+def candle_stats(sf: sessionmaker[Session]) -> List[dict]:
+    """간격(source)별 캔들 개수·코인 수·가장 오래된/최근 시각"""
+    with sf() as session:
+        rows = session.execute(
+            select(Candle.source, func.count(), func.count(func.distinct(Candle.coin)),
+                   func.min(Candle.ts_ms), func.max(Candle.ts_ms))
+            .group_by(Candle.source).order_by(func.count().desc())
+        ).all()
+    return [{"source": s, "rows": n, "coins": c, "from_ms": lo, "to_ms": hi} for s, n, c, lo, hi in rows]
+
+
+def prune_candles(sf: sessionmaker[Session], before_ms: Optional[int] = None,
+                  sources: Optional[Sequence[str]] = None, coins: Optional[Sequence[str]] = None) -> dict:
+    """
+    캔들 지우기 (받아본 구간 기록도 같이 손봐서 다음에 다시 받을 수 있게 한다)
+
+    Args:
+        before_ms: 이 시각보다 오래된 캔들만 지운다 (None 이면 기간 제한 없음)
+        sources: 지울 간격. 'upbit@5m' 처럼 정확히, 또는 '@5m' 처럼 끝부분만 적어도 된다
+        coins: 지울 코인 (None 이면 전부)
+
+    왜 fetched_ranges 도 손보나: 업비트는 거래가 없던 분에 캔들을 안 줘서, '받아본 구간' 을 따로 적어 둔다.
+    캔들만 지우면 그 구간은 '이미 받아봤다' 로 남아서 다시 받지 않는다.
+      예) 9/1~10/1 을 받아봤고 9/15 이전을 지웠다면 → 받아본 구간을 9/15~10/1 로 줄인다
+
+    Returns:
+        {"candles": 지운 캔들 수, "ranges": 손본 구간 수, "sources": 지운 간격 목록}
+    """
+    def match(source: str) -> bool:
+        if not sources:
+            return True
+        return any(source == s or source.endswith(s) for s in sources)
+
+    with sf() as session:
+        targets = [s for (s,) in session.execute(select(Candle.source).distinct()).all() if match(s)]
+        if not targets:
+            return {"candles": 0, "ranges": 0, "sources": []}
+        where = [Candle.source.in_(targets)]
+        if before_ms is not None:
+            where.append(Candle.ts_ms < before_ms)
+        if coins:
+            where.append(Candle.coin.in_(list(coins)))
+        deleted = session.execute(delete(Candle).where(*where)).rowcount or 0
+
+        # 받아본 구간 기록 손보기 (kind 는 'candle:<source>' 꼴)
+        kinds = [f"candle:{s}" for s in targets]
+        rq = [FetchedRange.kind.in_(kinds)]
+        if coins:
+            rq.append(FetchedRange.coin.in_(list(coins)))
+        touched = 0
+        for row in session.scalars(select(FetchedRange).where(*rq)).all():
+            if before_ms is None or row.end_ms <= before_ms:
+                session.delete(row)  # 구간 전체가 지워진 범위에 들어감
+                touched += 1
+            elif row.start_ms < before_ms:
+                row.start_ms = before_ms  # 걸쳐 있으면 남은 쪽만 '받아봤다' 로 둔다
+                touched += 1
+        session.commit()
+    return {"candles": deleted, "ranges": touched, "sources": targets}
+
+
+def vacuum(db_path: str) -> None:
+    """지운 만큼 파일 크기를 실제로 줄인다 (SQLite 는 지워도 파일이 안 줄어든다)"""
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("VACUUM")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """python -m kimp.history info / prune"""
+    import argparse
+
+    from kimp.config import load_settings
+
+    parser = argparse.ArgumentParser(description="과거 데이터(캔들) 상태 보기와 정리")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("info", help="간격별 캔들 개수와 크기 보기")
+    p = sub.add_parser("prune", help="캔들 지우기 (시뮬레이션 결과는 건드리지 않음)")
+    p.add_argument("--days", type=float, default=None, help="이 일수보다 오래된 캔들만 지움 (안 적으면 전부)")
+    p.add_argument("--source", default=None,
+                   help="지울 간격. 예: '@5m' (5분봉 전부) / 'upbit@15m' / 'bybit'. 안 적으면 전부")
+    p.add_argument("--coins", default=None, help="지울 코인. 예: DOOD,ALT (안 적으면 전부)")
+    p.add_argument("--yes", action="store_true", help="확인 없이 바로 지움 (안 적으면 무엇을 지울지만 보여줌)")
+    p.add_argument("--no-vacuum", action="store_true", help="지운 뒤 파일 크기 줄이기(VACUUM)를 건너뜀")
+    args = parser.parse_args(argv)
+
+    settings = load_settings()
+    path = settings.history_db_path
+    if not os.path.exists(path):
+        print(f"{path} 가 없습니다.")
+        return 1
+    sf = make_history_session_factory(path)
+    size_mb = os.path.getsize(path) / 1_048_576
+    stats = candle_stats(sf)
+    total = sum(s["rows"] for s in stats) or 1
+    print(f"{path}  {size_mb:,.1f}MB  캔들 {total:,}개  (1개당 약 {size_mb * 1_048_576 / total:.0f}바이트)")
+    print()
+    print(f"{'간격':14s} {'캔들':>12s} {'코인':>5s} {'크기(MB)':>9s}  기간 (한국 시간)")
+    for s in stats:
+        lo = datetime.fromtimestamp(s["from_ms"] / 1000, timezone.utc).astimezone()
+        hi = datetime.fromtimestamp(s["to_ms"] / 1000, timezone.utc).astimezone()
+        print(f"{s['source']:14s} {s['rows']:>12,} {s['coins']:>5} {s['rows'] / total * size_mb:>9.1f}  "
+              f"{lo:%Y-%m-%d} ~ {hi:%Y-%m-%d}")
+
+    if args.cmd == "info":
+        print()
+        print("정리하려면: python -m kimp.history prune --days 60        (60일보다 오래된 캔들)")
+        print("            python -m kimp.history prune --source @5m    (5분봉 전부)")
+        return 0
+
+    before_ms = None
+    if args.days:
+        before_ms = int((datetime.now(timezone.utc).timestamp() - args.days * 86_400) * 1000)
+    sources = [s.strip() for s in args.source.split(",")] if args.source else None
+    coins = [c.strip().upper() for c in args.coins.split(",")] if args.coins else None
+
+    print()
+    what = []
+    if args.days:
+        what.append(f"{args.days:g}일보다 오래된 것")
+    if sources:
+        what.append(f"간격 {', '.join(sources)}")
+    if coins:
+        what.append(f"코인 {', '.join(coins)}")
+    print(f"지울 대상: {' · '.join(what) if what else '캔들 전부'}")
+    if not args.yes:
+        print("실제로 지우려면 --yes 를 붙이세요. (시뮬레이션 결과 sim_runs/sim_trades 는 지우지 않습니다)")
+        return 0
+
+    result = prune_candles(sf, before_ms, sources, coins)
+    print(f"지운 캔들 {result['candles']:,}개 · 받아본 구간 기록 {result['ranges']:,}개 정리 "
+          f"(간격 {', '.join(result['sources']) or '-'})")
+    if not args.no_vacuum:
+        print("파일 크기 줄이는 중 (VACUUM)...")
+        vacuum(path)
+    print(f"끝. 지금 크기 {os.path.getsize(path) / 1_048_576:,.1f}MB")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
