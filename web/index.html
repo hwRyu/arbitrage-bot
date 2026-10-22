@@ -58,6 +58,7 @@
   .pick { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 20px;
           border: 1px solid var(--line); cursor: pointer; font-size: 12px; color: var(--dim); }
   .pick.on { color: var(--text); border-color: currentColor; }
+  .pick.none { opacity: .45; text-decoration: line-through; }
   .pick i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
   .chip { font-size: 12px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--dim); }
   .chip.running { color: #11151c; background: var(--warn); border-color: var(--warn); font-weight: 700; }
@@ -269,7 +270,7 @@ document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
   if (b.dataset.tab === "bot") loadBot();
   if (b.dataset.tab === "data") loadData();
 });
-$("chartCoin").onchange = loadChart;
+$("chartCoin").onchange = () => { CHART_PICKED = true; loadChart(); };
 $("chartFetch").onchange = loadChart;
 $("chartForce").onclick = () => loadChart("force");
 $("liveScope").onchange = loadLive;
@@ -347,6 +348,7 @@ async function loadLive() {
 }
 
 function openChart(coin) {
+  CHART_PICKED = true;
   const sel = $("chartCoin");
   if (![...sel.options].some((o) => o.value === coin)) sel.add(new Option(coin, coin));
   sel.value = coin;
@@ -367,14 +369,19 @@ const SERIES = [
   { k: "usdt_krw",    name: "USDT 가격(원)",   color: "#8b98a9", axis: "원", on: false },
   { k: "upbit_krw",   name: "업비트 가격(원)", color: "#6e7681", axis: "원", on: false },
 ];
-let LAST = null;
+let LAST = null, CHART_PICKED = false;  // CHART_PICKED: 사용자가 코인을 직접 골랐나
 
-function renderPicks() {
-  $("seriesPick").innerHTML = SERIES.map((s, i) =>
-    `<span class="pick ${s.on ? "on" : ""}" style="${s.on ? "color:" + s.color : ""}" onclick="togglePick(${i})">
-       <i style="background:${s.color}"></i>${s.name}</span>`).join("");
+function renderPicks(available) {
+  const has = (k) => !available || available.includes(k);
+  $("seriesPick").innerHTML = SERIES.map((s, i) => {
+    const ok = has(s.k);
+    const title = ok ? "" : ' title="이 기록에는 없는 지표입니다 (1분봉에는 호가가 없습니다)"';
+    return `<span class="pick ${s.on && ok ? "on" : ""} ${ok ? "" : "none"}"
+       style="${s.on && ok ? "color:" + s.color : ""}"${title} onclick="togglePick(${i})">
+       <i style="background:${ok ? s.color : "#3a4453"}"></i>${s.name}${ok ? "" : " (없음)"}</span>`;
+  }).join("");
 }
-function togglePick(i) { SERIES[i].on = !SERIES[i].on; renderPicks(); if (LAST) drawChart(LAST); }
+function togglePick(i) { SERIES[i].on = !SERIES[i].on; if (LAST) drawChart(LAST); else renderPicks(); }
 
 function drawChart(data) {
   LAST = data;
@@ -451,9 +458,16 @@ function drawChart(data) {
     `<span><i style="background:${s.color}"></i>${s.name} ${s.axis === "원" ? "(오른쪽 축, 점선)" : ""}
       <b style="color:${s.color}">${s.axis === "%" ? sign(last[s.k], 3) + "%" : fmt(last[s.k], 1)}</b></span>`).join("")
     + (pct && entry != null ? `<span><i style="background:#8b98a9"></i>진입 기준 ${entry}%</span>` : "");
+  renderPicks(data.available);
+  const missing = SERIES.filter((x) => x.on && !(data.available || []).includes(x.k)).map((x) => x.name);
+  const rec = (data.recorded || []).map((r) => `${r.coin}(${r.count.toLocaleString()}건)`).join(", ");
   $("chartNote").textContent = data.source === "1분봉"
-    ? "봇 기록이 없어서 과거 1분봉으로 계산했습니다 (가운데 김프·가격·펀딩비만 있고 진입·청산 김프는 없습니다). 페이퍼 봇을 켜면 전부 쌓입니다."
-    : "봇이 1분마다 남긴 기록입니다. 진입·청산 김프는 그 순간 실제 호가 기준입니다.";
+    ? "봇 기록이 없어서 과거 1분봉으로 그렸습니다. 1분봉에는 호가가 없어서 "
+      + (missing.length ? `[${missing.join(", ")}] 는 그릴 수 없습니다.` : "진입·청산 김프를 그릴 수 없습니다.")
+      + NL + "페이퍼 봇을 켜면 그 코인부터 1분에 1건씩 쌓입니다 (페이퍼 봇 탭)."
+      + (rec ? NL + "지금 봇 기록이 있는 코인: " + rec : "")
+    : "봇이 1분마다 남긴 기록입니다. 진입·청산 김프는 그 순간 실제 호가 기준입니다."
+      + (rows.length < 30 ? NL + `아직 ${rows.length}점뿐입니다 — 봇을 더 돌리면 촘촘해집니다.` : "");
 }
 
 async function loadChart(mode) {
@@ -775,12 +789,22 @@ async function loadUniverse() {
       const v = (u.volume[c] || {}).upbit_krw || 0;
       return `${c}${v ? "  (" + (v / 1e8).toFixed(0) + "억)" : ""}`;
     };
-    const mine = u.my.filter((c) => u.coins.includes(c));
-    const rest = u.coins.filter((c) => !u.my.includes(c));
+    const recset = new Set((u.recorded || []).map((r) => r.coin));
+    const mark = (c) => (recset.has(c) ? "● " : "") + label(c);  // ● = 봇 기록 있음 (진입·청산 김프 볼 수 있음)
+    const recorded = (u.recorded || []).map((r) => r.coin).filter((c) => u.coins.includes(c));
+    const mine = u.my.filter((c) => u.coins.includes(c) && !recset.has(c));
+    const rest = u.coins.filter((c) => !u.my.includes(c) && !recset.has(c));
+    const opts = (list) => list.map((c) => `<option value="${c}">${mark(c)}</option>`).join("");
     sel.innerHTML =
-      `<optgroup label="내 코인 (.env COINS)">${mine.map((c) => `<option value="${c}">${label(c)}</option>`).join("")}</optgroup>` +
-      `<optgroup label="전체 ${rest.length}개 (거래대금 순)">${rest.map((c) => `<option value="${c}">${label(c)}</option>`).join("")}</optgroup>`;
+      (recorded.length ? `<optgroup label="● 봇 기록 있음 (진입·청산 김프 볼 수 있음)">${opts(recorded)}</optgroup>` : "") +
+      `<optgroup label="내 코인 (.env COINS)">${opts(mine)}</optgroup>` +
+      `<optgroup label="전체 ${rest.length}개 (거래대금 순)">${opts(rest)}</optgroup>`;
     if (keep) sel.value = keep;
+    // 사용자가 아직 직접 고르지 않았으면, 기록이 있는 코인을 기본으로 (진입·청산 김프가 보이는 쪽)
+    if (!CHART_PICKED && recorded.length) {
+      sel.value = recorded[0];
+      if (document.querySelector("main section.on").id === "chart") loadChart();
+    }
   } catch (e) { /* 목록을 못 받으면 .env 코인만 둔다 */ }
 }
 

@@ -107,6 +107,18 @@ def spread_summary(settings: Settings, coins: Sequence[str]) -> List[Dict[str, A
     ]
 
 
+def recorded_coins(settings: Settings) -> List[Dict[str, Any]]:
+    """봇 기록(premium_snapshots)이 있는 코인과 건수 — 차트에서 '진입·청산 김프를 볼 수 있는 코인'"""
+    if not os.path.exists(settings.db_path):
+        return []
+    with make_session_factory(settings.db_path)() as session:
+        rows = session.execute(
+            select(PremiumSnapshot.coin, func.count()).group_by(PremiumSnapshot.coin)
+            .order_by(func.count().desc())
+        ).all()
+    return [{"coin": c, "count": n} for c, n in rows]
+
+
 def premium_history(settings: Settings, coin: str, hours: float = 24.0, now_ms: Optional[int] = None,
                     md=None, force_fetch: bool = False) -> Dict[str, Any]:
     """
@@ -157,7 +169,8 @@ def premium_history(settings: Settings, coin: str, hours: float = 24.0, now_ms: 
                     "usdt_krw": r.usdt_krw, "upbit_krw": r.upbit_mid_krw, "bybit_usdt": r.bybit_mid_usdt,
                 })
     if series:
-        return {"coin": coin, "source": "봇 기록", "series": series}
+        return {"coin": coin, "source": "봇 기록", "series": series,
+                "available": _available_keys(series), "recorded": recorded_coins(settings)}
 
     store = HistoryStore(make_history_session_factory(settings.history_db_path))
     skipped = False
@@ -180,12 +193,25 @@ def premium_history(settings: Settings, coin: str, hours: float = 24.0, now_ms: 
                 "tether": None, "site": None,
                 "usdt_krw": u, "upbit_krw": upbit[ts], "bybit_usdt": b,
             })
-    out = {"coin": coin, "source": "1분봉" if series else "없음", "series": series}
+    out = {"coin": coin, "source": "1분봉" if series else "없음", "series": series,
+           "available": _available_keys(series), "recorded": recorded_coins(settings)}
     if skipped and len(series) < hours * 60 * 0.9:  # 받아야 할 양에 많이 모자라면 알려준다
         out["fetch_skipped"] = True
         out["hint"] = (f"{hours / 24:.0f}일치는 자동으로 받지 않습니다 (코인당 약 {hours * 60 * 2 / 1000:.0f}천 개 캔들). "
                        f"'지금 받아오기' 를 누르면 받아서 저장합니다 (시뮬레이션에서도 재사용됩니다).")
     return out
+
+
+def _available_keys(series: Sequence[Dict[str, Any]]) -> List[str]:
+    """
+    이 기록에 값이 들어 있는 지표만 골라준다 (화면에서 없는 지표를 흐리게 보여주려고)
+
+    1분봉으로 만든 기록에는 호가가 없다 → 진입·청산 김프, 호가 간격, 테더 프리미엄이 없다.
+    그걸 알려주지 않으면 "토글은 켜져 있는데 아무것도 안 그려진다" 로 보인다.
+    """
+    keys = ("mid", "entry", "exit", "spread", "usdt_spread", "funding", "tether", "site",
+            "usdt_krw", "upbit_krw", "bybit_usdt")
+    return [k for k in keys if any(r.get(k) is not None for r in series)]
 
 
 def _ensure_candles(store: HistoryStore, md, coin: str, start_ms: int, now_ms: int) -> None:
@@ -625,7 +651,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(premium_history(self.settings, coin, hours, md=md, force_fetch=(flag == "force")))
             elif url.path == "/api/universe":
                 u = universe(self._market())
-                self._json({"coins": u["coins"], "volume": u["volume"], "my": list(self.settings.coins)})
+                self._json({"coins": u["coins"], "volume": u["volume"], "my": list(self.settings.coins),
+                            "recorded": recorded_coins(self.settings)})
             elif url.path == "/api/live":
                 self._json(live_premium(self._market(), self._coins(query)))
             elif url.path == "/api/screen":

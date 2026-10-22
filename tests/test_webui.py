@@ -252,3 +252,27 @@ class DataJobTest(unittest.TestCase):
         from kimp.webui import candle_summary
         out = candle_summary(replace(Settings(coins=["CAP"]), history_db_path="없는파일.db"))
         self.assertEqual((out["rows"], out["sources"]), (0, []))
+
+
+class AvailableKeysTest(unittest.TestCase):
+    """차트에 그릴 수 있는 지표 골라내기 (없는 지표를 흐리게 보여주려고)"""
+
+    def test_only_keys_with_values(self):
+        from kimp.webui import _available_keys
+        # 1분봉으로 만든 기록: 호가가 없어서 진입·청산 김프가 없다
+        series = [{"ts": 1, "mid": -0.1, "entry": None, "exit": None, "spread": None,
+                   "usdt_krw": 1350.0, "funding": None}]
+        self.assertEqual(_available_keys(series), ["mid", "usdt_krw"])
+
+    def test_bot_records_have_everything(self):
+        from kimp.webui import _available_keys
+        series = [{"ts": 1, "mid": -0.1, "entry": 0.1, "exit": -0.3, "spread": 0.3,
+                   "usdt_spread": 0.07, "funding": 0.01, "tether": 0.8, "site": 0.7,
+                   "usdt_krw": 1350.0, "upbit_krw": 91.0, "bybit_usdt": 0.068}]
+        got = _available_keys(series)
+        for k in ("mid", "entry", "exit", "spread", "funding", "tether", "site"):
+            self.assertIn(k, got)
+
+    def test_empty(self):
+        from kimp.webui import _available_keys
+        self.assertEqual(_available_keys([]), [])
