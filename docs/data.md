@@ -238,6 +238,9 @@ FROM premium_snapshots GROUP BY coin;
 | `coin` · `start_ms` · `end_ms` | 코인 · 받아본 구간 |
 
 ### 2-3. `sim_runs` / `sim_trades` — 시뮬레이션 결과
+> 이 두 테이블은 화면 **대시보드 탭**에서 봇 기록(`positions`)과 **같은 모양으로** 볼 수 있다.
+> 실거래를 아직 안 했을 때도 성과 화면을 그대로 써 보려는 것이다 (`kimp/dashboard.py`).
+
 
 | `sim_runs` 컬럼 | 뜻 |
 |---|---|
@@ -270,6 +273,10 @@ python -m kimp.report
 # 브라우저로 보기 (설정 탭에 DB 크기, 페이퍼 봇 탭에 코인별 기록 건수)
 python -m kimp.webui
 ```
+
+**아래 SQL 을 직접 치지 않아도 되는 것들**은 화면 **대시보드 탭**에 이미 있다 (`python -m kimp.webui`).
+기록(`live.db` / `dryrun.db` / `kimp.db` 또는 시뮬레이션 결과)과 기간을 고르면 `positions` · `transfers` ·
+`sim_trades` 를 읽어 순손익·승률·누적 곡선·코인별·거래 이력으로 정리해 준다. 집계 코드는 `kimp/dashboard.py`.
 
 ```sql
 -- 닫은 거래 손익 (페이퍼)

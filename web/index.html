@@ -37,10 +37,12 @@
   button.act:hover { border-color: var(--accent); }
   .chart { width: 100%; height: 340px; background: #0d1117; border: 1px solid var(--line); border-radius: 8px; }
   /* 차트 위에 마우스를 올리면 그 시각의 값들을 보여주는 상자 */
-  #hover { position: absolute; display: none; pointer-events: none; background: #0b0f15;
+  #hover, #dhover { position: absolute; display: none; pointer-events: none; background: #0b0f15;
            border: 1px solid var(--accent); border-radius: 7px; padding: 7px 9px; font-size: 12px;
            line-height: 1.6; white-space: nowrap; z-index: 20; box-shadow: 0 6px 20px rgba(0,0,0,.5); }
   #hover b { color: var(--dim); font-weight: 600; }
+  #dhover { position: fixed; }   /* 대시보드 차트용 — 감싼 상자와 무관하게 커서 옆에 뜬다 */
+  #dhover b { color: var(--text); font-weight: 700; }
   .legend { display: flex; gap: 16px; font-size: 12px; color: var(--dim); margin-top: 8px; }
   .legend i { display: inline-block; width: 18px; height: 2px; vertical-align: middle; margin-right: 5px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
@@ -68,15 +70,13 @@
   .chip { font-size: 12px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--dim); }
   /* 용어 설명 풍선: 점선 밑줄에 마우스를 올리면 뜻·공식·예시가 나온다 */
   .hint { border-bottom: 1px dotted currentColor; cursor: help; }
-  [data-tip] { position: relative; }
-  [data-tip]:hover::after {
-    content: attr(data-tip); position: absolute; left: 0; top: 125%; z-index: 50;
-    white-space: pre-line; width: max-content; max-width: 340px; text-align: left;
-    background: #0b0f15; color: var(--text); border: 1px solid var(--accent); border-radius: 7px;
-    padding: 8px 10px; font-size: 12px; font-weight: 400; line-height: 1.5;
-    box-shadow: 0 6px 20px rgba(0,0,0,.5);
-  }
-  th:last-child [data-tip]:hover::after, td:last-child [data-tip]:hover::after { left: auto; right: 0; }
+  /* 설명 풍선. CSS ::after 로 띄우면 표를 감싼 .wrap(overflow:auto) 안에서 잘린다
+     (overflow 상자는 z-index 로 벗어날 수 없다) → body 에 붙인 position:fixed 상자 하나로 띄운다 */
+  #tipbox { position: fixed; display: none; z-index: 9999; pointer-events: none;
+            white-space: pre-line; max-width: 360px; text-align: left;
+            background: #0b0f15; color: var(--text); border: 1px solid var(--accent); border-radius: 7px;
+            padding: 8px 10px; font-size: 12px; font-weight: 400; line-height: 1.5;
+            box-shadow: 0 6px 20px rgba(0,0,0,.5); }
   details { margin-bottom: 12px; }
   details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
   details .panel { margin-top: 8px; }
@@ -84,6 +84,27 @@
   details dt { color: var(--dim); font-weight: 600; }
   details dd { margin: 0; }
   details code { background: #11151c; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  /* 탭 맨 위 안내 상자: 이 탭이 무엇을 하는 곳인지 (시뮬레이션 / 페이퍼 봇) */
+  .about { background: #0d1117; border: 1px solid var(--line); border-left: 3px solid var(--accent);
+           border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+  .about h4 { margin: 0 0 6px; font-size: 14px; font-weight: 700; }
+  .about .accent { color: var(--accent); }
+  .about table { width: auto; font-size: 12.5px; margin: 8px 0 2px; }
+  .about th, .about td { padding: 4px 16px 4px 0; border-bottom: 1px solid var(--line);
+                         text-align: left; color: var(--dim); white-space: nowrap; }
+  .about th { position: static; background: none; font-size: 11.5px; }
+  .about tr.me td { color: var(--text); font-weight: 700; }
+  .about details { margin: 10px 0 0; }
+  .about ul { margin: 8px 0 0; padding-left: 18px; color: var(--dim); font-size: 12.5px; line-height: 1.75; }
+  .about ul b { color: var(--text); }
+  .about code { background: #11151c; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  /* 목표 순이익 → 관리선 역산 결과 */
+  #levelBox { background: #0d1117; border: 1px solid var(--line); border-left: 3px solid #a371f7;
+              border-radius: 8px; padding: 12px 14px; margin-top: 14px; }
+  table.costs { width: auto; min-width: 460px; }
+  table.costs th, table.costs td { text-align: left; padding: 5px 16px 5px 0; }
+  table.costs td:nth-child(2), table.costs th:nth-child(2) { text-align: right; }
+  table.costs tr.sum td { font-weight: 700; border-top: 1px solid var(--line); border-bottom: none; }
   .chip.running { color: #11151c; background: var(--warn); border-color: var(--warn); font-weight: 700; }
   .chip.done { color: #11151c; background: var(--up); border-color: var(--up); font-weight: 700; }
   .chip.bad { color: #11151c; background: var(--down); border-color: var(--down); font-weight: 700; }
@@ -103,7 +124,8 @@
 </header>
 
 <div class="tabs">
-  <button data-tab="live" class="on">지금 김프</button>
+  <button data-tab="dash" class="on">대시보드</button>
+  <button data-tab="live">지금 김프</button>
   <button data-tab="chart">김프 차트</button>
   <button data-tab="screen">추천 코인</button>
   <button data-tab="sim">시뮬레이션</button>
@@ -113,7 +135,51 @@
 </div>
 
 <main>
-  <section id="live" class="on">
+  <section id="dash" class="on">
+    <div class="panel">
+      <div class="row">
+        <label>기록 <select id="dbSrc" style="min-width:320px"></select></label>
+        <label>시작 <input id="dbFrom" type="date"></label>
+        <label>종료 <input id="dbTo" type="date"></label>
+        <button class="act" id="dbGo">조회</button>
+        <span class="muted">빠른 기간</span>
+        <span class="pick" onclick="dashRange(7)">7일</span>
+        <span class="pick" onclick="dashRange(30)">30일</span>
+        <span class="pick" onclick="dashRange(90)">90일</span>
+        <span class="pick" onclick="dashRange(0)">전체</span>
+        <span style="flex:1"></span>
+        <span class="muted" id="dbInfo"></span>
+      </div>
+      <div class="row"><span class="muted">기간은 <b>청산 시각</b> 기준입니다 (손익이 확정된 날에 잡습니다).
+실거래·페이퍼 기록이 비어 있으면 <b>시뮬레이션 결과</b>를 골라 같은 화면으로 볼 수 있습니다.</span></div>
+    </div>
+    <div class="cards" id="dbCards"></div>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">누적 순손익 (USDT) <span class="muted" style="font-weight:400">— 점에 마우스를 올리면 그 거래 (코인·손익·누적)</span></h3>
+    <svg class="chart" id="dbEquity" viewBox="0 0 900 260" preserveAspectRatio="none" style="height:260px"></svg>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">일별 손익 (한국 시간)
+      <span class="muted" style="font-weight:400">— 막대에 마우스를 올리면 그 날</span></h3>
+    <svg class="chart" id="dbDaily" viewBox="0 0 900 200" preserveAspectRatio="none" style="height:200px"></svg>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">코인별 성과</h3>
+    <div class="wrap"><table id="dbCoin"></table></div>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">청산 사유별</h3>
+    <div class="wrap"><table id="dbReason"></table></div>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">열려 있는 포지션</h3>
+    <div class="wrap"><table id="dbOpen"></table></div>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">거래 이력 <span class="muted" style="font-weight:400">— 포지션 하나당 한 줄</span></h3>
+    <div class="wrap"><table id="dbTrades"></table></div>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">송금 이력 <span class="muted" style="font-weight:400">— 거래소 간 USDT 이동 (리밸런싱)</span></h3>
+    <div class="wrap"><table id="dbTransfers"></table></div>
+    <p class="note">순손익 = 김프 몫 + 펀딩비 − 비용(수수료·전송비). 모두 USDT 기준입니다 — 테더 프리미엄·환율은 양쪽 다리에서 상쇄되므로 들어가지 않습니다.</p>
+  </section>
+
+  <section id="live">
     <details>
       <summary>용어 설명 (김프가 왜 세 개인가?)</summary>
       <div class="panel">
@@ -166,6 +232,23 @@
       <datalist id="coinList"></datalist>
       <label><input type="checkbox" id="chartFetch" checked> 기록 없으면 캔들 받아오기 (24시간까지 자동)</label>
       <button class="act" id="chartForce" style="display:none">지금 받아오기</button>
+      <label title="고른 % 지표의 평균 ± kσ 를 가로선으로 그린다">
+        <input type="checkbox" id="chartBands">
+        <span class="hint" id="bandsTip">관리선 UCL/LCL</span>
+      </label>
+      <select id="chartSigma">
+        <option value="1">±1σ</option>
+        <option value="2" selected>±2σ</option>
+        <option value="3">±3σ</option>
+        <option value="manual">직접 입력</option>
+      </select>
+      <span id="bandManual" style="display:none">
+        <label>UCL <input id="bandUcl" type="number" step="0.01" placeholder="비우면 안 그림"
+                          style="width:110px">%</label>
+        <label>LCL <input id="bandLcl" type="number" step="0.01" placeholder="비우면 안 그림"
+                          style="width:110px">%</label>
+        <button class="act" id="bandFromSigma" title="지금 기간의 ±2σ 값을 입력칸에 넣는다">±2σ 값 넣기</button>
+      </span>
       <select id="chartHours">
         <option value="6">6시간</option>
         <option value="24" selected>24시간</option>
@@ -175,6 +258,13 @@
       </select>
       <span class="muted" id="chartInfo"></span>
     </div>
+    <div class="row">
+      <span class="hint" id="levelTip" style="font-size:13px">목표 순이익으로 관리선 맞추기</span>
+      <label>목표 <input id="lvTarget" type="number" value="1" step="0.1" min="0.05" style="width:70px">%</label>
+      <label>포지션 <input id="lvNotional" type="number" placeholder="설정값" step="10" style="width:95px">USDT</label>
+      <button class="act" id="lvRun">목표로 맞추기</button>
+      <span class="muted">비용(수수료·호가 간격·전송비·펀딩비)을 역산해 UCL/LCL 을 정하고, 이 기간에 몇 번 왕복했는지 셉니다</span>
+    </div>
     <div class="row" id="chartQuick"></div>
     <div class="row" id="seriesPick"></div>
     <div style="position:relative">
@@ -183,6 +273,8 @@
     </div>
     <div class="legend" id="legend"></div>
     <p class="note" id="chartNote"></p>
+    <div id="levelBox"><p class="muted" style="margin:0">위 <b>목표로 맞추기</b> 를 누르면,
+      이 코인의 실제 비용을 더해 <b>목표 순이익이 남는 진입·청산 김프</b>를 계산해 차트에 그립니다.</p></div>
   </section>
 
   <section id="screen">
@@ -200,6 +292,27 @@
   </section>
 
   <section id="sim">
+    <div class="about">
+      <h4>이 탭은 — <span class="accent">과거 데이터로 전략을 맞춰보는 곳</span>입니다 (백테스트)</h4>
+      <table>
+        <tr><th></th><th>쓰는 시세</th><th>시간</th><th>주문</th></tr>
+        <tr class="me"><td>◆ 시뮬레이션 (이 탭)</td><td>과거 1분봉 (history.db)</td><td>빨리 감기 — 한 달이 몇 초</td><td>없음 (계산만)</td></tr>
+        <tr><td>페이퍼 봇</td><td>지금 진짜 호가창</td><td>실시간 — 하루가 하루</td><td>가짜 (장부만)</td></tr>
+        <tr><td>실거래</td><td>지금 진짜 호가창</td><td>실시간</td><td>진짜</td></tr>
+        <tr><td>시세 수집 (데이터 탭)</td><td>지금 진짜 호가창</td><td>실시간</td><td>없음 (기록만)</td></tr>
+      </table>
+      <details>
+        <summary>자세히 — 무엇을 알 수 있고 무엇은 알 수 없나</summary>
+        <ul>
+          <li><b>알 수 있는 것</b> — 진입 기준·목표·동시 보유 수를 바꿨을 때 그 기간에 몇 번 진입해서 얼마 벌었을까. 코인을 고르는 근거가 여기서 나옵니다.</li>
+          <li><b>알 수 없는 것 ①: 호가창.</b> 거래소는 과거 호가창을 주지 않습니다 (1분봉에는 종가만 있습니다). 그래서 호가 간격을
+              <b>평균값 하나로 가정</b>합니다 — 수집 기록이 30줄을 넘은 코인은 실측 평균, 없으면 추측값 0.1%. 호가가 얇은 코인의 실제 체결 밀림은 여기서 안 보입니다.</li>
+          <li><b>알 수 없는 것 ②: 운영.</b> API 오류·요청 제한·송금 문제·껐다 켤 때 복구 — 전략 수학만 보기 때문에 하나도 안 나옵니다. 그건 페이퍼 봇에서 봅니다.</li>
+          <li><b>과최적화 주의.</b> 같은 30일로 코인을 고른 뒤 같은 30일에 돌리면 좋게 나오는 게 당연합니다. 추천 코인 탭의 <b>검증/월</b>(앞 2/3로 고른 기준을 뒤 1/3에 써본 값)이 더 믿을 만합니다.</li>
+          <li>결과는 <code>data/history.db</code> 에 저장되고, <b>대시보드 탭</b>에서 봇 기록과 같은 화면으로 볼 수 있습니다.</li>
+        </ul>
+      </details>
+    </div>
     <div class="panel">
       <div class="row">
         <label>시작 <input id="smFrom" type="date" value="2026-09-22"></label>
@@ -224,6 +337,28 @@
   </section>
 
   <section id="bot">
+    <div class="about">
+      <h4>이 탭은 — <span class="accent">지금 실시간 시세로 봇을 리허설하는 곳</span>입니다 (주문만 가짜)</h4>
+      <table>
+        <tr><th></th><th>쓰는 시세</th><th>시간</th><th>주문</th></tr>
+        <tr><td>시뮬레이션</td><td>과거 1분봉 (history.db)</td><td>빨리 감기 — 한 달이 몇 초</td><td>없음 (계산만)</td></tr>
+        <tr class="me"><td>◆ 페이퍼 봇 (이 탭)</td><td>지금 진짜 호가창</td><td>실시간 — 하루가 하루</td><td>가짜 (장부만)</td></tr>
+        <tr><td>실거래</td><td>지금 진짜 호가창</td><td>실시간</td><td>진짜</td></tr>
+        <tr><td>시세 수집 (데이터 탭)</td><td>지금 진짜 호가창</td><td>실시간</td><td>없음 (기록만)</td></tr>
+      </table>
+      <details>
+        <summary>자세히 — 과거 데이터를 쓰는 게 아닙니다</summary>
+        <ul>
+          <li><b>과거를 보지 않습니다.</b> 지금 이 순간 업비트·바이비트 호가창을 스캔 간격마다 읽어서, 조건이 맞으면 진입하고 목표에 닿으면 청산합니다. 과거로 맞춰보는 것은 <b>시뮬레이션 탭</b>입니다.</li>
+          <li><b>주문만 가짜입니다.</b> 잔고는 DB 장부(<code>paper_balances</code>)만 바뀌고 돈은 나가지 않습니다. 체결가는 <b>그 순간 진짜 호가 5단</b>으로 계산하므로 호가가 얇은 코인의 밀림(슬리피지)이 실제처럼 나옵니다.</li>
+          <li><b>나머지는 실거래와 같은 코드입니다.</b> 엔진·브로커·안전장치·텔레그램·송금 판단·재시작 복구를 공유하고 <b>실행기만</b> 다릅니다. 그래서 실거래 직전 리허설이 됩니다.</li>
+          <li><b>여기서만 보이는 것</b> — API 요청 제한, 실제 진입 빈도(하루에 몇 번 기회가 오나), 껐다 켰을 때 포지션을 이어받는지, 호가 얇은 코인의 실제 비용.</li>
+          <li><b>한 번만</b> 을 켜면 포지션 1개만 잡고, 청산되면 봇이 스스로 종료하며 검증 보고를 남깁니다. <b>최대 보유</b> 시간을 넘기면 목표에 못 닿았어도 그 시점 시세로 정리합니다 (청산 사유 <code>TIMEOUT</code>) — 손익보다 '완주' 가 목적인 모드입니다.</li>
+          <li>화면에서 켜는 봇은 <b>항상 페이퍼</b>입니다 (<code>PAPER_TRADING=true</code> 강제). 실거래는 터미널에서만 켤 수 있습니다.</li>
+          <li>기록 쌓기가 목적이면 이걸 켜지 마세요 — <b>데이터 탭의 시세 수집</b>이 그 일을 전담합니다 (주문·포지션 없이 코인 수십 개를 안전하게).</li>
+        </ul>
+      </details>
+    </div>
     <div class="panel">
       <div class="row">
         <label>코인 <input id="btCoins" placeholder="비우면 .env COINS" style="width:230px"></label>
@@ -315,6 +450,8 @@
     <pre id="jobLog" style="max-height:220px;overflow:auto;margin:0">아직 실행한 작업이 없습니다.</pre>
   </section>
 </main>
+<div id="tipbox"></div>
+<div id="dhover"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -371,6 +508,50 @@ const TIP = {
   margin: "이 포지션에 묶인 바이비트 증거금 = 숏 금액 ÷ 레버리지",
   reason: "청산 사유" + NL + "TAKE_PROFIT 목표 달성 / STOP_LOSS 손절 / LIQUIDATION 강제청산 / TIMEOUT 한 번만 돌리기 시간 초과",
   status: "포지션 상태" + NL + "OPENING 진입 중 / OPEN 보유 / CLOSING 청산 중 / CLOSED 끝 / ABORTED 되돌림 / ERROR 사람이 정리 필요",
+  // ---- 대시보드 ----
+  dbTrades: "이 기간에 청산까지 끝난 거래 수" + NL +
+            "기간은 청산 시각 기준이다. 진입만 하고 아직 들고 있는 것은 '열려 있는 포지션' 에 따로 나온다.",
+  dbAvgPercent: "거래별 손익률의 평균 (%)" + NL +
+                "손익률 = 순손익 ÷ 포지션 금액. 포지션 크기가 달라도 비교할 수 있다." + NL +
+                "목표(기본 1%) 근처면 익절로 끝난 거래가 많다는 뜻.",
+  dbTurnover: "거래 규모 대비 수익률 = 순손익 ÷ 거래한 금액 합계 × 100" + NL +
+              "같은 50 USDT 를 열 번 돌리면 합계는 500 USDT 다. '한 번 돌릴 때마다 몇 % 남나' 를 본다." + NL +
+              "자본 수익률이 아니다 (자본은 여러 번 재사용된다).",
+  dbGross: "김프 몫 (USDT) = 업비트 몫 + 바이비트 몫" + NL +
+           "펀딩비와 비용을 빼기 전, 김프가 벌어진 것만. 순손익 = 김프 몫 + 펀딩비 − 비용.",
+  dbFunding: "펀딩비 합계 (USDT). + 면 숏인 우리가 받았고, − 면 냈다" + NL +
+             "낸 펀딩비는 그만큼 청산 김프가 더 올라야 목표에 닿게 만든다 (1:1).",
+  dbCost: "비용 합계 (USDT) = 업비트 수수료 4번 + 바이비트 수수료 2번 + 전송비" + NL +
+          "호가 간격은 여기 없다 — 체결가에 이미 들어가 김프 몫을 깎는다.",
+  dbHold: "보유 시간 = 청산 시각 − 진입 시각" + NL +
+          "짧을수록 같은 자리로 더 많이 돌릴 수 있다 (동시 보유 수가 정해져 있으므로).",
+  dbDrawdown: "최대 낙폭 (USDT) = 누적 손익이 최고점에서 가장 많이 밀린 폭" + NL +
+              "0 이면 한 번도 뒷걸음질하지 않았다는 뜻. 자본을 얼마나 버텨야 하는지 가늠하는 값.",
+  dbMonth: "월 환산 = 기간 순손익 ÷ 기간 일수 × 30" + NL +
+           "기간이 짧으면 크게 흔들린다. 며칠치로 월 수익을 단정하지 말 것.",
+  levels: "목표 순이익으로 관리선 맞추기" + NL +
+          "김프가 올라야 하는 폭은 목표 수익만이 아니다. 나가는 돈을 다 메우고 그 위로 목표만큼 올라야 한다." + NL + NL +
+          "필요한 폭 = 목표 + 왕복 수수료 + 코인 호가 간격 + USDT 호가 간격 + 전송비 + 펀딩비 + 여유" + NL + NL +
+          "코인 호가 간격이 코인마다 10배씩 다르기 때문에, 같은 '목표 1%' 가 코인마다 난이도가 전혀 다르다." + NL +
+          "예) 호가 0.10% 면 1.54%p 만 오르면 되는데, 호가 0.95% 면 2.39%p 가 올라야 한다." + NL + NL +
+          "폭이 정해지면 그 폭을 유지한 채 LCL 자리를 아래에서 위로 훑어서" + NL +
+          "'LCL 에서 진입 → UCL 에서 청산' 이 이 기간에 가장 많이 완결되는 자리를 고른다." + NL +
+          "거래가 일어나려면 차트가 두 선을 다 지나가야 하므로, 폭만 맞추는 게 아니라 자리도 중요하다." + NL + NL +
+          "펀딩비는 보유 시간에 비례하고 보유 시간은 관리선에 달려 있어서, 한 번 돌려 본 평균 보유 시간으로 다시 계산한다." + NL +
+          "포지션 금액은 전송비가 몇 % 인지 재는 데 쓴다 (금액이 작을수록 전송비 비중이 커진다).",
+  bands: "관리선 (UCL / CL / LCL)" + NL +
+         "지금 켜 둔 % 지표 중 맨 위 것의 평균(CL)과 평균 ± kσ 를 가로선으로 그린다." + NL +
+         "σ 는 그 기간 김프가 평균에서 얼마나 흔들렸나(표준편차)다." + NL + NL +
+         "읽는 법: 김프가 LCL 아래로 내려간 순간은 그 기간 기준으로 '드물게 낮은' 때다 → 진입 후보." + NL +
+         "UCL 위로 올라가면 '드물게 높은' 때 → 청산 쪽에 가깝다. ±2σ 면 약 95% 가 띠 안에 들어온다." + NL + NL +
+         "주의: 김프는 추세가 생기면 평균 자체가 움직인다. 기간을 길게 잡으면 띠가 넓어져 쓸모가 없어진다" + NL +
+         "(6시간~24시간으로 보는 게 쓸 만하다). 진입 기준선(회색 점선)을 대신하는 값이 아니라 참고용이다." + NL + NL +
+         "직접 입력: σ 자리에서 '직접 입력' 을 고르면 UCL·LCL 값을 손으로 적는다." + NL +
+         "한쪽만 적어도 된다 (예: LCL 만 -0.6 → 진입 보고 싶은 선 하나만 긋기)." + NL +
+         "적은 값은 브라우저에 남아서 다시 열어도 그대로 있다. '±2σ 값 넣기' 로 자동값을 가져와 고칠 수도 있다.",
+  dbTransfer: "거래소 간 USDT 송금 (리밸런싱)" + NL +
+              "REQUESTED 출금 요청 / CONFIRMED 입금 확인 / FAILED 실패." + NL +
+              "업비트→바이비트는 수수료 0, 바이비트→업비트는 약 1.3 USDT.",
 };  // 줄바꿈 (편집 사고를 막으려고 상수로)
 let CONFIG = null, TIMER = null;
 
@@ -379,6 +560,7 @@ let CONFIG = null, TIMER = null;
 document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll(".tabs button").forEach((x) => x.classList.toggle("on", x === b));
   document.querySelectorAll("main section").forEach((s) => s.classList.toggle("on", s.id === b.dataset.tab));
+  if (b.dataset.tab === "dash") loadDash();
   if (b.dataset.tab === "chart") loadChart();
   if (b.dataset.tab === "screen") loadScreen();
   if (b.dataset.tab === "sim") loadSims();
@@ -388,6 +570,50 @@ document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
 $("chartCoin").onchange = () => { CHART_PICKED = true; $("chartCoin").value = $("chartCoin").value.trim().toUpperCase(); loadChart(); };
 $("chartCoin").onkeydown = (e) => { if (e.key === "Enter") $("chartCoin").onchange(); };
 $("chartFetch").onchange = loadChart;
+// 관리선은 이미 받은 데이터로 다시 그리기만 하면 된다 (거래소를 다시 부르지 않는다)
+const BAND_STORE = "kimp.bands";
+
+function saveBands() {
+  try {
+    localStorage.setItem(BAND_STORE, JSON.stringify({
+      on: $("chartBands").checked, mode: $("chartSigma").value,
+      ucl: $("bandUcl").value, lcl: $("bandLcl").value,
+    }));
+  } catch (e) { /* 사생활 보호 모드 등에서 막히면 그냥 기억하지 않는다 */ }
+}
+
+function loadBands() {
+  try {
+    const v = JSON.parse(localStorage.getItem(BAND_STORE) || "{}");
+    if (v.mode) $("chartSigma").value = v.mode;
+    if (v.ucl !== undefined) $("bandUcl").value = v.ucl;
+    if (v.lcl !== undefined) $("bandLcl").value = v.lcl;
+    $("chartBands").checked = !!v.on;
+  } catch (e) { /* 값이 깨졌으면 기본값으로 */ }
+  $("bandManual").style.display = $("chartSigma").value === "manual" ? "" : "none";
+}
+
+function bandsChanged() {
+  $("bandManual").style.display = $("chartSigma").value === "manual" ? "" : "none";
+  saveBands();
+  if ($("chartBands").checked && LAST) drawChart(LAST);
+}
+
+$("chartBands").onchange = () => { saveBands(); if (LAST) drawChart(LAST); };
+$("chartSigma").onchange = bandsChanged;
+$("bandUcl").oninput = bandsChanged;
+$("bandLcl").oninput = bandsChanged;
+// 자동값을 입력칸에 가져와서 손으로 고치기 (기준점이 있으면 정하기가 쉽다)
+$("bandFromSigma").onclick = () => {
+  if (!LAST) return;
+  const picked = SERIES.filter((x) => x.on && x.axis === "%"
+    && (LAST.series || []).some((r) => r[x.k] !== null && r[x.k] !== undefined));
+  const st = seriesStats(LAST.series || [], picked[0]);
+  if (!st) { alert("값이 모자라 평균을 낼 수 없습니다 (% 지표를 하나 켜고 점이 5개 이상 있어야 합니다)"); return; }
+  $("bandUcl").value = (st.mean + 2 * st.sd).toFixed(3);
+  $("bandLcl").value = (st.mean - 2 * st.sd).toFixed(3);
+  bandsChanged();
+};
 $("chartForce").onclick = () => loadChart("force");
 $("liveScope").onchange = loadLive;
 $("liveSort").onchange = loadLive;
@@ -405,10 +631,40 @@ async function api(path) {
   return data;
 }
 
+// 설명 풍선에 넣을 글자 (줄바꿈은 &#10; 로, 따옴표는 홑따옴표로 — 속성 안에 들어가므로)
+const tipAttr = (t) => t.split(NL).join("&#10;").split(String.fromCharCode(34)).join(String.fromCharCode(39));
+
+// data-tip 이 붙은 것에 마우스를 올리면 풍선을 띄운다.
+// body 에 붙인 position:fixed 상자를 쓴다 — 표를 감싼 .wrap(overflow:auto) 안에서 잘리지 않게.
+function showTip(el) {
+  const text = el.getAttribute("data-tip");
+  if (!text) return;
+  const box = $("tipbox");
+  box.textContent = text;
+  box.style.display = "block";
+  box.style.left = "0px";
+  box.style.top = "0px";
+  const r = el.getBoundingClientRect(), w = box.offsetWidth, h = box.offsetHeight;
+  let left = r.left, top = r.bottom + 7;
+  if (left + w > window.innerWidth - 8) left = window.innerWidth - w - 8;     // 오른쪽으로 넘치면 당긴다
+  if (top + h > window.innerHeight - 8) top = r.top - h - 7;                  // 아래로 넘치면 위에 띄운다
+  box.style.left = Math.max(8, left) + "px";
+  box.style.top = Math.max(8, top) + "px";
+}
+document.addEventListener("mouseover", (e) => {
+  const el = e.target.closest && e.target.closest("[data-tip]");
+  if (el) showTip(el);
+});
+document.addEventListener("mouseout", (e) => {
+  if (e.target.closest && e.target.closest("[data-tip]")) $("tipbox").style.display = "none";
+});
+// 스크롤하면 풍선이 엉뚱한 자리에 남는다 (capture: 안쪽 스크롤 상자까지 잡으려고)
+document.addEventListener("scroll", () => { $("tipbox").style.display = "none"; }, true);
+
 // cols 의 tip 이 있으면 헤더에 점선 밑줄 + 마우스 올렸을 때 설명 풍선
 function table(el, cols, rows) {
   const head = "<tr>" + cols.map((c) => `<th>${c.tip
-    ? `<span class="hint" data-tip="${c.tip.split(NL).join("&#10;").split(String.fromCharCode(34)).join(String.fromCharCode(39))}">${c.t}</span>`
+    ? `<span class="hint" data-tip="${tipAttr(c.tip)}">${c.t}</span>`
     : c.t}</th>`).join("") + "</tr>";
   const body = rows.map((r) => "<tr" + (r._click ? ` class="click" onclick="${r._click}"` : "") + ">" +
     cols.map((c) => `<td class="${c.cls ? c.cls(r) : ""}">${c.v(r)}</td>`).join("") + "</tr>").join("");
@@ -503,12 +759,45 @@ function renderPicks(available) {
     const tip = ok ? (s.tip || "") : "이 기록에는 없는 지표입니다 (1분봉에는 호가가 없습니다)";
     return `<span class="pick ${s.on && ok ? "on" : ""} ${ok ? "" : "none"}"
        style="${s.on && ok ? "color:" + s.color : ""}"${title}
-       data-tip="${tip.split(NL).join("&#10;").split(String.fromCharCode(34)).join(String.fromCharCode(39))}"
+       data-tip="${tipAttr(tip)}"
        onclick="togglePick(${i})">
        <i style="background:${ok ? s.color : "#3a4453"}"></i>${s.name}${ok ? "" : " (없음)"}</span>`;
   }).join("");
 }
 function togglePick(i) { SERIES[i].on = !SERIES[i].on; if (LAST) drawChart(LAST); else renderPicks(); }
+
+const BAND_COLOR = "#a371f7";
+
+// 빈 칸·숫자 아닌 글자는 null (= 그 선을 안 그린다)
+const numOrNull = (v) => {
+  const t = String(v === null || v === undefined ? "" : v).trim();
+  return (t === "" || Number.isNaN(Number(t))) ? null : Number(t);
+};
+
+// 지표 하나의 평균과 표준편차 (점이 5개 미만이면 의미가 없어 null)
+function seriesStats(rows, series) {
+  if (!series) return null;
+  const vals = rows.map((r) => r[series.k]).filter((v) => v !== null && v !== undefined);
+  if (vals.length < 5) return null;
+  const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const sd = Math.sqrt(vals.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (vals.length - 1));
+  return { mean, sd, n: vals.length };
+}
+
+// 관리선 정하기 — σ 자동 계산, 또는 손으로 적은 값
+// ucl / lcl 은 null 일 수 있다 (한쪽만 긋기). mean(CL) 은 자동일 때만 있다.
+function controlBands(rows, series) {
+  if ($("chartSigma").value === "manual") {
+    const ucl = numOrNull($("bandUcl").value), lcl = numOrNull($("bandLcl").value);
+    if (ucl === null && lcl === null) return null;
+    return { manual: true, name: "직접 입력", k: null, n: null, mean: null, sd: null, ucl, lcl };
+  }
+  const st = seriesStats(rows, series);
+  if (!st) return null;
+  const k = Number($("chartSigma").value) || 2;
+  return { manual: false, name: series.name, k, n: st.n, mean: st.mean, sd: st.sd,
+           ucl: st.mean + k * st.sd, lcl: st.mean - k * st.sd };
+}
 
 function drawChart(data) {
   LAST = data;
@@ -535,6 +824,12 @@ function drawChart(data) {
   }
   let pct = range(pctKeys);
   if (pct && entry !== undefined && entry !== null) pct = [Math.min(pct[0], entry - 0.05), Math.max(pct[1], entry + 0.05)];
+  // 관리선(UCL/CL/LCL): 켜 둔 % 지표 중 맨 위 것의 평균 ± kσ. 지금 김프가 드문 수준인지 보려고
+  const bands = $("chartBands").checked ? controlBands(rows, picked.find((x) => x.axis === "%")) : null;
+  if (bands && pct) {   // 그린 선이 잘리지 않게 세로 범위를 넓힌다 (한쪽만 적었으면 그쪽만)
+    if (bands.lcl !== null) pct = [Math.min(pct[0], bands.lcl - 0.03), pct[1]];
+    if (bands.ucl !== null) pct = [pct[0], Math.max(pct[1], bands.ucl + 0.03)];
+  }
   const krw = range(picked.filter((s) => s.axis === "원").map((s) => s.k));
   const yFor = (axis) => {
     const r = axis === "%" ? pct : krw;
@@ -563,6 +858,27 @@ function drawChart(data) {
     g += `<line x1="${L}" y1="${ye}" x2="${W - R}" y2="${ye}" stroke="#8b98a9" stroke-dasharray="5 4"/>` +
          `<text x="${L + 4}" y="${ye - 4}" fill="#8b98a9" font-size="11">진입 기준 ${entry}%</text>`;
   }
+  if (bands && pct) {
+    const yb = yFor("%");
+    // 두 선이 다 있으면 사이를 띠로 먼저 깔고, 그 위에 선을 그린다 (선이 띠에 묻히지 않게)
+    if (bands.ucl !== null && bands.lcl !== null) {
+      const top = yb(bands.ucl), bottom = yb(bands.lcl);
+      g += `<rect x="${L}" y="${top.toFixed(1)}" width="${W - L - R}" height="${Math.abs(bottom - top).toFixed(1)}"
+              fill="${BAND_COLOR}" opacity=".07"/>`;
+    }
+    if (bands.mean !== null) {   // CL 은 자동(σ)일 때만 — 직접 입력에는 평균이 없다
+      g += `<line x1="${L}" y1="${yb(bands.mean).toFixed(1)}" x2="${W - R}" y2="${yb(bands.mean).toFixed(1)}"
+              stroke="${BAND_COLOR}" stroke-dasharray="2 4" opacity=".85"/>`;
+    }
+    [["UCL", bands.ucl], ["LCL", bands.lcl]].forEach((item) => {
+      if (item[1] === null) return;
+      const yy = yb(item[1]);
+      g += `<line x1="${L}" y1="${yy.toFixed(1)}" x2="${W - R}" y2="${yy.toFixed(1)}"
+              stroke="${BAND_COLOR}" stroke-width="1.2" opacity=".9"/>` +
+           `<text x="${W - R - 4}" y="${(yy - 4).toFixed(1)}" fill="${BAND_COLOR}" font-size="11"
+              text-anchor="end">${item[0]} ${sign(item[1], 3)}%</text>`;
+    });
+  }
   const paths = picked.map((s) => {
     const y = yFor(s.axis);
     let d = "", pen = false;
@@ -587,7 +903,13 @@ function drawChart(data) {
   $("legend").innerHTML = picked.map((s) =>
     `<span><i style="background:${s.color}"></i>${s.name} ${s.axis === "원" ? "(오른쪽 축, 점선)" : ""}
       <b style="color:${s.color}">${s.axis === "%" ? sign(last[s.k], 3) + "%" : fmt(last[s.k], 1)}</b></span>`).join("")
-    + (pct && entry != null ? `<span><i style="background:#8b98a9"></i>진입 기준 ${entry}%</span>` : "");
+    + (pct && entry != null ? `<span><i style="background:#8b98a9"></i>진입 기준 ${entry}%</span>` : "")
+    + (bands ? `<span class="hint" data-tip="${tipAttr(TIP.bands)}"><i style="background:${BAND_COLOR}"></i>관리선
+        ${bands.manual ? "직접 입력" : bands.name + " ±" + bands.k + "σ"}
+        ${bands.mean !== null ? `— CL <b style="color:${BAND_COLOR}">${sign(bands.mean, 3)}%</b>` : "—"}
+        ${bands.ucl !== null ? `· UCL <b style="color:${BAND_COLOR}">${sign(bands.ucl, 3)}%</b>` : ""}
+        ${bands.lcl !== null ? `· LCL <b style="color:${BAND_COLOR}">${sign(bands.lcl, 3)}%</b>` : ""}
+        ${bands.sd !== null ? `(σ ${bands.sd.toFixed(3)}%p · ${bands.n.toLocaleString()}점)` : ""}</span>` : "");
   renderPicks(data.available);
   const missing = SERIES.filter((x) => x.on && !(data.available || []).includes(x.k)).map((x) => x.name);
   const rec = (data.recorded || []).map((r) => `${r.coin}(${r.count.toLocaleString()}건)`).join(", ");
@@ -641,6 +963,109 @@ $("svg").onmouseleave = () => {
   const c = $("svg").querySelector("#cross");
   if (c) c.remove();
 };
+
+// ---------- 목표 순이익 → 관리선 역산 ----------
+// 나가는 돈(수수료·호가 간격·전송비·펀딩비)을 코인의 실제 수치로 모아 '몇 %p 올라야 목표가 남나' 를 구하고,
+// 그 폭을 기간 안에서 왕복이 가장 많이 일어나는 자리에 놓는다. 계산은 서버(kimp/levels.py).
+let LEVELS = null;
+
+async function applyTargetLevels() {
+  const coin = $("chartCoin").value;
+  if (!coin) { alert("코인을 먼저 고르세요"); return; }
+  const q = [`coin=${encodeURIComponent(coin)}`, `hours=${$("chartHours").value}`,
+             `target=${$("lvTarget").value || 1}`];
+  if ($("lvNotional").value) q.push(`notional=${$("lvNotional").value}`);
+  $("lvRun").disabled = true;
+  $("levelBox").innerHTML = `<p class="muted" style="margin:0">계산 중…</p>`;
+  try {
+    const r = await api("/api/levels?" + q.join("&"));
+    LEVELS = r;
+    renderLevels(r);
+    if (r.levels) applyLevels(r.levels);
+  } catch (e) {
+    $("levelBox").innerHTML = `<p class="err" style="margin:0">${e.message}</p>`;
+  } finally {
+    $("lvRun").disabled = false;
+  }
+}
+
+// 구한 값을 입력칸에 넣고 차트에 그린다 (직접 입력 모드로 바꿔서 — 그대로 손으로 고칠 수 있다)
+function applyLevels(lv) {
+  $("chartSigma").value = "manual";
+  $("bandUcl").value = lv.ucl.toFixed(3);
+  $("bandLcl").value = lv.lcl.toFixed(3);
+  $("chartBands").checked = true;
+  bandsChanged();
+}
+
+function applyCandidate(i) {
+  if (LEVELS && LEVELS.candidates[i]) applyLevels(LEVELS.candidates[i]);
+}
+
+function renderLevels(r) {
+  const box = $("levelBox");
+  if (r.error) {
+    box.innerHTML = `<p class="err" style="margin:0">${r.error}</p>`;
+    return;
+  }
+  const lv = r.levels, w = r.window;
+  const hold = (v) => (v === null || v === undefined) ? "-" : (v < 1 ? fmt(v * 60, 0) + "분" : fmt(v, 1) + "시간");
+
+  // 비용 내역 — 항목마다 그 코인의 실제 수치와 출처를 같이 보여준다
+  const rows = r.costs.map((c) =>
+    `<tr><td>${c.name}</td>
+       <td class="${c.percent > 0 ? "minus" : (c.percent < 0 ? "plus" : "")}">${sign(c.percent, 3)}%</td>
+       <td class="muted" style="white-space:normal">${c.detail}</td></tr>`).join("");
+
+  const head = `<div class="row" style="margin:0 0 10px">
+      <b style="font-size:13.5px">목표 순이익 ${fmt(r.target_percent, 2)}%</b>
+      <span class="muted">→ 필요한 폭</span>
+      <b style="color:${BAND_COLOR};font-size:15px">${fmt(r.required_gap_percent, 3)}%p</b>
+      <span class="muted">= 목표 ${fmt(r.target_percent, 2)}% + 비용 ${fmt(r.cost_percent, 3)}%</span>
+      <span style="flex:1"></span>
+      <span class="muted">${r.coin} · 포지션 ${r.notional_usdt.toLocaleString()} USDT ·
+        가운데 김프 ${r.points.toLocaleString()}점 / ${fmt(r.hours, 0)}시간</span>
+    </div>`;
+
+  const levelLine = lv ? `<div class="row" style="margin:10px 0 0">
+      <span class="chip" style="color:${BAND_COLOR};border-color:${BAND_COLOR}">LCL ${sign(lv.lcl, 3)}% 이하 진입</span>
+      <span class="chip" style="color:${BAND_COLOR};border-color:${BAND_COLOR}">UCL ${sign(lv.ucl, 3)}% 이상 청산</span>
+      <span class="muted">이 기간에</span>
+      <b class="${lv.round_trips ? "plus" : "minus"}">왕복 ${lv.round_trips}회</b>
+      <span class="muted">(진입 조건 ${lv.entries}회${lv.still_holding ? ", 마지막은 보유 중" : ""} ·
+        평균 보유 ${hold(lv.avg_hold_hours)})</span>
+      ${r.trips_per_month ? `<span class="muted">· 이 속도면 월 ${fmt(r.trips_per_month, 1)}회 ·
+        ${sign(r.profit_per_month_usdt, 0)} USDT</span>` : ""}
+    </div>` : "";
+
+  const cands = (r.candidates || []).length > 1 ? `<div class="row" style="margin:8px 0 0">
+      <span class="muted">다른 자리:</span>
+      ${r.candidates.map((c, i) =>
+        `<span class="pick" onclick="applyCandidate(${i})">LCL ${sign(c.lcl, 2)} / UCL ${sign(c.ucl, 2)}
+           · ${c.round_trips}회 · ${hold(c.avg_hold_hours)}</span>`).join("")}
+    </div>` : "";
+
+  box.innerHTML = head +
+    `<div class="wrap"><table class="costs">
+       <tr><th>나가는 돈</th><th>비율</th><th>이 코인의 수치</th></tr>${rows}
+       <tr class="sum"><td>비용 합계</td><td class="minus">${sign(r.cost_percent, 3)}%</td>
+         <td class="muted">포지션 ${r.notional_usdt.toLocaleString()} USDT 대비 · 펀딩비는 보유 ${hold(r.assumed_hold_hours)} 가정</td></tr>
+     </table></div>` +
+    levelLine + cands +
+    `<p class="note" style="margin-top:10px">기간 중 가운데 김프 ${sign(w.min, 3)}% ~ ${sign(w.max, 3)}%
+      (변동폭 <b>${fmt(w.swing, 3)}%p</b> · 평균 ${sign(w.mean, 3)}% · 마지막 ${sign(w.last, 3)}%)</p>` +
+    (r.warning ? `<p class="note err" style="margin-top:6px">${r.warning}</p>` : "") +
+    // 차트 데이터가 기간에 비해 적으면 변동폭이 과소평가된다 → 캔들을 받으라고 알려 준다
+    (r.points < r.hours * 60 * 0.5 ? `<p class="note" style="margin-top:6px;color:var(--warn)">
+      이 계산은 <b>차트에 있는 데이터만</b> 씁니다 — 지금은 ${fmt(r.hours, 0)}시간 구간에
+      ${r.points.toLocaleString()}점뿐입니다 (1분봉이면 ${(r.hours * 60).toLocaleString()}점).
+      위 <b>지금 받아오기</b> 로 캔들을 받은 뒤 다시 누르면 변동폭이 제대로 나옵니다.</p>` : "") +
+    `<p class="note" style="margin-top:6px">왕복 수는 <b>이 기간에 그랬다</b>는 뜻입니다 — 다음 기간을 보장하지 않습니다.
+      호가 간격은 그 코인의 실측(기록 30줄 이상)이고, 없으면 추측값입니다.</p>`;
+}
+
+$("lvRun").onclick = applyTargetLevels;
+$("lvTarget").onkeydown = (e) => { if (e.key === "Enter") applyTargetLevels(); };
 
 async function loadChart(mode) {
   const coin = $("chartCoin").value, hours = $("chartHours").value;
@@ -967,6 +1392,304 @@ async function loadBot() {
   }
 }
 
+// ---------- 대시보드 (기간 성과) ----------
+// 기록(실거래·드라이런·페이퍼 DB 또는 시뮬레이션 결과)과 기간을 골라 집계를 받아 그린다.
+// 집계는 서버(kimp/dashboard.py)에서 하고 여기서는 그리기만 한다.
+const DB_COLORS = { up: "#3fb950", down: "#f85149", grid: "#2a3340", dim: "#8b98a9" };
+let DASH = null, EQ_PLOT = null, DAILY_PLOT = null;   // *_PLOT: 차트 마우스 오버에서 쓸 좌표 변환
+
+// 날짜 입력칸은 그 PC 시간대 기준이다 (toISOString 은 UTC 라 하루가 밀릴 수 있어 직접 맞춘다)
+const dayValue = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+
+function dashRange(days) {
+  if (!days) { $("dbFrom").value = ""; $("dbTo").value = ""; }
+  else {
+    const to = new Date();
+    $("dbFrom").value = dayValue(new Date(to.getTime() - days * 86400000));
+    $("dbTo").value = dayValue(to);
+  }
+  loadDash();
+}
+
+async function loadDash() {
+  const q = [];
+  if ($("dbSrc").value) q.push("source=" + encodeURIComponent($("dbSrc").value));
+  if ($("dbFrom").value) q.push("start=" + $("dbFrom").value);
+  if ($("dbTo").value) q.push("end=" + $("dbTo").value);
+  $("dbInfo").textContent = "불러오는 중…";
+  try {
+    const d = await api("/api/dashboard" + (q.length ? "?" + q.join("&") : ""));
+    DASH = d;
+    dashSources(d);
+    // 날짜를 비워 뒀으면 서버가 맞춘 기간(기록 전체)을 칸에 채워 보여준다
+    if (!$("dbFrom").value) $("dbFrom").value = d.range.start;
+    if (!$("dbTo").value) $("dbTo").value = d.range.end;
+    dashCards(d.summary);
+    drawEquity(d.equity);
+    drawDaily(d.daily);
+    dashTables(d);
+    $("dbInfo").textContent = `${d.meta.db} · 기간 내 ${d.summary.trades}건 / 전체 ${d.all_trades}건`;
+  } catch (e) {
+    $("dbCards").innerHTML = `<p class="err">${e.message}</p>`;
+    $("dbInfo").textContent = "";
+  }
+}
+
+function dashSources(d) {
+  const sel = $("dbSrc");
+  sel.innerHTML = d.sources.map((s) => {
+    const n = (s.trades === null || s.trades === undefined) ? "" : ` · ${s.trades}건`;
+    return `<option value="${s.value}">${s.label}${n}${s.active ? " ← 지금 모드" : ""}</option>`;
+  }).join("");
+  sel.value = d.source;
+}
+
+function dashCards(s) {
+  const amount = (v, dg) => (v === null || v === undefined) ? "-" : (v >= 0 ? "+" : "") + Number(v).toFixed(dg === undefined ? 2 : dg);
+  const color = (v, text) => `<span class="${cls(v)}">${text}</span>`;
+  const cards = [
+    ["순손익", color(s.net_usdt, amount(s.net_usdt) + " USDT"), TIP.netPnl],
+    ["거래 수", `${s.trades}건 <span class="muted">/ ${s.days}일</span>`, TIP.dbTrades],
+    ["승률", s.win_rate === null ? "-" : `${fmt(s.win_rate, 1)}% <span class="muted">(${s.wins}승 ${s.losses}패)</span>`],
+    ["평균 손익률", color(s.avg_net_percent, sign(s.avg_net_percent) + "%"), TIP.dbAvgPercent],
+    ["건당 평균", color(s.avg_net_usdt, amount(s.avg_net_usdt, 3) + " USDT")],
+    ["거래 규모 대비", color(s.return_on_turnover, sign(s.return_on_turnover, 3) + "%"), TIP.dbTurnover],
+    ["김프 몫", color(s.gross_usdt, amount(s.gross_usdt)), TIP.dbGross],
+    ["펀딩비", color(s.funding_usdt, amount(s.funding_usdt, 3)), TIP.dbFunding],
+    ["비용 (수수료·전송)", `<span class="minus">-${fmt(s.cost_usdt, 3)}</span>`, TIP.dbCost],
+    ["평균 보유", s.avg_hold_hours === null ? "-" : fmt(s.avg_hold_hours, 1) + "시간", TIP.dbHold],
+    ["최대 낙폭", color(s.max_drawdown_usdt, amount(s.max_drawdown_usdt)), TIP.dbDrawdown],
+    ["월 환산", color(s.net_per_month, amount(s.net_per_month) + " USDT"), TIP.dbMonth],
+  ];
+  $("dbCards").innerHTML = cards.map(([k, v, tip]) =>
+    `<div class="card"><b${tip ? ` class="hint" data-tip="${tipAttr(tip)}"` : ""}>${k}</b><span>${v}</span></div>`).join("");
+}
+
+// 누적 순손익 선 (가로축 = 청산 시각, 세로축 = USDT). 점 하나가 거래 한 건
+function drawEquity(points) {
+  const svg = $("dbEquity"), W = 900, H = 260, L = 62, R = 18, T = 14, B = 26;
+  if (!points || !points.length) {
+    svg.innerHTML = `<text x="20" y="34" fill="${DB_COLORS.dim}">이 기간에 닫은 거래가 없습니다</text>`;
+    return;
+  }
+  const t0 = points[0].ts, t1 = points[points.length - 1].ts;
+  const x = (t) => L + (t1 === t0 ? (W - L - R) / 2 : (t - t0) / (t1 - t0) * (W - L - R));
+  const vals = points.map((p) => p.cum_usdt).concat([0]);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = (hi - lo) * 0.12 || 1;
+  lo -= pad; hi += pad;
+  const y = (v) => T + (hi - v) / (hi - lo) * (H - T - B);
+  const out = [];
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, yy = y(v).toFixed(1);
+    out.push(`<line x1="${L}" y1="${yy}" x2="${W - R}" y2="${yy}" stroke="${DB_COLORS.grid}" stroke-width="1"/>`);
+    out.push(`<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" fill="${DB_COLORS.dim}" font-size="11" text-anchor="end">${v.toFixed(1)}</text>`);
+  }
+  if (lo < 0 && hi > 0) {
+    out.push(`<line x1="${L}" y1="${y(0).toFixed(1)}" x2="${W - R}" y2="${y(0).toFixed(1)}" stroke="${DB_COLORS.dim}" stroke-width="1" stroke-dasharray="4 3"/>`);
+  }
+  const final = points[points.length - 1].cum_usdt;
+  const line = points.map((p, i) => `${i ? "L" : "M"}${x(p.ts).toFixed(1)},${y(p.cum_usdt).toFixed(1)}`).join(" ");
+  out.push(`<path d="${line}" fill="none" stroke="${final >= 0 ? DB_COLORS.up : DB_COLORS.down}" stroke-width="2"/>`);
+  if (points.length <= 200) {
+    points.forEach((p) => out.push(
+      `<circle cx="${x(p.ts).toFixed(1)}" cy="${y(p.cum_usdt).toFixed(1)}" r="2.6"
+        fill="${p.net_usdt >= 0 ? DB_COLORS.up : DB_COLORS.down}"/>`));
+  }
+  out.push(`<text x="${L}" y="${H - 8}" fill="${DB_COLORS.dim}" font-size="11">${kst(t0).slice(0, 12)}</text>`);
+  out.push(`<text x="${W - R}" y="${H - 8}" fill="${DB_COLORS.dim}" font-size="11" text-anchor="end">${kst(t1).slice(0, 12)}</text>`);
+  svg.innerHTML = out.join("");
+  EQ_PLOT = { points, W, H, L, R, T, B, t0, t1, x, y };   // 마우스 오버에서 쓸 좌표 변환
+}
+
+// 일별 손익 막대 (거래가 있던 날만 그린다)
+function drawDaily(days) {
+  const svg = $("dbDaily"), W = 900, H = 200, L = 62, R = 18, T = 12, B = 30;
+  if (!days || !days.length) {
+    svg.innerHTML = `<text x="20" y="34" fill="${DB_COLORS.dim}">이 기간에 닫은 거래가 없습니다</text>`;
+    return;
+  }
+  const vals = days.map((d) => d.net_usdt).concat([0]);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = (hi - lo) * 0.18 || 1;
+  lo -= pad; hi += pad;
+  const y = (v) => T + (hi - v) / (hi - lo) * (H - T - B);
+  const step = (W - L - R) / days.length;
+  const bw = Math.max(2, step * 0.68);
+  const out = [`<line x1="${L}" y1="${y(0).toFixed(1)}" x2="${W - R}" y2="${y(0).toFixed(1)}" stroke="${DB_COLORS.dim}" stroke-width="1"/>`];
+  for (let i = 0; i <= 2; i++) {
+    const v = lo + (hi - lo) * i / 2;
+    out.push(`<text x="${L - 6}" y="${(y(v) + 4).toFixed(1)}" fill="${DB_COLORS.dim}" font-size="11" text-anchor="end">${v.toFixed(1)}</text>`);
+  }
+  const every = Math.ceil(days.length / 12);
+  days.forEach((d, i) => {
+    const cx = L + step * (i + 0.5);
+    const top = y(Math.max(0, d.net_usdt)), h = Math.max(1, Math.abs(y(d.net_usdt) - y(0)));
+    out.push(`<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}"
+      fill="${d.net_usdt >= 0 ? DB_COLORS.up : DB_COLORS.down}"/>`);
+    if (i % every === 0) {
+      out.push(`<text x="${cx.toFixed(1)}" y="${H - 10}" fill="${DB_COLORS.dim}" font-size="10" text-anchor="middle">${d.date.slice(5)}</text>`);
+    }
+  });
+  svg.innerHTML = out.join("");
+  DAILY_PLOT = { days, W, H, L, R, T, B, step, y };
+}
+
+// 대시보드 차트 마우스 오버
+// SVG <title> 은 브라우저에 따라 안 뜨거나 한참 뒤에 뜬다 → 김프 차트처럼 직접 상자를 띄운다
+function hideDashHover(svg) {
+  $("dhover").style.display = "none";
+  const mark = svg && svg.querySelector("#dmark");
+  if (mark) mark.remove();
+}
+
+function placeDashHover(ev) {
+  const box = $("dhover");
+  box.style.display = "block";
+  const w = box.offsetWidth, h = box.offsetHeight;
+  let left = ev.clientX + 16, top = ev.clientY + 16;
+  if (left + w > window.innerWidth - 8) left = ev.clientX - w - 16;
+  if (top + h > window.innerHeight - 8) top = ev.clientY - h - 16;
+  box.style.left = Math.max(8, left) + "px";
+  box.style.top = Math.max(8, top) + "px";
+}
+
+// 화면 px → viewBox 가로 좌표
+function viewX(ev, svg, plot) {
+  const rect = svg.getBoundingClientRect();
+  return (ev.clientX - rect.left) / rect.width * plot.W;
+}
+
+function equityHover(ev) {
+  const svg = $("dbEquity"), plot = EQ_PLOT;
+  if (!plot || !plot.points.length) return;
+  const vx = viewX(ev, svg, plot);
+  const ratio = (vx - plot.L) / (plot.W - plot.L - plot.R);
+  if (ratio < -0.03 || ratio > 1.03) { hideDashHover(svg); return; }
+  const want = plot.t0 + Math.min(1, Math.max(0, ratio)) * (plot.t1 - plot.t0);
+  let best = 0;
+  plot.points.forEach((p, i) => {
+    if (Math.abs(p.ts - want) < Math.abs(plot.points[best].ts - want)) best = i;
+  });
+  const p = plot.points[best];
+  const color = p.net_usdt >= 0 ? DB_COLORS.up : DB_COLORS.down;
+  $("dhover").innerHTML =
+    `<b>${p.coin}</b> · ${kst(p.ts)}<br>` +
+    `이 거래 <b style="color:${color}">${sign(p.net_usdt, 3)} USDT</b><br>` +
+    `누적 <b>${sign(p.cum_usdt)} USDT</b><br>` +
+    `<span style="color:var(--dim)">${best + 1}번째 / 전체 ${plot.points.length}건</span>`;
+  placeDashHover(ev);
+  const old = svg.querySelector("#dmark");
+  if (old) old.remove();
+  const cx = plot.x(p.ts).toFixed(1), cy = plot.y(p.cum_usdt).toFixed(1);
+  svg.insertAdjacentHTML("beforeend",
+    `<g id="dmark"><line x1="${cx}" y1="${plot.T}" x2="${cx}" y2="${plot.H - plot.B}"
+        stroke="${DB_COLORS.dim}" stroke-dasharray="2 3"/>
+      <circle cx="${cx}" cy="${cy}" r="5" fill="none" stroke="${color}" stroke-width="2"/></g>`);
+}
+
+function dailyHover(ev) {
+  const svg = $("dbDaily"), plot = DAILY_PLOT;
+  if (!plot || !plot.days.length) return;
+  const vx = viewX(ev, svg, plot);
+  const i = Math.floor((vx - plot.L) / plot.step);
+  if (i < 0 || i >= plot.days.length) { hideDashHover(svg); return; }
+  const d = plot.days[i];
+  const color = d.net_usdt >= 0 ? DB_COLORS.up : DB_COLORS.down;
+  $("dhover").innerHTML =
+    `<b>${d.date}</b> <span style="color:var(--dim)">(한국 시간)</span><br>` +
+    `손익 <b style="color:${color}">${sign(d.net_usdt, 3)} USDT</b><br>` +
+    `거래 ${d.trades}건 <span style="color:var(--dim)">(${d.wins}승 ${d.trades - d.wins}패)</span>`;
+  placeDashHover(ev);
+  const old = svg.querySelector("#dmark");
+  if (old) old.remove();
+  const cx = (plot.L + plot.step * (i + 0.5)).toFixed(1);
+  svg.insertAdjacentHTML("beforeend",
+    `<line id="dmark" x1="${cx}" y1="${plot.T}" x2="${cx}" y2="${plot.H - plot.B}"
+       stroke="${DB_COLORS.dim}" stroke-dasharray="2 3"/>`);
+}
+
+$("dbEquity").onmousemove = equityHover;
+$("dbEquity").onmouseleave = () => hideDashHover($("dbEquity"));
+$("dbDaily").onmousemove = dailyHover;
+$("dbDaily").onmouseleave = () => hideDashHover($("dbDaily"));
+
+function dashTables(d) {
+  const hours = (v) => (v === null || v === undefined) ? "-" : (v < 1 ? fmt(v * 60, 0) + "분" : fmt(v, 1) + "시간");
+  const when = (ms) => ms ? kst(ms).slice(0, 19) : "-";
+
+  table($("dbCoin"), [
+    { t: "코인", v: (r) => r.coin },
+    { t: "거래", v: (r) => r.trades + "건" },
+    { t: "순손익", tip: TIP.netPnl, v: (r) => sign(r.net_usdt) + " USDT", cls: (r) => cls(r.net_usdt) },
+    { t: "승률", v: (r) => `${fmt(r.win_rate, 0)}% (${r.wins}/${r.trades})` },
+    { t: "평균 손익률", tip: TIP.dbAvgPercent, v: (r) => sign(r.avg_net_percent) + "%", cls: (r) => cls(r.avg_net_percent) },
+    { t: "평균 보유", tip: TIP.dbHold, v: (r) => hours(r.avg_hold_hours) },
+    { t: "평균 진입 김프", tip: TIP.entry, v: (r) => sign(r.avg_entry_premium, 3) },
+    { t: "평균 청산 김프", tip: TIP.exit, v: (r) => sign(r.avg_exit_premium, 3) },
+    { t: "펀딩비", tip: TIP.dbFunding, v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
+    { t: "비용", tip: TIP.dbCost, v: (r) => fmt(r.cost_usdt, 3) },
+    { t: "최고/최저", v: (r) => `${sign(r.best_usdt, 2)} / ${sign(r.worst_usdt, 2)}` },
+  ], d.by_coin);
+
+  table($("dbReason"), [
+    { t: "사유", tip: TIP.reason, v: (r) => r.reason },
+    { t: "거래", v: (r) => r.trades + "건" },
+    { t: "순손익", v: (r) => sign(r.net_usdt) + " USDT", cls: (r) => cls(r.net_usdt) },
+    { t: "평균 손익률", v: (r) => sign(r.avg_net_percent) + "%", cls: (r) => cls(r.avg_net_percent) },
+    { t: "평균 보유", v: (r) => hours(r.avg_hold_hours) },
+  ], d.by_reason);
+
+  if (!d.open.length) $("dbOpen").innerHTML = `<tr><td class="muted">열려 있는 포지션이 없습니다</td></tr>`;
+  else table($("dbOpen"), [
+    { t: "코인", v: (r) => r.coin },
+    { t: "상태", tip: TIP.status, v: (r) => r.status },
+    { t: "진입 시각", v: (r) => when(r.opened_ms) },
+    { t: "진입 김프", tip: TIP.entry, v: (r) => sign(r.entry_premium, 3) },
+    { t: "포지션", v: (r) => fmt(r.notional_usdt) + " USDT" },
+    { t: "지금 손익률", v: (r) => sign(r.last_net_percent) + "%", cls: (r) => cls(r.last_net_percent) },
+    { t: "지금 청산 김프", tip: TIP.exit, v: (r) => sign(r.last_exit_premium, 3) },
+    { t: "펀딩비", v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
+    { t: "목표/손절", v: (r) => `+${fmt(r.target)}% / ${fmt(r.stop)}%` },
+    { t: "강제청산가", tip: TIP.liq, v: (r) => fmt(r.liquidation_price, 6) },
+  ], d.open);
+
+  if (!d.trades.length) $("dbTrades").innerHTML = `<tr><td class="muted">이 기간에 닫은 거래가 없습니다</td></tr>`;
+  else table($("dbTrades"), [
+    { t: "코인", v: (r) => r.coin },
+    { t: "진입", v: (r) => when(r.opened_ms).slice(5, 16) },
+    { t: "청산", v: (r) => when(r.closed_ms).slice(5, 16) },
+    { t: "보유", tip: TIP.dbHold, v: (r) => hours(r.hold_hours) },
+    { t: "진입 김프", tip: TIP.entry, v: (r) => sign(r.entry_premium, 3) },
+    { t: "청산 김프", tip: TIP.exit, v: (r) => sign(r.exit_premium, 3) },
+    { t: "사유", tip: TIP.reason, v: (r) => r.exit_reason },
+    { t: "포지션", v: (r) => fmt(r.notional_usdt) },
+    { t: "김프 몫", tip: TIP.dbGross, v: (r) => sign(r.gross_usdt, 3), cls: (r) => cls(r.gross_usdt) },
+    { t: "펀딩비", tip: TIP.dbFunding, v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
+    { t: "비용", tip: TIP.dbCost, v: (r) => fmt(r.cost_usdt, 3) },
+    { t: "순손익", tip: TIP.netPnl, v: (r) => sign(r.net_usdt, 3), cls: (r) => cls(r.net_usdt) },
+    { t: "손익률", v: (r) => sign(r.net_percent) + "%", cls: (r) => cls(r.net_percent) },
+  ], d.trades);
+
+  if (!d.transfers.length) $("dbTransfers").innerHTML = `<tr><td class="muted">이 기간에 송금 기록이 없습니다</td></tr>`;
+  else table($("dbTransfers"), [
+    { t: "방향", tip: TIP.dbTransfer, v: (r) => r.direction === "upbit->bybit" ? "업비트 → 바이비트" : "바이비트 → 업비트" },
+    { t: "금액", v: (r) => fmt(r.amount_usdt) + " USDT" },
+    { t: "수수료", v: (r) => fmt(r.fee_usdt, 2) },
+    { t: "망", v: (r) => r.network },
+    { t: "상태", v: (r) => r.status, cls: (r) => r.status === "FAILED" ? "minus" : (r.status === "CONFIRMED" ? "plus" : "") },
+    { t: "사유", v: (r) => r.reason || "-" },
+    { t: "요청", v: (r) => when(r.requested_ms).slice(5, 16) },
+    { t: "확인", v: (r) => when(r.confirmed_ms).slice(5, 16) },
+    { t: "메모", v: (r) => `<span class="flags">${r.note || ""}</span>` },
+  ], d.transfers);
+}
+
+$("dbGo").onclick = loadDash;
+$("dbSrc").onchange = () => { $("dbFrom").value = ""; $("dbTo").value = ""; loadDash(); };
+$("dbFrom").onchange = loadDash;
+$("dbTo").onchange = loadDash;
+
 // 코인 목록은 조회가 몇 초 걸려서 설정이 뜬 뒤에 따로 채운다
 async function loadUniverse() {
   try {
@@ -1003,6 +1726,7 @@ async function reload() {
   }
   loadLive();
   const on = document.querySelector("main section.on").id;
+  if (on === "dash") loadDash();
   if (on === "chart") loadChart();
   if (on === "screen") loadScreen();
   if (on === "sim") loadSims();
@@ -1011,6 +1735,9 @@ async function reload() {
   renderPicks();
   attachRunningJob();
 }
+$("bandsTip").setAttribute("data-tip", TIP.bands);
+$("levelTip").setAttribute("data-tip", TIP.levels);
+loadBands();
 reload();
 </script>
 </body>

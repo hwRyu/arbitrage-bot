@@ -2,6 +2,7 @@
 import unittest
 
 from kimp.screen import (
+    RECENT_FAIL_DISCOUNT,
     CoinLive,
     SwingCosts,
     best_swing,
@@ -213,6 +214,82 @@ class ScoreTest(unittest.TestCase):
     def test_trend_flag(self):
         s = self._eval("UP", [i * 0.02 for i in range(300)])
         self.assertIn("추세↑", s.flags)
+
+
+
+
+class RecentOpportunityTest(unittest.TestCase):
+    """
+    최근(검증) 구간에 기회가 없으면 점수를 깎는다 — 다만 0 으로 뭉개지 않는다
+
+    예전에는 검증 수익이 0 이면 점수도 0 이 되어, '최근에 기회가 없던' 코인이 전부 0 점으로
+    뭉쳐 서로 구분이 안 됐다 (월 23% 를 자리 7% 로 버는 코인과 월 4% 를 자리 58% 로 버는 코인이 같은 점수).
+    지금은 전체 점수를 RECENT_FAIL_DISCOUNT(1/4) 로 깎아서 벌점은 세고 순위는 남긴다.
+    """
+
+    WAVE = [-1.5] * 5 + [0.8] * 5            # 기회가 있는 파도 (기존 테스트와 같은 모양)
+    STUCK = [-1.5] * 5 + [-1.3] * 5          # 진입은 되지만 목표에 못 닿아 청산이 안 되는 구간
+    QUIET = ([-0.45] * 2 + [-0.25] * 2) * 25  # 진입 기준에 아예 안 닿는 잔잔한 구간
+
+    def _eval(self, coin, values, recent_days=0.0, stop=-5.0):
+        return evaluate_coin(coin, series(values), BAR, days=len(values) * BAR / 86_400_000,
+                             spread_percent=0.05, usdt_spread_percent=0.05, fixed_cost_percent=0.4,
+                             target=1.0, stop=stop, funding=[], live=CoinLive(), size_usdt=1000,
+                             recent_days=recent_days)
+
+    def test_recent_empty_is_discounted_not_zeroed(self):
+        """앞은 파도, 최근은 청산이 안 되는 구간 → 점수가 0 이 아니라 전체의 1/4 로 깎인다"""
+        s = self._eval("HEAD", ([-1.5] * 2 + [0.8] * 2) * 50 + self.STUCK * 10)
+        self.assertTrue(s.recent_empty)
+        self.assertEqual(s.test.trades, 0)
+        self.assertGreater(s.monthly, 0)
+        self.assertAlmostEqual(s.base_score, s.monthly * RECENT_FAIL_DISCOUNT, places=6)
+        self.assertGreater(s.score, 0)                 # 0 으로 뭉개지 않는다
+        self.assertIn("최근기회없음", s.flags)
+
+    def test_discount_keeps_ranking(self):
+        """둘 다 최근 기회가 없어도, 빨리 왕복해서 더 번 코인이 위로 온다 (예전엔 둘 다 0 점)"""
+        fast = self._eval("FAST", ([-1.5] * 2 + [0.8] * 2) * 50 + self.QUIET)
+        slow = self._eval("SLOW", ([-1.5] * 10 + [0.8] * 10) * 10 + self.QUIET)
+        self.assertTrue(fast.recent_empty and slow.recent_empty)
+        self.assertGreater(fast.score, 0)
+        self.assertGreater(slow.score, 0)
+        self.assertGreater(fast.score, slow.score)
+        self.assertEqual([x.coin for x in rank([slow, fast])], ["FAST", "SLOW"])
+
+    def test_recent_trades_means_no_discount(self):
+        """최근 구간에도 거래가 있으면 깎지 않고 min(전체, 검증) 그대로"""
+        s = self._eval("BOTH", self.WAVE * 40)
+        self.assertFalse(s.recent_empty)
+        self.assertGreater(s.test.trades, 0)
+        self.assertAlmostEqual(s.base_score, min(s.monthly, s.test_monthly), places=6)
+        self.assertNotIn("최근기회없음", s.flags)
+
+    def test_recent_loss_is_not_rescued_by_discount(self):
+        """최근에 손절이 났으면 감점으로 구제하지 않는다 (음수가 그대로 깔린다)"""
+        # 진입 기준에 닿은 뒤 -4% 로 떨어져 손절 (stop -2%) → 검증 구간 손실
+        s = self._eval("LOSS", self.WAVE * 20 + ([-1.5] * 5 + [-4.0] * 15) * 5, stop=-2.0)
+        self.assertFalse(s.recent_empty)
+        self.assertLess(s.test_monthly, 0)
+        self.assertAlmostEqual(s.base_score, min(s.monthly, s.test_monthly), places=6)
+        self.assertLess(s.score, 0)
+        self.assertNotIn("최근기회없음", s.flags)
+
+    def test_recent_days_moves_the_cut(self):
+        """--recent-days 를 주면 검증 구간 길이가 기간이 아니라 그 일수로 정해진다"""
+        values = self.WAVE * 40                        # 400봉 × 15분 ≈ 4.17일
+        default = self._eval("A", values)              # 뒤 1/3 ≈ 1.39일
+        short = self._eval("B", values, recent_days=1.0)
+        self.assertGreater(default.test_days, short.test_days)
+        self.assertAlmostEqual(short.test_days, 1.0, delta=0.05)
+        self.assertGreater(short.test.trades, 0)
+
+    def test_recent_days_ignored_when_too_long(self):
+        """기간보다 긴 --recent-days 는 무시한다 (기준을 고를 앞 구간이 없어지므로)"""
+        s = self._eval("C", self.WAVE * 40, recent_days=999.0)
+        self.assertGreater(s.test_days, 0)
+        self.assertIsNotNone(s.full)
+        self.assertIsNotNone(s.test)
 
 
 if __name__ == "__main__":

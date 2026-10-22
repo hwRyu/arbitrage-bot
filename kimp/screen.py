@@ -118,6 +118,8 @@ CYCLE_GOOD_HOURS = 24.0
 # 자리 점유율 하한. 거래가 1~2건뿐인 코인이 '자리를 거의 안 쓴다' 는 이유로
 # 점수가 부풀지 않게 막는다. 0.25 = 자리를 4분의 1 은 쓴다고 보고 계산
 MIN_OCCUPANCY = 0.25
+# 검증 기간에 완결된 거래가 아예 없을 때 전체 점수에 곱할 값 (0 으로 뭉개지 않고 깎기만 한다)
+RECENT_FAIL_DISCOUNT = 0.25
 
 # 추천 COINS 목록을 만들 때 쓸 자리 예산 비율.
 # 자리 3개 × 0.8 = 2.4 까지만 채운다 (꽉 채우면 빠른 코인이 들어갈 틈이 없다)
@@ -490,9 +492,26 @@ class CoinScore:
         return per_month(self.test.total, self.test_days) if self.test else 0.0
 
     @property
+    def recent_empty(self) -> bool:
+        """검증 기간에 완결된 거래가 하나도 없었나 (= 최근에는 목표를 낼 기회가 없었다)"""
+        return self.test is None or self.test.trades == 0
+
+    @property
     def base_score(self) -> float:
-        """기본 점수 = 전체 월 수익과 검증 월 수익 중 작은 값 (지난 기간에만 맞춘 기준을 걸러내려고)"""
-        return min(self.monthly, self.test_monthly) if self.full else -999.0
+        """
+        기본 점수 = 전체 월 수익과 검증 월 수익 중 작은 값 (지난 기간에만 맞춘 기준을 걸러내려고)
+
+        단, 검증 기간에 **거래가 아예 없으면** 0 으로 뭉개지 말고 전체 점수를
+        RECENT_FAIL_DISCOUNT 배로 깎는다. 0 으로 두면 '최근에 기회가 없던' 코인이 전부 0 점이 되어
+        서로 구분이 안 된다 — 월 23% 를 자리 7% 로 버는 코인과 월 4% 를 자리 58% 로 버는 코인이 같은 0 점.
+        벌점(4분의 1)은 그대로 세면서 순위는 살려 둔다.
+        검증 기간에 거래가 있었는데 손실이면 min 이 음수가 되어 그대로 깔린다 (기회가 없던 것보다 나쁘다).
+        """
+        if not self.full:
+            return -999.0
+        if self.recent_empty and self.monthly > 0:
+            return self.monthly * RECENT_FAIL_DISCOUNT
+        return min(self.monthly, self.test_monthly)
 
     @property
     def score(self) -> float:
@@ -527,7 +546,8 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
                   spread_percent: float, usdt_spread_percent: float, fixed_cost_percent: float,
                   target: float, stop: float, funding: Sequence[Tuple[int, float]],
                   live: CoinLive, size_usdt: float,
-                  cycle_good_hours: float = CYCLE_GOOD_HOURS) -> Optional[CoinScore]:
+                  cycle_good_hours: float = CYCLE_GOOD_HOURS,
+                  recent_days: float = 0.0) -> Optional[CoinScore]:
     """
     코인 하나 평가: 통계 + 백테스트(전체 / 검증) + 경고 표시
 
@@ -536,6 +556,7 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
         spread_percent: 코인 호가 간격 (업비트 + 바이비트, %)
         usdt_spread_percent: 업비트 USDT/KRW 호가 간격 (%)
         fixed_cost_percent: 수수료 + 전송비 (%)
+        recent_days: 검증에 쓸 최근 기간 (일). 0 이면 기간의 뒤 1/3
     """
     if len(series) < 50:
         return None
@@ -546,8 +567,14 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
 
     full = best_swing(series, costs, funding)
 
-    # 검증: 앞 2/3 로 기준 고르기 → 뒤 1/3 에 그대로 써보기
+    # 검증: 앞 구간에서 기준 고르기 → 뒤 구간(최근)에 그대로 써보기
+    # 기본은 뒤 1/3. --recent-days 를 주면 그 일수로 자른다 (--days 를 바꿔도 검증 길이가 안 흔들리게)
     cut = len(series) * 2 // 3
+    if recent_days > 0 and series:
+        edge = series[-1][0] - recent_days * DAY_MS
+        at = next((i for i, (ts, _) in enumerate(series) if ts >= edge), None)
+        if at is not None and 0 < at < len(series):
+            cut = at
     train, test_part = series[:cut], series[cut:]
     picked = best_swing(train, costs, funding)
     test = run_swing(test_part, picked.threshold, costs, funding) if picked else None
@@ -581,6 +608,8 @@ def make_flags(s: CoinScore, size_usdt: float) -> List[str]:
         flags.append("회귀느림")
     if s.cycle_hours and s.cycle_hours > 7 * 24:
         flags.append("기회드묾")
+    if s.full and s.full.trades and s.recent_empty:
+        flags.append("최근기회없음")   # 전체 기간엔 벌었지만 검증(최근) 구간엔 완결된 거래가 없다
     if s.funding_8h < 0:
         flags.append("펀딩냄")
     if s.full and s.full.is_open_at_end and s.full.open_net < 0:
@@ -634,7 +663,9 @@ LEGEND = """
 열 설명
   봉       이 점수를 계산한 캔들 간격. 1m = 2단계에서 시뮬레이션과 같은 기준으로 다시 본 코인
   전체/월  전체 기간에 가장 좋았던 진입 기준으로 돌렸을 때 월 환산 수익 (%)
-  검증/월  앞 2/3 기간에서 고른 기준을 뒤 1/3 기간에 그대로 썼을 때 월 환산 수익 (%)
+  검증/월  앞 기간에서 고른 기준을 뒤(최근) 기간에 그대로 썼을 때 월 환산 수익 (%)
+           기본은 뒤 1/3 (--recent-days 로 '최근 N일' 고정 가능). 0.00 이면 그 구간에 완결된 거래가 없었다는 뜻
+           → 점수는 전체/월 의 1/4 로 깎인다 (최근기회없음 경고). 0 으로 뭉개면 코인끼리 구분이 안 되므로
   거래/승  전체 기간 닫은 거래 수 / 그중 이익 / 진입기준: 그때 쓴 진입 김프 기준 (%)
   보유h    거래 하나 평균 보유 시간
   주기h    반복 주기 = 기간 ÷ 왕복 횟수 (시간). 24시간 이하면 가중치 1, 48시간 0.5, 1주 0.14
@@ -651,6 +682,7 @@ LEGEND = """
 경고
   이상김프(1시간 평균 ±5% 초과, 입출금 막힘 의심 → 맨 아래) 기회드묾(주기 1주 초과) 데이터부족(기간 80% 미만) 호가넓음(>0.3%) 물량얇음(호가 0.3% 안 물량 < 포지션 크기)
   추세↑↓(중간값이 1%p 넘게 이동) 회귀느림(반감기 48시간 초과) 펀딩냄 물림(끝에 손실로 들고 있음)
+  최근기회없음(전체 기간엔 벌었지만 검증 구간엔 완결된 거래가 없음 → 점수 1/4 로 감점)
 """
 
 
@@ -763,7 +795,7 @@ def load_series(store: HistoryStore, md, coins: Sequence[str], timeframe: str, s
 
 def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, float], usdt_spread: float,
                  fixed: float, target: float, stop: float, live: Dict[str, CoinLive],
-                 size: float, cycle_hours: float) -> List[CoinScore]:
+                 size: float, cycle_hours: float, recent_days: float = 0.0) -> List[CoinScore]:
     """받아둔 종가로 코인마다 점수 계산 (호가 간격은 미리 정해둔 resolved 값 사용)"""
     bar_ms = TIMEFRAME_MS[timeframe]
     scores = []
@@ -771,7 +803,7 @@ def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, fl
         floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
         spread = max(resolved.get(c, 0.0), floor)
         s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, days, spread, usdt_spread,
-                          fixed, target, stop, funding, live[c], size, cycle_hours)
+                          fixed, target, stop, funding, live[c], size, cycle_hours, recent_days)
         if s:
             s.timeframe = timeframe
             scores.append(s)
@@ -825,6 +857,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="추천 코인 순위 (최근 김프 움직임으로 전략이 잘 통했을 코인 찾기)")
     parser.add_argument("--days", type=float, default=30, help="최근 며칠을 볼지 (기본 30)")
     parser.add_argument("--top", type=int, default=20, help="몇 위까지 보여줄지 (기본 20)")
+    parser.add_argument("--recent-days", type=float, default=0.0,
+                        help="검증에 쓸 최근 기간 (일). 0 = 기간의 뒤 1/3 (기본). "
+                             "예: --days 30 --recent-days 7 → 앞 23일로 기준 고르고 최근 7일로 검증")
     parser.add_argument("--timeframe", default="15m", choices=sorted(TIMEFRAME_MS), help="캔들 간격 (기본 15m)")
     parser.add_argument("--coins", default=None, help="이 코인들만 보기 예: XRP,SOL (안 적으면 전체)")
     parser.add_argument("--json-path", default="data/screen_latest.json",
@@ -904,7 +939,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         live[c].spread_percent, live[c].depth_usdt = books.get(c, (None, None))
 
     scores = evaluate_all(data, usdt, args.timeframe, args.days, resolved, usdt_spread, fixed, target,
-                          settings.stop_loss_percent, live, size, args.cycle_hours)
+                          settings.stop_loss_percent, live, size, args.cycle_hours, args.recent_days)
 
     # 2단계: 1단계 상위 코인만 더 짧은 봉으로 다시 평가 (시뮬레이션과 같은 기준으로 맞추기)
     refined_timeframe = None
@@ -922,7 +957,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                                            src, retrying, with_funding=False)
             if r_data:
                 refined = evaluate_all(r_data, r_usdt, refined_timeframe, args.days, resolved, r_usdt_spread,
-                                       fixed, target, settings.stop_loss_percent, live, size, args.cycle_hours)
+                                       fixed, target, settings.stop_loss_percent, live, size,
+                                       args.cycle_hours, args.recent_days)
                 done = {x.coin for x in refined}
                 scores = refined + [x for x in scores if x.coin not in done]
                 usdt_spread = r_usdt_spread

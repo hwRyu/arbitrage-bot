@@ -14,6 +14,8 @@
     지금 김프   거래소 호가창을 그 자리에서 조회한 진입/청산 김프 (새로고침마다)
     추천 코인   python -m kimp.screen 이 남긴 data/screen_latest.json
     시뮬레이션  python -m kimp.simulate 가 history DB 에 저장한 실행 기록과 거래 내역
+    대시보드    기간을 정해서 본 성과 (누적 손익·일별·코인별·거래 이력). 집계는 kimp/dashboard.py
+    관리선      목표 순이익에 맞는 진입·청산 김프 (비용 역산 + 기회 많은 자리). 계산은 kimp/levels.py
 
 주의: 127.0.0.1 에만 바인딩한다 (다른 PC 에서 접근 불가). API 키는 화면에 보내지 않는다.
 """
@@ -31,6 +33,8 @@ from urllib.parse import parse_qs, urlparse
 from sqlalchemy import func, select
 
 from kimp.config import Settings, load_settings
+from kimp.dashboard import dashboard
+from kimp.levels import plan as level_plan
 from kimp.db import PaperBalance, Position, PositionStatus, PremiumSnapshot, make_session_factory
 from kimp.history import BYBIT, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade, make_history_session_factory
 from kimp.spread import resolve_spreads, snapshot_spreads_multi
@@ -702,6 +706,15 @@ class Handler(BaseHTTPRequestHandler):
                 flag = (query.get("fetch") or ["1"])[0]
                 md = self._market() if flag not in ("0", "") else None
                 self._json(premium_history(self.settings, coin, hours, md=md, force_fetch=(flag == "force")))
+            elif url.path == "/api/levels":
+                # 목표 순이익에 맞는 관리선 (차트와 같은 데이터로 계산 — 캔들을 새로 받지는 않는다)
+                coin = (query.get("coin") or [self.settings.coins[0]])[0].upper()
+                hours = float((query.get("hours") or ["24"])[0])
+                target = float((query.get("target") or ["1"])[0])
+                notional = (query.get("notional") or [""])[0].strip()
+                data = premium_history(self.settings, coin, hours, md=None)
+                self._json(level_plan(self.settings, coin, data["series"], target,
+                                      notional_usdt=float(notional) if notional else None, hours=hours))
             elif url.path == "/api/universe":
                 u = universe(self._market())
                 self._json({"coins": u["coins"], "volume": u["volume"], "my": list(self.settings.coins),
@@ -710,6 +723,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(live_premium(self._market(), self._coins(query)))
             elif url.path == "/api/screen":
                 self._json(screen_latest() or {"error": "아직 없습니다. python -m kimp.screen 을 한 번 돌리세요"})
+            elif url.path == "/api/dashboard":
+                # 기간 성과 (source: live / dry_run / paper / sim:3, start·end 는 YYYY-MM-DD)
+                self._json(dashboard(self.settings,
+                                     (query.get("source") or [""])[0],
+                                     (query.get("start") or [""])[0],
+                                     (query.get("end") or [""])[0]))
             elif url.path == "/api/sims":
                 self._json(sim_runs(self.settings))
             elif url.path == "/api/candles":
