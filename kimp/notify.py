@@ -10,7 +10,12 @@
 
 명령 (TELEGRAM_CHAT_ID 에서 온 것만 받는다)
 ------------------------------------------------------------------
-  /status  잔고·포지션·진입 가능 여부      /stop  신규 진입 중단      /resume  재개      /help
+  /status   잔고·포지션·진입 가능 여부        /premium  지금 김프 (가운데·진입·청산, 기준까지 남은 폭)
+  /stop     신규 진입 중단 (청산은 계속)        /resume   재개
+  /close    강제 청산 (/close 또는 /close CAP,SEI)   /collect  수집 현황 (/collect start 40 · stop)
+  /help     명령 목록
+
+  명령에 인자를 붙일 수 있다 (/close CAP,SEI). 핸들러가 인자를 받으면 넘겨준다.
 
 준비: 텔레그램 @BotFather 에서 봇을 만들어 토큰 받기 → 봇에게 아무 말이나 보낸 뒤
       https://api.telegram.org/bot<토큰>/getUpdates 에서 chat.id 확인 → .env 에 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -110,7 +115,7 @@ class TelegramLogHandler(logging.Handler):
 class TelegramCommands:
     """텔레그램 명령 받기 (getUpdates 길게 기다리기, 따로 스레드)"""
 
-    def __init__(self, notifier: TelegramNotifier, handlers: Dict[str, Callable[[], str]],
+    def __init__(self, notifier: TelegramNotifier, handlers: Dict[str, Callable[..., str]],
                  post: Optional[Callable] = None):
         self.n = notifier
         self.handlers = handlers
@@ -122,12 +127,19 @@ class TelegramCommands:
         msg = update.get("message") or {}
         if str((msg.get("chat") or {}).get("id")) != self.n.chat_id:
             return None
-        cmd = (msg.get("text") or "").strip().split()[0].split("@")[0].lower() if msg.get("text") else ""
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return None
+        head, _, rest = text.partition(" ")
+        cmd = head.split("@")[0].lower()   # 그룹에서는 /stop@봇이름 처럼 온다
         fn = self.handlers.get(cmd)
         if fn is None:
             return "명령: " + " ".join(sorted(self.handlers))
         try:
-            return fn()
+            # 인자를 받는 핸들러(/close CAP)와 안 받는 핸들러(/status)를 모두 지원한다
+            import inspect
+            takes_arg = bool(inspect.signature(fn).parameters)
+            return fn(rest.strip()) if takes_arg else fn()
         except Exception as exc:
             return f"처리 실패: {exc}"
 

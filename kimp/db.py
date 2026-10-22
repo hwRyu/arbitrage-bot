@@ -62,6 +62,7 @@ class ExitReason:
     FUNDING_DROP = "FUNDING_DROP"  # (펀딩비 전략) 펀딩비가 기준 아래로 떨어져서 정리
     LIQ_GUARD = "LIQ_GUARD"  # (펀딩비 전략) 강제청산이 가까워서 미리 양쪽 정리
     TIMEOUT = "TIMEOUT"  # 한 번만 돌리기(ONE_SHOT)에서 ONE_SHOT_MAX_HOURS 를 넘겨 시장가로 정리
+    MANUAL = "MANUAL"  # 사람이 지시해서 정리 (텔레그램 /close)
 
 
 class Position(Base):

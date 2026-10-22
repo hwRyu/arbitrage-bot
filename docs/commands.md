@@ -317,7 +317,7 @@ Remove-Item data\STOP                         # 재개
   실수로 실거래가 켜진 채 `main.py` 를 또 켜는 사고를 막으려면, 실거래용 설정은 `$env:` 가 아니라 **`.env` 에 적어 두는 게 안전하다.**
 - 비상정지는 파일만 만들면 되니 탐색기에서 `data` 폴더에 `STOP` 파일을 만들어도 같다.
 
-텔레그램: `/status`, `/stop`, `/resume`
+텔레그램: `/status` `/premium` `/close` `/stop` `/resume` `/collect` `/help` → 자세한 설명은 [live.md](live.md) 6번
 
 ## 8. 송금(리밸런싱)은 누가 하나
 - 페이퍼·시뮬레이션: 필요한 순간(청산 후 비율이 10%p 넘게 깨짐 / 진입하려는데 한쪽이 모자람) **사용자가 보냈다고 치고** 바로 옮기고 수수료 1번 (`PAPER_AUTO_REBALANCE`)

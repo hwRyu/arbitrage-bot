@@ -439,3 +439,95 @@ class CoinParamsEngineTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CloseRequestTest(unittest.TestCase):
+    """
+    텔레그램 /close — 사람이 지시한 강제 청산
+
+    다른 스레드(텔레그램)가 포지션을 직접 건드리면 엔진과 충돌한다.
+    그래서 요청만 적어두고 다음 스캔에서 엔진이 청산한다 (청산 사유 MANUAL).
+    """
+
+    def _engine_with_positions(self, coins=("XRP", "SOL")):
+        market = FakeMarket()
+        settings = make_settings(coins=list(coins), max_open_positions=2, reentry_cooldown_sec=0)
+        sf = make_session_factory(":memory:")
+        broker = PaperBroker(FEES, 0.3)
+        with sf() as s:
+            broker.ensure_initial_balances(s, settings.paper_initial_total_usdt, settings.upbit_target_share())
+        engine = Engine(settings, market, None, broker, sf, list(coins))
+        engine.startup()
+        market.quotes = {c: make_quote(-1.0, coin=c) for c in coins}
+        engine.step()                     # 두 코인 모두 진입
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), len(coins))
+        return engine, sf, broker, market
+
+    def test_close_all(self):
+        engine, sf, broker, market = self._engine_with_positions()
+        msg = engine.request_close()
+        self.assertIn("전체 2개", msg)
+        # 김프를 기준(-0.5%) 위로 올려 둔다. 안 그러면 청산한 그 스캔에서 바로 재진입한다
+        # (/close 는 청산만 한다. 재진입까지 막으려면 /stop 과 함께 쓴다)
+        market.quotes = {c: make_quote(0.0, coin=c) for c in ("XRP", "SOL")}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 0)
+            from sqlalchemy import select
+            from kimp.db import Position
+            for p in s.scalars(select(Position)).all():
+                self.assertEqual(p.exit_reason, ExitReason.MANUAL)
+
+    def test_close_one_coin(self):
+        engine, sf, broker, market = self._engine_with_positions()
+        msg = engine.request_close(["sol"])            # 소문자도 받는다
+        self.assertIn("SOL", msg)
+        market.quotes = {c: make_quote(0.0, coin=c) for c in ("XRP", "SOL")}   # 재진입 안 되게
+        engine.step()
+        with sf() as s:
+            left = broker.open_positions(s)
+            self.assertEqual([p.coin for p in left], ["XRP"])   # XRP 는 그대로
+
+    def test_close_unknown_coin(self):
+        engine, sf, broker, market = self._engine_with_positions()
+        self.assertIn("그 코인의 포지션이 없습니다", engine.request_close(["DOGE"]))
+        market.quotes = {c: make_quote(0.0, coin=c) for c in ("XRP", "SOL")}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 2)  # 아무것도 청산하지 않는다
+
+    def test_close_then_reenters_if_still_cheap(self):
+        """
+        /close 는 '청산' 만 한다 — 김프가 여전히 기준 아래면 같은 스캔에서 다시 들어간다
+
+        재진입까지 막으려면 /stop 과 함께 써야 한다. (헷갈리기 쉬운 부분이라 테스트로 박아둔다)
+        """
+        engine, sf, broker, market = self._engine_with_positions(coins=("XRP",))
+        with sf() as s:
+            first = broker.open_positions(s)[0].id
+        engine.request_close()
+        engine.step()                                   # 청산 + 재진입
+        with sf() as s:
+            now = broker.open_positions(s)
+            self.assertEqual(len(now), 1)
+            self.assertNotEqual(now[0].id, first)       # 새 포지션이다
+            from sqlalchemy import select
+            from kimp.db import Position
+            closed = [p for p in s.scalars(select(Position)).all() if p.id == first][0]
+            self.assertEqual(closed.exit_reason, ExitReason.MANUAL)
+
+    def test_close_with_stop_does_not_reenter(self):
+        """/stop 뒤에 /close 하면 청산만 되고 다시 들어가지 않는다"""
+        engine, sf, broker, market = self._engine_with_positions(coins=("XRP",))
+        broker.safety.manual_stop = True                # 텔레그램 /stop 과 같은 효과
+        engine.request_close()
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 0)
+
+    def test_close_with_no_position(self):
+        market = FakeMarket()
+        engine, sf, _ = make_engine(make_settings(), market)
+        engine.startup()
+        self.assertIn("들고 있는 포지션이 없습니다", engine.request_close())

@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -38,6 +38,8 @@ from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium, margin_to_add_usdt
 from kimp.premium import Quote
+
+LF = chr(10)  # 줄바꿈 (편집 사고를 막으려고 상수로)
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +101,64 @@ class Engine:
         self._reentry_allowed_at: Dict[str, float] = {}
         self._last_status_log = 0.0
 
+        # 사람이 지시한 강제 청산 요청 (텔레그램 /close). 다른 스레드에서 직접 청산하면
+        # 엔진과 같은 포지션을 동시에 건드릴 수 있어서, 요청만 적어두고 다음 스캔에서 엔진이 처리한다.
+        self._close_requests: set = set()   # 코인 이름들. "*" 이면 전부
+
         # 한 번만 돌리기(ONE_SHOT): 포지션 하나를 끝까지 보고 종료한다
         self._one_shot_opened = False  # 이번 실행에서 포지션을 잡았나 (또는 이미 있던 걸 이어받았나)
         self._one_shot_done = False    # 그 포지션이 끝났나 → run 루프가 멈춘다
+
+    def request_close(self, coins: Optional[Sequence[str]] = None) -> str:
+        """
+        강제 청산 요청 (텔레그램 /close). 실제 청산은 다음 스캔에서 엔진이 한다.
+
+        Args:
+            coins: 청산할 코인들. 없으면 전부
+        Returns:
+            사람에게 보여줄 안내 문장
+        """
+        with self.session_factory() as session:
+            holding = self.broker.open_positions(session)
+        if not holding:
+            return "들고 있는 포지션이 없습니다."
+        if coins:
+            want = {c.strip().upper() for c in coins if c.strip()}
+            found = [p for p in holding if p.coin in want]
+            missing = want - {p.coin for p in holding}
+            if not found:
+                return f"그 코인의 포지션이 없습니다 (지금: {', '.join(p.coin for p in holding)})"
+            self._close_requests |= {p.coin for p in found}
+            note = f" (없는 코인: {', '.join(sorted(missing))})" if missing else ""
+            return (f"청산 요청: {', '.join(sorted(p.coin for p in found))}{note}"
+                    f"{LF}다음 스캔({self.s.scan_interval_sec:.0f}초 안)에 지금 시세로 정리합니다.")
+        self._close_requests.add("*")
+        return (f"청산 요청: 전체 {len(holding)}개 ({', '.join(p.coin for p in holding)})"
+                f"{LF}다음 스캔({self.s.scan_interval_sec:.0f}초 안)에 지금 시세로 정리합니다.")
+
+    def _handle_close_requests(self, session: Session, quotes: Dict[str, Quote],
+                               open_positions: Dict[str, Position]) -> bool:
+        """요청된 포지션을 지금 시세로 청산한다 (청산 사유 MANUAL). 하나라도 청산했으면 True"""
+        if not self._close_requests:
+            return False
+        closed = False
+        for coin, pos in list(open_positions.items()):
+            if "*" not in self._close_requests and coin not in self._close_requests:
+                continue
+            quote = quotes.get(coin)
+            valuation = self.broker.value_exit(pos, quote) if quote else None
+            if valuation is None:
+                logger.warning("[강제 청산] %s 호가가 모자라서 이번 스캔에는 못 했습니다 (다시 시도합니다)", coin)
+                continue
+            logger.warning("[강제 청산] #%d %s 사람이 지시 → 지금 시세로 정리 (순손익 %+.3f%%)",
+                           pos.id, coin, valuation.pnl.net_percent)
+            self._close(session, pos, valuation, ExitReason.MANUAL)
+            self._close_requests.discard(coin)
+            del open_positions[coin]
+            closed = True
+        if "*" in self._close_requests and not open_positions:
+            self._close_requests.clear()
+        return closed
 
     @property
     def transfers(self) -> list:
@@ -171,7 +228,7 @@ class Engine:
             self.broker.sync(session, quotes, self.coins)
             open_positions = {p.coin: p for p in self.broker.open_positions(session)}
 
-            closed_any = False
+            closed_any = self._handle_close_requests(session, quotes, open_positions)
             for coin, pos in list(open_positions.items()):
                 quote = quotes.get(coin)
                 if quote is None:

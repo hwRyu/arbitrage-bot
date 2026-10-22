@@ -99,8 +99,100 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory) -> str
     return "\n".join(lines)
 
 
-def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, stop_event: threading.Event):
-    """텔레그램 알림(로그 → 텔레그램) + 명령(/status /stop /resume) + 매일 9시 요약"""
+HELP_TEXT = (
+    "/status   잔고·포지션·진입 가능 여부" + LF +
+    "/premium  지금 김프 (가운데·진입·청산, 기준까지 얼마 남았나)" + LF +
+    "/close    들고 있는 포지션 강제 청산 (예: /close 또는 /close CAP,SEI)" + LF +
+    "/stop     신규 진입 중단 (청산·관리는 계속)" + LF +
+    "/resume   재개" + LF +
+    "/collect  시세 수집 현황 (/collect start 40 · /collect stop)" + LF +
+    "/help     이 목록"
+)
+
+
+def premium_text(settings: Settings, market) -> str:
+    """
+    /premium 답장: 지금 김프를 코인별로 한 줄씩
+
+    진입 김프가 기준보다 얼마나 높은지(얼마나 더 떨어져야 하는지)까지 보여준다.
+    """
+    from kimp.market_data import fetch_tops
+
+    if market is None:
+        return "시세 조회를 쓸 수 없습니다"
+    tops = fetch_tops(market, list(settings.coins))
+    if not tops:
+        return "시세를 못 받았습니다"
+    lines = [f"[김프] {datetime.now(KST):%m-%d %H:%M}"]
+    for coin in settings.coins:
+        t = tops.get(coin)
+        if t is None:
+            lines.append(f"  {coin}: 시세 없음")
+            continue
+        threshold = settings.params_for(coin).entry_premium_threshold_percent
+        need = t.entry_premium_top - threshold  # + 면 이만큼 더 떨어져야 진입
+        lines.append(
+            f"  {coin} 가운데 {t.mid_premium:+.3f}% | 진입 {t.entry_premium_top:+.3f}% "
+            f"(기준 {threshold:+.2f}%, {need:+.3f}%p) | 청산 {t.exit_premium_top:+.3f}% "
+            f"| 호가 {t.coin_spread_percent:.3f}% | 펀딩 {t.funding_8h_percent() or 0:+.4f}%")
+    lines.append(f"  USDT {next(iter(tops.values())).usdt_mid:,.1f}원")
+    return LF.join(lines)
+
+
+# /collect 로 띄운 수집기 프로세스 (한 번에 하나만)
+_COLLECTOR: dict = {"proc": None, "args": ""}
+
+
+def collect_command(settings: Settings, args: str) -> str:
+    """
+    /collect            수집 현황 (코인별 기록 줄 수)
+    /collect start 40   거래대금 상위 40개 수집 시작 (숫자를 안 적으면 .env COINS)
+    /collect stop       수집 중지
+    """
+    import subprocess
+    import sys
+
+    from kimp.webui import recorded_coins
+
+    action, _, rest = args.partition(" ")
+    action = action.strip().lower()
+    proc = _COLLECTOR["proc"]
+    running = proc is not None and proc.poll() is None
+
+    if action == "stop":
+        if not running:
+            return "수집기가 돌고 있지 않습니다 (터미널에서 직접 띄운 것은 여기서 못 끕니다)"
+        proc.terminate()
+        _COLLECTOR["proc"] = None
+        return "수집기를 멈췄습니다"
+
+    if action == "start":
+        if running:
+            return f"이미 돌고 있습니다 ({_COLLECTOR['args']}). 먼저 /collect stop"
+        top = (rest or action and "").strip()
+        cmd = [sys.executable, "-m", "kimp.collect", "--interval", "60"]
+        if top.isdigit():
+            cmd += ["--top", top]
+        _COLLECTOR["proc"] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _COLLECTOR["args"] = " ".join(cmd[2:])
+        return f"수집기를 켰습니다: {_COLLECTOR['args']}"
+
+    # 현황
+    rows = recorded_coins(settings)
+    ready = sum(1 for r in rows if r["count"] >= 30)
+    lines = [f"[수집] {'돌고 있음' if running else '안 돌고 있음 (이 봇이 띄운 것 기준)'}",
+             f"기록 있는 코인 {len(rows)}개 · 30줄 넘은 코인 {ready}개 ({settings.snapshot_db_path})"]
+    for r in rows[:12]:
+        lines.append(f"  {r['coin']} {r['count']:,}줄" + ("" if r["count"] >= 30 else " (30줄 필요)"))
+    if len(rows) > 12:
+        lines.append(f"  … 그 외 {len(rows) - 12}개")
+    lines.append("/collect start 40 · /collect stop")
+    return LF.join(lines)
+
+
+def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, stop_event: threading.Event,
+                   engine=None, market=None):
+    """텔레그램 알림(로그 → 텔레그램) + 명령 + 매일 9시 요약 (명령 목록은 HELP_TEXT)"""
     if not (settings.telegram_bot_token and settings.telegram_chat_id):
         if settings.mode != "paper":
             logger.warning("텔레그램 설정이 없어서 알림을 못 보냅니다 (실거래에서는 꼭 설정하세요)")
@@ -119,9 +211,16 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
         broker.safety.resume()
         return "재개했습니다 (수동 정지·연속 실패 횟수 풀림). 다른 이유로 막혀 있으면 /status 에 나옵니다"
 
-    TelegramCommands(notifier, {"/status": lambda: status_text(settings, broker, session_factory),
-                                "/stop": stop, "/resume": resume,
-                                "/help": lambda: "/status 현황, /stop 신규 진입 중단, /resume 재개"}).start(stop_event)
+    TelegramCommands(notifier, {
+        "/status": lambda: status_text(settings, broker, session_factory),
+        "/stop": stop,
+        "/resume": resume,
+        "/premium": lambda: premium_text(settings, market),
+        "/close": lambda args: (engine.request_close(args.split(",") if args else None) if engine
+                                else "엔진이 아직 준비되지 않았습니다"),
+        "/collect": lambda args: collect_command(settings, args),
+        "/help": lambda: HELP_TEXT,
+    }).start(stop_event)
 
     def daily() -> None:
         sent_for = None
@@ -294,7 +393,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    start_telegram(settings, broker, session_factory, stop_event)
+    start_telegram(settings, broker, session_factory, stop_event, engine=engine, market=market)
 
     # 펀딩비 수익 전략: 항상 페이퍼. 김프 전략과 자본·시세 객체·DB 연결을 따로 써서 다른 스레드로 돌린다
     carry_thread = None
