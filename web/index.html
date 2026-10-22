@@ -36,6 +36,11 @@
                        border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
   button.act:hover { border-color: var(--accent); }
   .chart { width: 100%; height: 340px; background: #0d1117; border: 1px solid var(--line); border-radius: 8px; }
+  /* 차트 위에 마우스를 올리면 그 시각의 값들을 보여주는 상자 */
+  #hover { position: absolute; display: none; pointer-events: none; background: #0b0f15;
+           border: 1px solid var(--accent); border-radius: 7px; padding: 7px 9px; font-size: 12px;
+           line-height: 1.6; white-space: nowrap; z-index: 20; box-shadow: 0 6px 20px rgba(0,0,0,.5); }
+  #hover b { color: var(--dim); font-weight: 600; }
   .legend { display: flex; gap: 16px; font-size: 12px; color: var(--dim); margin-top: 8px; }
   .legend i { display: inline-block; width: 18px; height: 2px; vertical-align: middle; margin-right: 5px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
@@ -156,7 +161,9 @@
 
   <section id="chart">
     <div class="row">
-      <select id="chartCoin"></select>
+      <label>코인 <input id="chartCoin" list="coinList" placeholder="입력해서 검색 (예: CAP)" style="width:190px"
+                     autocomplete="off"></label>
+      <datalist id="coinList"></datalist>
       <label><input type="checkbox" id="chartFetch" checked> 기록 없으면 캔들 받아오기 (24시간까지 자동)</label>
       <button class="act" id="chartForce" style="display:none">지금 받아오기</button>
       <select id="chartHours">
@@ -168,8 +175,12 @@
       </select>
       <span class="muted" id="chartInfo"></span>
     </div>
+    <div class="row" id="chartQuick"></div>
     <div class="row" id="seriesPick"></div>
-    <svg class="chart" id="svg" viewBox="0 0 900 340" preserveAspectRatio="none"></svg>
+    <div style="position:relative">
+      <svg class="chart" id="svg" viewBox="0 0 900 340" preserveAspectRatio="none"></svg>
+      <div id="hover"></div>
+    </div>
     <div class="legend" id="legend"></div>
     <p class="note" id="chartNote"></p>
   </section>
@@ -239,10 +250,26 @@
 
   <section id="data">
     <div class="cards" id="dataCards"></div>
+    <h3 style="font-size:14px;margin:18px 0 8px">코인별 김프·호가 기록 (수집 결과)</h3>
+    <div class="wrap"><table id="dataRec"></table></div>
     <h3 style="font-size:14px;margin:18px 0 8px">간격별 캔들</h3>
     <div class="wrap"><table id="dataTable"></table></div>
 
-    <h3 style="font-size:14px;margin:20px 0 8px">미리 받아두기</h3>
+    <h3 style="font-size:14px;margin:20px 0 8px">시세 수집 (김프·호가 기록 쌓기)</h3>
+    <div class="panel">
+      <div class="row">
+        <label>코인 <input id="clCoins" placeholder="비우면 .env COINS" style="width:200px"></label>
+        <label>또는 상위 <input id="clTop" type="number" placeholder="40" style="width:65px">개</label>
+        <label><input type="checkbox" id="clAll"> 전체 (약 240개)</label>
+        <label>주기 <input id="clInterval" type="number" value="60" min="5" style="width:60px">초</label>
+        <label>시간 <input id="clHours" type="number" placeholder="무제한" style="width:70px">h</label>
+        <button class="act" id="clRun">수집 시작</button>
+      </div>
+      <div class="row"><span class="muted">주문·포지션 없이 기록만 합니다 (봇과 별개, <code>data/market.db</code>).
+30줄만 넘으면 스크리너·시뮬레이션이 추측값 대신 실측 호가를 씁니다.</span></div>
+    </div>
+
+    <h3 style="font-size:14px;margin:20px 0 8px">미리 받아두기 (과거 캔들)</h3>
     <div class="panel">
       <div class="row">
         <label>코인 <input id="fcCoins" placeholder="CAP,SEI (쉼표로)" style="width:220px"></label>
@@ -358,7 +385,8 @@ document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
   if (b.dataset.tab === "bot") loadBot();
   if (b.dataset.tab === "data") loadData();
 });
-$("chartCoin").onchange = () => { CHART_PICKED = true; loadChart(); };
+$("chartCoin").onchange = () => { CHART_PICKED = true; $("chartCoin").value = $("chartCoin").value.trim().toUpperCase(); loadChart(); };
+$("chartCoin").onkeydown = (e) => { if (e.key === "Enter") $("chartCoin").onchange(); };
 $("chartFetch").onchange = loadChart;
 $("chartForce").onclick = () => loadChart("force");
 $("liveScope").onchange = loadLive;
@@ -388,9 +416,10 @@ function table(el, cols, rows) {
 }
 
 // ---------- 지금 김프 ----------
-const RUN_BUTTONS = { screen: "scRun", sim: "smRun", bot: "btRun", fetch: "fcRun", prune: "prRun" };
+const RUN_BUTTONS = { screen: "scRun", sim: "smRun", bot: "btRun", fetch: "fcRun", prune: "prRun",
+                      collect: "clRun" };
 const RUN_LABELS = { screen: "추천 코인 돌리기", sim: "시뮬레이션 돌리기", bot: "페이퍼 봇 켜기",
-                     fetch: "받아오기", prune: "지우기" };
+                     fetch: "받아오기", prune: "지우기", collect: "수집 시작" };
 
 async function loadLive() {
   const scope = $("liveScope").value;
@@ -442,10 +471,10 @@ async function loadLive() {
 
 function openChart(coin) {
   CHART_PICKED = true;
-  const sel = $("chartCoin");
-  if (![...sel.options].some((o) => o.value === coin)) sel.add(new Option(coin, coin));
-  sel.value = coin;
-  document.querySelector('.tabs button[data-tab="chart"]').click();
+  $("chartCoin").value = coin;
+  const btn = document.querySelector('.tabs button[data-tab="chart"]');
+  if (document.querySelector("main section.on").id === "chart") loadChart();
+  else btn.click();
 }
 
 // ---------- 김프 차트 (지표 골라 보기) ----------
@@ -464,7 +493,7 @@ const SERIES = [
   { k: "upbit_krw",   name: "업비트 가격(원)", color: "#6e7681", axis: "원", on: false,
     tip: "업비트 코인 가격 (원). 오른쪽 축·점선." },
 ];
-let LAST = null, CHART_PICKED = false;  // CHART_PICKED: 사용자가 코인을 직접 골랐나
+let LAST = null, PLOT = null, CHART_PICKED = false;  // CHART_PICKED: 사용자가 코인을 직접 골랐나
 
 function renderPicks(available) {
   const has = (k) => !available || available.includes(k);
@@ -550,6 +579,9 @@ function drawChart(data) {
     `<text x="${L}" y="${H - 8}" fill="#8b98a9" font-size="11">${kst(xs[0])}</text>` +
     `<text x="${W - R}" y="${H - 8}" fill="#8b98a9" font-size="11" text-anchor="end">${kst(xs[xs.length - 1])}</text>`;
 
+  // 마우스 오버에서 쓸 좌표 정보 (픽셀 ↔ 시각 변환)
+  PLOT = { rows, picked, L, R, W, T, H, B, x0: xs[0], x1: xs[xs.length - 1] };
+
   const last = rows[rows.length - 1];
   $("chartInfo").textContent = `${rows.length.toLocaleString()}개 · 출처 ${data.source} · 마지막 김프 ${sign(last.mid, 3)}%`;
   $("legend").innerHTML = picked.map((s) =>
@@ -567,6 +599,48 @@ function drawChart(data) {
     : "봇이 1분마다 남긴 기록입니다. 진입·청산 김프는 그 순간 실제 호가 기준입니다."
       + (rows.length < 30 ? NL + `아직 ${rows.length}점뿐입니다 — 봇을 더 돌리면 촘촘해집니다.` : "");
 }
+
+// 차트 위에서 마우스를 움직이면 그 시각의 값들을 보여준다 (십자선 + 상자)
+function chartHover(ev) {
+  const svg = $("svg"), box = $("hover");
+  if (!PLOT || !PLOT.rows.length) { box.style.display = "none"; return; }
+  const rect = svg.getBoundingClientRect();
+  const px = ev.clientX - rect.left;
+  const vx = px / rect.width * PLOT.W;                       // 화면 px → viewBox 좌표
+  const ratio = (vx - PLOT.L) / (PLOT.W - PLOT.L - PLOT.R);
+  if (ratio < -0.02 || ratio > 1.02) { box.style.display = "none"; return; }
+  const want = PLOT.x0 + Math.min(1, Math.max(0, ratio)) * (PLOT.x1 - PLOT.x0);
+  let lo = 0, hi = PLOT.rows.length - 1;                     // 가장 가까운 점 찾기 (이분 탐색)
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (PLOT.rows[mid].ts < want) lo = mid + 1; else hi = mid;
+  }
+  if (lo > 0 && Math.abs(PLOT.rows[lo - 1].ts - want) < Math.abs(PLOT.rows[lo].ts - want)) lo--;
+  const r = PLOT.rows[lo];
+  const lines = [`<b>${kst(r.ts)}</b>`].concat(PLOT.picked.map((sr) => {
+    const v = r[sr.k];
+    const text = v === null || v === undefined ? "-" : (sr.axis === "%" ? sign(v, 3) + "%" : fmt(v, 2));
+    return `<span style="color:${sr.color}">■</span> ${sr.name} <b style="color:var(--text)">${text}</b>`;
+  }));
+  box.innerHTML = lines.join("<br>");
+  box.style.display = "block";
+  const left = px + 14, w = box.offsetWidth;
+  box.style.left = (left + w > rect.width ? px - w - 14 : left) + "px";
+  box.style.top = "14px";
+  // 십자선: 기존 선 지우고 새로 그린다
+  const old = svg.querySelector("#cross");
+  if (old) old.remove();
+  const vxp = PLOT.L + (r.ts - PLOT.x0) / Math.max(1, PLOT.x1 - PLOT.x0) * (PLOT.W - PLOT.L - PLOT.R);
+  svg.insertAdjacentHTML("beforeend",
+    `<line id="cross" x1="${vxp}" y1="${PLOT.T}" x2="${vxp}" y2="${PLOT.H - PLOT.B}" stroke="#8b98a9" stroke-dasharray="2 3"/>`);
+}
+
+$("svg").onmousemove = chartHover;
+$("svg").onmouseleave = () => {
+  $("hover").style.display = "none";
+  const c = $("svg").querySelector("#cross");
+  if (c) c.remove();
+};
 
 async function loadChart(mode) {
   const coin = $("chartCoin").value, hours = $("chartHours").value;
@@ -682,6 +756,12 @@ async function loadData() {
       ["캔들 개수", d.rows.toLocaleString() + "개"],
       ["간격 종류", d.sources.length + "개"],
     ].map(([k, v]) => `<div class="card"><b>${k}</b><span>${v}</span></div>`).join("");
+    const rec = await api("/api/premium?coin=" + encodeURIComponent(CONFIG?.coins?.[0] || "BTC") + "&hours=1&fetch=0");
+    table($("dataRec"), [
+      { t: "코인", v: (r) => r.coin },
+      { t: "기록", tip: TIP.records, v: (r) => r.count.toLocaleString() + "줄" },
+      { t: "쓸 수 있나", v: (r) => r.count >= 30 ? "✔ 실측 사용" : `아직 (30줄 필요)` },
+    ], rec.recorded || []);
     table($("dataTable"), [
       { t: "간격", v: (r) => r.source },
       { t: "캔들", v: (r) => r.rows.toLocaleString() },
@@ -699,6 +779,10 @@ async function loadData() {
   }
 }
 
+$("clRun").onclick = () => runJob("collect", {
+  coins: $("clCoins").value, top: $("clTop").value, all: $("clAll").checked ? "1" : "",
+  interval: $("clInterval").value, hours: $("clHours").value,
+});
 $("fcRun").onclick = () => {
   if (!$("fcCoins").value.trim()) { alert("코인을 적어 주세요 (예: CAP,SEI)"); return; }
   runJob("fetch", { coins: $("fcCoins").value, days: $("fcDays").value, timeframe: $("fcTf").value });
@@ -793,8 +877,11 @@ async function pollJob() {
         if (j.kind === "sim" && j.status === "done") loadSims();
         if (j.kind === "bot") loadBot();
         if (j.kind === "fetch" || j.kind === "prune") loadData();
+        if (j.kind === "collect") { loadData(); loadLive(); }
       } else if (j.kind === "bot") {
         loadBot();  // 봇이 돌고 있으면 기록이 쌓이는 걸 같이 보여준다
+      } else if (j.kind === "collect") {
+        loadData();  // 수집 중이면 기록 건수가 늘어나는 걸 보여준다
       }
     } catch (e) {
       clearInterval(JOB_TIMER);
@@ -884,35 +971,32 @@ async function loadBot() {
 async function loadUniverse() {
   try {
     const u = await api("/api/universe");
-    const sel = $("chartCoin"), keep = sel.value;
-    const label = (c) => {
-      const v = (u.volume[c] || {}).upbit_krw || 0;
-      return `${c}${v ? "  (" + (v / 1e8).toFixed(0) + "억)" : ""}`;
-    };
     const recset = new Set((u.recorded || []).map((r) => r.coin));
-    const mark = (c) => (recset.has(c) ? "● " : "") + label(c);  // ● = 봇 기록 있음 (진입·청산 김프 볼 수 있음)
     const recorded = (u.recorded || []).map((r) => r.coin).filter((c) => u.coins.includes(c));
-    const mine = u.my.filter((c) => u.coins.includes(c) && !recset.has(c));
-    const rest = u.coins.filter((c) => !u.my.includes(c) && !recset.has(c));
-    const opts = (list) => list.map((c) => `<option value="${c}">${mark(c)}</option>`).join("");
-    sel.innerHTML =
-      (recorded.length ? `<optgroup label="● 봇 기록 있음 (진입·청산 김프 볼 수 있음)">${opts(recorded)}</optgroup>` : "") +
-      `<optgroup label="내 코인 (.env COINS)">${opts(mine)}</optgroup>` +
-      `<optgroup label="전체 ${rest.length}개 (거래대금 순)">${opts(rest)}</optgroup>`;
-    if (keep) sel.value = keep;
-    // 사용자가 아직 직접 고르지 않았으면, 기록이 있는 코인을 기본으로 (진입·청산 김프가 보이는 쪽)
+    // 입력창 자동완성 목록 (코인 이름을 치면 걸러진다). 거래대금·기록 여부를 설명으로 붙인다
+    $("coinList").innerHTML = u.coins.map((c) => {
+      const v = (u.volume[c] || {}).upbit_krw || 0;
+      const note = [recset.has(c) ? "봇 기록 있음" : "", v ? (v / 1e8).toFixed(0) + "억" : ""]
+        .filter(Boolean).join(" · ");
+      return `<option value="${c}">${note}</option>`;
+    }).join("");
+    // 기록 있는 코인은 버튼으로 바로 누를 수 있게 (진입·청산 김프가 보이는 코인)
+    $("chartQuick").innerHTML = recorded.length
+      ? `<span class="muted">봇 기록 있음:</span> ` + recorded.map((c) =>
+          `<span class="pick" onclick="openChart('${c}')">${c}</span>`).join("")
+      : `<span class="muted">봇 기록이 있는 코인이 없습니다 — 페이퍼 봇을 켜면 진입·청산 김프가 쌓입니다</span>`;
     if (!CHART_PICKED && recorded.length) {
-      sel.value = recorded[0];
+      $("chartCoin").value = recorded[0];
       if (document.querySelector("main section.on").id === "chart") loadChart();
     }
-  } catch (e) { /* 목록을 못 받으면 .env 코인만 둔다 */ }
+  } catch (e) { /* 목록을 못 받으면 입력해서 쓰면 된다 */ }
 }
 
 async function reload() {
   try {
     CONFIG = await api("/api/config");
     renderConfig(CONFIG);
-    $("chartCoin").innerHTML = CONFIG.coins.map((c) => `<option>${c}</option>`).join("");
+    if (!CHART_PICKED && !$("chartCoin").value) $("chartCoin").value = CONFIG.coins[0] || "";
     loadUniverse();
   } catch (e) {
     $("head").innerHTML = `<span class="err">설정을 읽지 못했습니다: ${e.message}</span>`;

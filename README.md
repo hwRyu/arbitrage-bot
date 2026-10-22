@@ -97,6 +97,14 @@ python -m kimp.screen --coins XRP,SOL,DOGE  # 정한 코인끼리만 비교
 - 끝에 `.env` 에 붙여넣을 `COINS=` 와 코인별 진입 기준이 나옵니다. 고른 코인은 `kimp.simulate` 로 1분봉 확인을 한 번 더 하세요.
 - 처음 실행은 2~3분 걸리고, 받은 캔들은 `data/history.db` 에 저장돼 다음부터 빠릅니다.
 
+## 시세 수집 (김프·호가 기록)
+```bash
+python -m kimp.collect --coins CAP,SEI    # 주문 없이 김프·호가만 적습니다 (봇과 별개)
+python -m kimp.collect --all              # 양쪽 거래소에 다 있는 코인 전부 (약 240개)
+```
+과거 호가창은 거래소가 주지 않아서, 호가 간격은 **직접 모아야** 알 수 있습니다. 30줄만 넘으면
+스크리너·시뮬레이션이 추측값(0.1%) 대신 실측값을 씁니다. `data/market.db` 에 쌓이고 매매 기록과 섞이지 않습니다.
+
 ## 브라우저로 보기 (편의 도구)
 ```bash
 python -m kimp.webui          # http://127.0.0.1:8765
@@ -147,6 +155,7 @@ python -m unittest discover -s tests -v
 | `kimp/report.py` | 김프 기록 분석 리포트 |
 | `kimp/history.py` | 과거 데이터 받기와 저장 (시뮬레이션용) |
 | `kimp/simulate.py` | 과거 기간 시뮬레이션 |
+| `kimp/collect.py` | 시세 수집기 (김프·호가 기록만. 주문·포지션 없음) |
 | `kimp/webui.py` | 로컬 화면 (설정·김프 차트·추천·시뮬 결과). 화면은 `web/index.html` |
 | `kimp/spread.py` | 코인 호가 간격 정하기 (봇 기록 → 설정 → 지금 호가 중간값 → 기본값). 스크리너·시뮬레이션 공용 |
 | `kimp/screen.py` | 추천 코인 순위 (최근 김프 움직임 + 호가·거래량·펀딩 → 백테스트 점수) |

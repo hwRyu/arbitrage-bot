@@ -121,7 +121,7 @@ class RoughSpreadTest(unittest.TestCase):
         from kimp.spread import accumulate_hint
         text = accumulate_hint(["CAP", "SEI"])
         self.assertIn("CAP,SEI", text)
-        self.assertIn("main.py", text)
+        self.assertIn("kimp.collect", text)   # 봇이 아니라 수집기로 안내한다
         self.assertIn("--rough-spread", text)
 
     def test_simulate_decide_spreads_marks_rough(self):

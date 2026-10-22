@@ -45,7 +45,7 @@ from sqlalchemy import func, select
 from kimp.config import Settings, load_settings
 from kimp.db import Position, PositionStatus, make_session_factory
 from kimp.spread import (LIVE_SAMPLES, MIN_SNAPSHOTS_FOR_SPREAD, accumulate_hint, is_rough,
-                         median_spread_depth, resolve_spreads, snapshot_spreads)
+                         median_spread_depth, resolve_spreads, snapshot_spreads_multi)
 from kimp.engine import Engine
 from kimp.fx import FxQuote
 from kimp.history import (BYBIT, MINUTE_MS, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade,
@@ -447,11 +447,12 @@ def decide_spreads(settings: Settings, coins: List[str], md=None, usdt_krw: floa
     if md is not None and allow_live:
         need = [c for c in coins
                 if not os.getenv(f"{c}_SIM_SPREAD_PERCENT", "").strip()
-                and snapshot_spreads(settings.db_path, [c]).get(c, (0, 0))[1] < MIN_SNAPSHOTS_FOR_SPREAD]
+                and snapshot_spreads_multi(settings.snapshot_db_paths(), [c]).get(c, (0, 0))[1]
+                < MIN_SNAPSHOTS_FOR_SPREAD]
         if need:
             print(f"호가 간격 확인 중 (기록이 없는 {len(need)}개 코인, {LIVE_SAMPLES}번 재서 중간값)...")
             live = {c: v[0] for c, v in median_spread_depth(md, need, usdt_krw).items()}
-    return resolve_spreads(coins, settings.db_path, settings.sim_default_spread_percent, live)
+    return resolve_spreads(coins, settings.snapshot_db_paths(), settings.sim_default_spread_percent, live)
 
 
 # ----------------------------------------------------------------------

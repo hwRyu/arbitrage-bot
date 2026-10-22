@@ -47,6 +47,21 @@ LIVE_SAMPLE_PAUSE_SEC = 4.0
 DEPTH_WITHIN = 0.003
 
 
+def snapshot_spreads_multi(db_paths: Sequence[str], coins: Sequence[str]) -> Dict[str, Tuple[float, int]]:
+    """
+    여러 DB 에서 호가 간격 기록을 모아 합친다 (앞쪽 DB 가 우선)
+
+    수집기 DB(data/market.db) 를 먼저 보고, 없는 코인은 봇 DB 의 기록을 쓴다.
+    같은 코인이 양쪽에 있으면 건수가 많은 쪽을 쓴다 (더 많이 재 본 쪽이 믿을 만하다).
+    """
+    merged: Dict[str, Tuple[float, int]] = {}
+    for path in db_paths:
+        for coin, (avg, n) in snapshot_spreads(path, coins).items():
+            if coin not in merged or n > merged[coin][1]:
+                merged[coin] = (avg, n)
+    return merged
+
+
 def snapshot_spreads(db_path: str, coins: Sequence[str]) -> Dict[str, Tuple[float, int]]:
     """
     봇이 쌓은 김프 기록에서 코인 호가 간격 평균 꺼내기
@@ -161,40 +176,42 @@ def is_rough(source: str) -> bool:
 def accumulate_hint(coins: Sequence[str], rough_flag: str = "--rough-spread") -> str:
     """호가 기록을 쌓는 방법 안내 (시뮬레이션이 막혔을 때 그대로 보여준다)"""
     names = ",".join(coins)
-    win = "    ." + '\\' + ".venv" + '\\' + "Scripts" + '\\' + "python.exe main.py"
+    BS = chr(92)
     lines = [
         f"호가 간격 기록이 없어서 숫자를 믿을 수 없습니다: {names}",
         "",
-        "과거 호가창은 거래소가 주지 않습니다. 봇을 페이퍼로 돌려 직접 쌓아야 합니다",
+        "과거 호가창은 거래소가 주지 않습니다. 시세 수집기로 직접 쌓아야 합니다",
         f"(코인마다 1분에 1건. {MIN_SNAPSHOTS_FOR_SPREAD}건만 넘으면 자동으로 그 값을 씁니다).",
         "",
-        "  윈도우 PowerShell",
-        f'    $env:COINS="{names}"; $env:SCAN_INTERVAL_SEC="20"; $env:CARRY_ENABLED="false"',
-        win,
+        "  윈도우",
+        f"    .{BS}.venv{BS}Scripts{BS}python.exe -m kimp.collect --coins {names}",
         "",
         "  맥 / Git Bash",
-        f"    COINS={names} SCAN_INTERVAL_SEC=20 CARRY_ENABLED=false python main.py",
+        f"    python -m kimp.collect --coins {names}",
         "",
-        "자세한 설명: docs/commands.md '호가 기록 쌓기'",
+        "  (주문·포지션 없이 김프·호가만 적습니다. 코인당 1분에 1줄, 30줄만 넘으면 바로 쓸 수 있습니다)",
+        "",
+        "자세한 설명: docs/commands.md '시세 수집'",
         f"그래도 지금 대충이라도 돌려보려면 {rough_flag} 를 붙이세요 (숫자는 실행마다 바뀝니다).",
     ]
     return chr(10).join(lines)
 
 
-def resolve_spreads(coins: Sequence[str], db_path: str, default_percent: float,
+def resolve_spreads(coins: Sequence[str], db_path, default_percent: float,
                     live: Optional[Dict[str, Optional[float]]] = None,
                     min_snapshots: int = MIN_SNAPSHOTS_FOR_SPREAD) -> Tuple[Dict[str, float], Dict[str, str]]:
     """
     코인별 호가 간격을 정한다: 기록 평균 → 코인별 설정 → 지금 호가창 중간값 → 공통 기본값
 
     Args:
-        db_path: 봇이 쌓은 DB (페이퍼 DB_PATH). 없으면 건너뛴다
+        db_path: 기록 DB 경로 하나, 또는 여러 개 (앞쪽 우선). 없는 파일은 건너뛴다
         default_percent: 아무것도 없을 때 쓸 값 (SIM_DEFAULT_SPREAD_PERCENT)
         live: {코인: 지금 호가 간격 %} (median_spread_depth 결과). 없으면 건너뛴다
     Returns:
         ({코인: %}, {코인: 어디서 온 값인지 설명})
     """
-    measured = snapshot_spreads(db_path, coins)
+    paths = [db_path] if isinstance(db_path, str) else list(db_path)
+    measured = snapshot_spreads_multi(paths, coins)
     spreads: Dict[str, float] = {}
     sources: Dict[str, str] = {}
     for coin in coins:

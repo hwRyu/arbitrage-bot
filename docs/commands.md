@@ -125,39 +125,32 @@ python main.py
 표 위에 어느 값을 썼는지 찍힌다. 한 번만 재면 그 순간 호가에 순위가 휘둘린다 (같은 데이터로 14분 뒤
 다시 돌렸더니 CAP 검증 월수익이 +13.94% → +4.90% 로 바뀜). ①이 가장 정확하니 아래 '호가 기록 쌓기' 를 먼저 하면 좋다.
 
-### 호가 기록 쌓기 (시뮬레이션 정확도 올리기)
-과거 호가창은 거래소가 주지 않는다. 그래서 **봇을 돌려서 직접 쌓는다.** 페이퍼 모드로 켜두면
-코인마다 1분에 1건씩 `premium_snapshots` 에 기록되고, 그다음부터 스크리너·시뮬레이션이 자동으로 그 값을 쓴다
-(설정을 바꿀 것은 없다).
+### 시세 수집 — `python -m kimp.collect`
+**봇과 역할이 다르다.** 수집기는 김프·호가만 적는다 (주문·포지션·잔고 없음).
 
-```powershell
-# 윈도우 PowerShell — 후보 코인을 다 넣는다 (기록은 포지션과 무관하게 코인별로 쌓인다)
-$env:PYTHONUTF8="1"
-$env:COINS="CAP,SEI,LIT,GRVT,MEW,WAVES"
-$env:SCAN_INTERVAL_SEC="20"      # 기록은 1분에 1건이라 3초마다 볼 필요가 없다 (요청 제한 여유)
-$env:CARRY_ENABLED="false"       # 펀딩비 전략까지 돌릴 필요 없음
-.\.venv\Scripts\python.exe main.py
-```
-```bash
-# 맥 / Git Bash
-COINS=CAP,SEI,LIT,GRVT,MEW,WAVES SCAN_INTERVAL_SEC=20 CARRY_ENABLED=false python main.py
-```
-- 하루 돌리면 코인당 약 1,440건. 30건(30분)만 넘어도 '기록' 으로 인정된다.
-- 쌓인 값 확인: `python -m kimp.report` (또는 `data/kimp.db` 의 `premium_snapshots`)
-- 봇을 두 개 돌리면 업비트 요청 제한(IP 기준 초당 10회)을 넘을 수 있다 → 기록용은 `SCAN_INTERVAL_SEC` 를 늘릴 것.
+| 명령 | 역할 | 주문 | DB |
+|---|---|---|---|
+| `python main.py` | 전략 실행 (진입·청산·손익) | 모드에 따라 | `kimp.db` / `dryrun.db` / `live.db` |
+| `python -m kimp.collect` | **시세 기록만** | **없음** | `data/market.db` (`SNAPSHOT_DB_PATH`) |
 
-### 과거 시뮬레이션 — `python -m kimp.simulate`
-> **호가 간격 기록이 없으면 시뮬레이션이 멈춥니다.** 믿을 수 없는 숫자를 내놓지 않기 위해서입니다.
-> 같은 기간을 돌렸는데 실행마다 CAP 호가가 0.125% / 0.266% 로 잡혀서 거래 115건 / 76건,
-> 손익 +63 / +42 USDT 로 갈린 적이 있습니다. 먼저 아래 '호가 기록 쌓기' 를 하거나,
-> 대충이라도 보려면 `--rough-spread` 를 붙이세요.
 ```bash
-python -m kimp.simulate --from 2026-09-22                       # 9/22 0시부터 지금까지
-python -m kimp.simulate --from 2026-09-22 --to 2026-10-15
-python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP --verbose   # 거래 하나하나 보기
-python -m kimp.simulate --from 2026-09-22 --no-save             # 결과를 DB 에 안 남김
-python -m kimp.simulate --from 2026-09-22 --rough-spread        # 호가 기록이 없어도 '지금 호가' 로 강행
+python -m kimp.collect                   # .env 의 COINS
+python -m kimp.collect --coins CAP,SEI   # 코인 지정
+python -m kimp.collect --top 40          # 업비트 거래대금 상위 40개
+python -m kimp.collect --all             # 양쪽 거래소에 다 있는 코인 전부 (약 240개)
+python -m kimp.collect --interval 30     # 기록 주기 (초, 기본 60)
+python -m kimp.collect --once            # 한 번만 기록하고 종료 (확인용)
+python -m kimp.collect --hours 24        # 24시간 돌고 종료
 ```
+
+**왜 필요한가:** 과거 호가창은 거래소가 주지 않는다. "그 순간 호가로 진입/청산하면 김프가 얼마였나" 는
+직접 적어 둬야 알 수 있다. 이 기록이 **30줄**을 넘으면 스크리너·시뮬레이션이 추측값(기본 0.1%) 대신
+실측 호가 간격을 쓴다. 전략을 돌릴 필요가 없으니 수집은 따로 돌린다.
+- 코인을 수백 개 넣어도 안전하다 (진입을 안 한다). 20개가 2초, 240개가 2초대.
+- 봇과 같이 돌려도 된다 (DB 가 다르다). 업비트 요청 제한이 걱정되면 `--interval` 을 늘린다.
+- 기록을 찾는 순서: `data/market.db` → 지금 모드 봇 DB → 페이퍼 DB (시장 데이터라 모드가 달라도 같이 쓴다)
+- 쌓인 양 보기: `python -m kimp.webui` 의 **데이터 탭** (코인별 기록 줄 수와 '✔ 실측 사용' 표시), 또는 `python -m kimp.report`
+- 로컬 화면 데이터 탭에서 **수집 시작** 버튼으로도 돌릴 수 있다.
 
 ### 김프 기록 분석 — `python -m kimp.report`
 ```bash

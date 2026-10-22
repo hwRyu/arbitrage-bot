@@ -8,6 +8,7 @@ import json
 import os
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from kimp.config import Settings
 from kimp.db import PremiumSnapshot, make_session_factory
@@ -57,7 +58,9 @@ class SnapshotBackedTest(unittest.TestCase):
                                             exit_premium_top=-0.26, usdt_krw=1_350.0, usdt_spread_percent=0.075,
                                             upbit_mid_krw=91.0, bybit_mid_usdt=0.068))
             session.commit()
-        self.settings = replace(Settings(coins=["CAP"]), db_path=self.db)
+        # history_db_path 를 없는 파일로 둬서 실제 data/history.db 의 1분봉이 섞이지 않게 한다
+        self.settings = replace(Settings(coins=["CAP"]), db_path=self.db, history_db_path="없는파일_hist.db",
+                                snapshot_db_path="없는파일_market.db")
 
     def tearDown(self):
         try:
@@ -72,11 +75,54 @@ class SnapshotBackedTest(unittest.TestCase):
         self.assertIn("기록", row["source"])
         self.assertEqual(row["records"], 40)
 
+    def test_candles_fill_window_and_records_overlay(self):
+        """
+        봇 기록만 쓰면 봇을 17분 돌렸을 때 7일을 요청해도 17분치만 나온다
+        → 1분봉으로 기간을 채우고, 봇 기록이 있는 분만 그 값으로 덮어쓴다
+        """
+        from kimp.history import BYBIT, UPBIT, UPBIT_USDT, Candle, make_history_session_factory
+        hist = self.db.replace(".db", "_hist.db")
+        try:
+            os.remove(hist)
+        except OSError:
+            pass
+        now = int(datetime.now(timezone.utc).timestamp() * 1000) // 60_000 * 60_000
+        with make_history_session_factory(hist)() as session:
+            for i in range(120):  # 2시간치 1분봉
+                ts = now - i * 60_000
+                session.add(Candle(source=UPBIT, coin="CAP", ts_ms=ts, open=91, high=91, low=91,
+                                   close=91.0, volume=0))
+                session.add(Candle(source=BYBIT, coin="CAP", ts_ms=ts, open=0.068, high=0.068, low=0.068,
+                                   close=0.068, volume=0))
+                session.add(Candle(source=UPBIT_USDT, coin="USDT", ts_ms=ts, open=1340, high=1340, low=1340,
+                                   close=1340.0, volume=0))
+            session.commit()
+        settings = replace(self.settings, history_db_path=hist)
+        out = premium_history(settings, "CAP", hours=2)
+        try:
+            os.remove(hist)
+        except OSError:
+            pass
+        self.assertGreaterEqual(len(out["series"]), 100)       # 1분봉으로 기간이 채워졌다
+        self.assertEqual(out["candles"], 120)
+        self.assertEqual(out["snapshots"], 40)                 # setUp 에서 넣은 봇 기록
+        self.assertIn("1분봉", out["source"])
+        self.assertIn("봇 기록", out["source"])
+        # 봇 기록이 있는 분에는 진입·청산 김프가 들어 있고, 나머지 분은 비어 있다
+        withe = [r for r in out["series"] if r["entry"] is not None]
+        self.assertTrue(0 < len(withe) <= 40)
+        self.assertTrue(any(r["entry"] is None for r in out["series"]))
+
     def test_premium_history_from_records(self):
-        """차트 데이터는 지표마다 칸이 있다 (화면에서 골라 그린다)"""
+        """
+        차트 데이터는 지표마다 칸이 있다 (화면에서 골라 그린다)
+
+        봇 기록은 1분 칸에 맞춰 넣기 때문에, 같은 분에 들어온 기록은 한 점으로 합쳐진다.
+        """
         out = premium_history(self.settings, "CAP", hours=24)
-        self.assertEqual(out["source"], "봇 기록")
-        self.assertEqual(len(out["series"]), 40)
+        self.assertIn("봇 기록", out["source"])
+        self.assertEqual(out["snapshots"], 40)
+        self.assertGreaterEqual(len(out["series"]), 1)
         row = out["series"][0]
         self.assertGreater(row["ts"], 0)
         self.assertAlmostEqual(row["mid"], -0.05)
@@ -96,7 +142,8 @@ class MissingFilesTest(unittest.TestCase):
     """파일이 없을 때도 터지지 않고 빈 값을 준다"""
 
     def test_no_db_no_json(self):
-        s = replace(Settings(coins=["CAP"]), db_path="없는파일.db", history_db_path="없는파일2.db")
+        s = replace(Settings(coins=["CAP"]), db_path="없는파일.db", history_db_path="없는파일2.db",
+                    snapshot_db_path="없는파일3.db")
         self.assertEqual(sim_runs(s), [])
         self.assertEqual(premium_history(s, "CAP")["series"], [])
         self.assertIsNone(screen_latest("없는파일3.json"))
@@ -194,7 +241,8 @@ class AutoFetchLimitTest(unittest.TestCase):
             self.tried = 0
 
     def _settings(self):
-        return replace(Settings(coins=["CAP"]), db_path="없는파일.db", history_db_path="없는파일2.db")
+        return replace(Settings(coins=["CAP"]), db_path="없는파일.db", history_db_path="없는파일2.db",
+                       snapshot_db_path="없는파일3.db")
 
     def test_short_window_tries_fetch(self):
         import kimp.webui as w

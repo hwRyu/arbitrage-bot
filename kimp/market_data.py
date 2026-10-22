@@ -230,3 +230,145 @@ def _parse_interval_hours(text) -> Optional[float]:
     except ValueError:
         return None
     return None
+
+
+# ======================================================================
+# 여러 코인을 한 번에 (맨 앞 호가만)
+# ======================================================================
+@dataclass(frozen=True)
+class TopQuote:
+    """
+    코인 하나의 '맨 앞 호가' 묶음 (여러 코인을 한 번에 받을 때 쓴다)
+
+    Quote(호가창 전체)와 달리 1호가만 들고 있다. 그래서 '수량만큼 긁은 평균가' 는 계산할 수 없고,
+    김프 기록·현황 표시용이다. 대신 코인 200개도 몇 초면 받는다.
+    """
+
+    coin: str
+    upbit_bid: float
+    upbit_ask: float
+    bybit_bid: float
+    bybit_ask: float
+    usdt_bid: float
+    usdt_ask: float
+    funding_rate: Optional[float] = None
+    funding_interval_hours: Optional[float] = None
+    next_funding_ms: Optional[int] = None
+    fx_krw: Optional[float] = None
+
+    @property
+    def upbit_mid(self) -> float:
+        return (self.upbit_bid + self.upbit_ask) / 2
+
+    @property
+    def bybit_mid(self) -> float:
+        return (self.bybit_bid + self.bybit_ask) / 2
+
+    @property
+    def usdt_mid(self) -> float:
+        return (self.usdt_bid + self.usdt_ask) / 2
+
+    @property
+    def mid_premium(self) -> float:
+        """가운데 가격끼리 계산한 봇 김프 (%, 코인 몫)"""
+        from kimp.premium import premium_percent
+        return premium_percent(self.upbit_mid, self.bybit_mid, self.usdt_mid)
+
+    @property
+    def entry_premium_top(self) -> float:
+        """지금 진입하면 나오는 김프: 코인 살 값 / 숏 칠 값 / USDT 팔 값"""
+        from kimp.premium import premium_percent
+        return premium_percent(self.upbit_ask, self.bybit_bid, self.usdt_bid)
+
+    @property
+    def exit_premium_top(self) -> float:
+        """지금 청산하면 나오는 김프: 코인 팔 값 / 숏 닫을 값 / USDT 살 값"""
+        from kimp.premium import premium_percent
+        return premium_percent(self.upbit_bid, self.bybit_ask, self.usdt_ask)
+
+    @property
+    def usdt_spread_percent(self) -> float:
+        """업비트 USDT/KRW 호가 간격 (%)"""
+        return (self.usdt_ask / self.usdt_bid - 1) * 100
+
+    @property
+    def coin_spread_percent(self) -> float:
+        """코인 호가 간격 (%) = 업비트 + 바이비트"""
+        return (self.upbit_ask / self.upbit_bid - 1) * 100 + (self.bybit_ask / self.bybit_bid - 1) * 100
+
+    @property
+    def tether_premium(self) -> Optional[float]:
+        """테더 프리미엄 (%) = 업비트 USDT 가격 ÷ 달러 환율 − 1. 환율이 없으면 None"""
+        return (self.usdt_mid / self.fx_krw - 1) * 100 if self.fx_krw else None
+
+    @property
+    def site_premium(self) -> Optional[float]:
+        """사이트식 김프 (%) = 달러 환율 기준. 환율이 없으면 None"""
+        from kimp.premium import premium_percent
+        return premium_percent(self.upbit_mid, self.bybit_mid, self.fx_krw) if self.fx_krw else None
+
+    def funding_8h_percent(self) -> Optional[float]:
+        """펀딩비율을 8시간 기준 %로 (코인마다 정산 주기가 1·4·8시간이라 맞춰야 비교된다)"""
+        if self.funding_rate is None:
+            return None
+        hours = self.funding_interval_hours or 8.0
+        return self.funding_rate * 100 * (8.0 / hours if hours else 1.0)
+
+
+def fetch_tops(md: "MarketData", coins: List[str], fx_krw: Optional[float] = None) -> Dict[str, TopQuote]:
+    """
+    여러 코인의 맨 앞 호가를 한 번에 받는다 (요청을 적게 쓰려고)
+
+        업비트  호가창을 50개씩 묶어서 (코인 150개면 3번)
+        바이비트 티커 1번 — 맨 앞 호가·펀딩비율이 다 들어 있다 (900개가 1초)
+
+    코인마다 호가창을 따로 받으면 200번이 되어 느리다. 그래서 김프 기록·현황 표시는 이 함수를 쓴다.
+    (단, 진입·청산 판단은 '수량만큼 긁은 평균가' 가 필요해서 fetch_quotes 를 쓴다)
+    """
+    out: Dict[str, TopQuote] = {}
+    if not coins:
+        return out
+    books: Dict[str, dict] = {}
+    symbols = [upbit_symbol(c) for c in coins] + [USDT_KRW_SYMBOL]
+    for i in range(0, len(symbols), 50):
+        try:
+            books.update(md.upbit.fetch_order_books(symbols[i:i + 50], 5))
+        except Exception as exc:
+            logger.warning("업비트 호가 묶음 조회 실패: %s", exc)
+    usdt = books.get(USDT_KRW_SYMBOL) or {}
+    usdt_bid = (usdt.get("bids") or [[None]])[0][0]
+    usdt_ask = (usdt.get("asks") or [[None]])[0][0]
+    if not usdt_bid or not usdt_ask:
+        logger.error("업비트 USDT/KRW 호가가 없어서 김프를 계산할 수 없습니다")
+        return out
+    try:
+        tickers = md.bybit.fetch_tickers()
+    except Exception as exc:
+        logger.error("바이비트 티커 조회 실패: %s", exc)
+        return out
+
+    for coin in coins:
+        up = books.get(upbit_symbol(coin)) or {}
+        by = tickers.get(bybit_symbol(coin)) or {}
+        up_bid = (up.get("bids") or [[None]])[0][0]
+        up_ask = (up.get("asks") or [[None]])[0][0]
+        by_bid, by_ask = by.get("bid"), by.get("ask")
+        if not (up_bid and up_ask and by_bid and by_ask):
+            continue
+        info = by.get("info") or {}
+        rate = info.get("fundingRate")
+        next_ms = info.get("nextFundingTime")
+        try:  # 정산 주기는 마켓 정보에 분 단위로 있다 (480분 = 8시간)
+            minutes = float(((md.bybit.market(bybit_symbol(coin)) or {}).get("info") or {})
+                            .get("fundingInterval") or 480)
+        except Exception:
+            minutes = 480.0
+        out[coin] = TopQuote(
+            coin=coin, upbit_bid=up_bid, upbit_ask=up_ask, bybit_bid=by_bid, bybit_ask=by_ask,
+            usdt_bid=usdt_bid, usdt_ask=usdt_ask,
+            funding_rate=float(rate) if rate not in (None, "") else None,
+            funding_interval_hours=minutes / 60 if minutes else 8.0,
+            next_funding_ms=int(next_ms) if next_ms not in (None, "") else None,
+            fx_krw=fx_krw,
+        )
+    return out

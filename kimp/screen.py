@@ -897,7 +897,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     books = median_spread_depth(md, list(data), usdt_now, retry=with_retry,
                                 progress=lambda n, total: print(f"  {n}/{total}번째", flush=True))
     # 봇이 쌓은 기록이 있으면 그게 우선 (시뮬레이션과 같은 규칙: kimp/spread.py)
-    resolved, spread_sources = resolve_spreads(list(data), settings.db_path,
+    resolved, spread_sources = resolve_spreads(list(data), settings.snapshot_db_paths(),
                                                settings.sim_default_spread_percent,
                                                {c: v[0] for c, v in books.items()})
     for c in data:

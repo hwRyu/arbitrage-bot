@@ -340,6 +340,11 @@ class Settings:
     # 과거 캔들 / 환율 / 펀딩비 이력과 시뮬레이션 결과 DB (실시간 봇 DB 와 따로)
     history_db_path: str = "data/history.db"
 
+    # 시세 수집기(python -m kimp.collect)가 김프·호가 기록을 쌓는 DB.
+    # 매매 기록(kimp.db / live.db)과 **따로** 둔다 — 수집은 전략과 무관한 '시장 데이터' 이기 때문이다.
+    # 스크리너·시뮬레이션은 이 파일을 먼저 보고, 없으면 봇 DB의 기록을 본다.
+    snapshot_db_path: str = "data/market.db"
+
     # 과거엔 호가창이 없어서 코인 호가 간격(업비트 코인 + 바이비트, %)을 가정한다.
     # 실시간 김프 기록에 측정값이 있으면 먼저 쓰고, 없으면 이 값. 호가 한 칸보다는 좁게 잡지 않는다.
     # 코인별로는 .env 에 <코인>_SIM_SPREAD_PERCENT
@@ -440,6 +445,19 @@ class Settings:
             return "paper"
         return "dry_run" if self.live_dry_run else "live"
 
+    def snapshot_db_paths(self) -> Tuple[str, ...]:
+        """
+        김프·호가 기록을 찾을 DB 순서 (앞쪽이 우선)
+
+        ① 수집기 DB (data/market.db) — 수집 전용 명령이 쌓는 곳
+        ② 지금 모드의 봇 DB — 봇도 돌면서 기록을 남기므로 보조로 본다
+        ③ 페이퍼 DB — 모드를 바꿔도 전에 페이퍼로 쌓아둔 기록은 그대로 쓸 수 있다
+
+        시세 기록은 전략과 무관한 '시장 데이터' 라서 모드가 달라도 같이 쓴다. (매매 기록은 섞지 않는다)
+        """
+        paths = [self.snapshot_db_path, self.active_db_path, self.db_path]
+        return tuple(dict.fromkeys(paths))  # 중복 제거, 순서 유지
+
     @property
     def active_db_path(self) -> str:
         """김프 전략이 쓰는 DB (모드마다 따로라 기록이 섞이지 않는다)"""
@@ -539,6 +557,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         log_level=_env_str("LOG_LEVEL", d.log_level).upper(),
         log_dir=_env_str("LOG_DIR", d.log_dir),
         history_db_path=_env_str("HISTORY_DB_PATH", d.history_db_path),
+        snapshot_db_path=_env_str("SNAPSHOT_DB_PATH", d.snapshot_db_path),
         sim_default_spread_percent=_env_float("SIM_DEFAULT_SPREAD_PERCENT", d.sim_default_spread_percent),
         carry_enabled=_env_bool("CARRY_ENABLED", d.carry_enabled),
         carry_coins=_env_list("CARRY_COINS", ""),

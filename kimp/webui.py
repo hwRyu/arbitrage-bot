@@ -33,7 +33,7 @@ from sqlalchemy import func, select
 from kimp.config import Settings, load_settings
 from kimp.db import PaperBalance, Position, PositionStatus, PremiumSnapshot, make_session_factory
 from kimp.history import BYBIT, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade, make_history_session_factory
-from kimp.spread import resolve_spreads, snapshot_spreads
+from kimp.spread import resolve_spreads, snapshot_spreads_multi
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +94,9 @@ def _file_mb(path: str) -> Optional[float]:
 
 def spread_summary(settings: Settings, coins: Sequence[str]) -> List[Dict[str, Any]]:
     """코인별 호가 간격과 그 출처 (봇 기록이 쌓였는지 한눈에 보기)"""
-    records = snapshot_spreads(settings.db_path, coins)
-    spreads, sources = resolve_spreads(coins, settings.db_path, settings.sim_default_spread_percent)
+    paths = settings.snapshot_db_paths()
+    records = snapshot_spreads_multi(paths, coins)
+    spreads, sources = resolve_spreads(coins, paths, settings.sim_default_spread_percent)
     return [
         {
             "coin": c,
@@ -108,70 +109,49 @@ def spread_summary(settings: Settings, coins: Sequence[str]) -> List[Dict[str, A
 
 
 def recorded_coins(settings: Settings) -> List[Dict[str, Any]]:
-    """봇 기록(premium_snapshots)이 있는 코인과 건수 — 차트에서 '진입·청산 김프를 볼 수 있는 코인'"""
-    if not os.path.exists(settings.db_path):
-        return []
-    with make_session_factory(settings.db_path)() as session:
-        rows = session.execute(
-            select(PremiumSnapshot.coin, func.count()).group_by(PremiumSnapshot.coin)
-            .order_by(func.count().desc())
-        ).all()
-    return [{"coin": c, "count": n} for c, n in rows]
+    """
+    김프·호가 기록이 있는 코인과 건수 — 차트에서 '진입·청산 김프를 볼 수 있는 코인'
+
+    수집기 DB(data/market.db)와 봇 DB 를 모두 본다 (수집기가 주로 쌓고, 봇도 돌면서 남긴다).
+    """
+    total: Dict[str, int] = {}
+    for path in settings.snapshot_db_paths():
+        if not os.path.exists(path):
+            continue
+        with make_session_factory(path)() as session:
+            for coin, n in session.execute(
+                    select(PremiumSnapshot.coin, func.count()).group_by(PremiumSnapshot.coin)).all():
+                total[coin] = total.get(coin, 0) + n
+    return [{"coin": c, "count": n} for c, n in sorted(total.items(), key=lambda kv: -kv[1])]
 
 
 def premium_history(settings: Settings, coin: str, hours: float = 24.0, now_ms: Optional[int] = None,
                     md=None, force_fetch: bool = False) -> Dict[str, Any]:
     """
-    코인 하나의 기록 (차트용). 봇이 남긴 지표를 다 담아서 화면에서 골라 그릴 수 있게 한다.
+    코인 하나의 기록 (차트용). 두 가지를 **섞어서** 돌려준다.
 
-    ① 봇 기록(premium_snapshots)이 있으면 그걸 쓴다 (지표가 다 있다)
-    ② 없으면 과거 1분봉(history DB)으로 김프만 계산한다 (가운데 가격 기준)
+        과거 1분봉 (data/history.db)  → 기간 전체의 가운데 김프·가격·펀딩비
+        봇 기록 (premium_snapshots)   → 봇이 돌던 구간의 진입·청산 김프, 호가 간격, 테더 프리미엄
+
+    봇 기록만 쓰면 봇을 17분 돌렸을 때 7일을 요청해도 17분치만 나온다. 그래서 1분봉으로 기간을 채우고,
+    봇 기록이 있는 분은 그 값으로 덮어쓴다 (그 분에는 호가 정보까지 들어간다).
 
     series 의 각 칸 (없으면 null)
         mid     가운데 가격 기준 봇 김프 (%)          ← 보통 시세
-        entry   맨 앞 호가로 지금 진입하면 나오는 김프 (%)
-        exit    맨 앞 호가로 지금 청산하면 나오는 김프 (%)
+        entry   맨 앞 호가로 지금 진입하면 나오는 김프 (%)   ← 봇 기록이 있는 분만
+        exit    맨 앞 호가로 지금 청산하면 나오는 김프 (%)   ← 봇 기록이 있는 분만
         spread  코인 호가 간격 (%) = entry − exit − usdt_spread
         usdt_spread  업비트 USDT/KRW 호가 간격 (%)
-        funding 바이비트 펀딩비율 (%, 8시간 기준으로 환산). + 면 숏인 우리가 받는다
-        tether  테더 프리미엄 (%)
-        site    김프 사이트식 김프 (%, 달러 환율 기준)
-        usdt_krw 업비트 USDT 가격 (원)
-        upbit_krw / bybit_usdt  각 거래소 코인 가격
+        funding 바이비트 펀딩비율 (%, 8시간 기준 환산). + 면 숏인 우리가 받는다
+        tether  테더 프리미엄 (%) / site 사이트식 김프 (%)
+        usdt_krw 업비트 USDT 가격 (원) / upbit_krw · bybit_usdt 각 거래소 코인 가격
     """
     import time as _time
 
     now_ms = now_ms if now_ms is not None else int(_time.time() * 1000)
     start_ms = now_ms - int(hours * 3_600_000)
-    series: List[Dict[str, Any]] = []
-    if os.path.exists(settings.db_path):
-        with make_session_factory(settings.db_path)() as session:
-            rows = session.execute(
-                select(PremiumSnapshot).where(PremiumSnapshot.coin == coin)
-                .order_by(PremiumSnapshot.created_at)
-            ).scalars().all()
-            for r in rows:
-                created = r.created_at
-                if created is None:
-                    continue
-                ts = int(created.replace(tzinfo=created.tzinfo or _utc()).timestamp() * 1000)
-                if ts < start_ms:
-                    continue
-                usdt_spread = r.usdt_spread_percent
-                spread = None
-                if r.entry_premium_top is not None and r.exit_premium_top is not None:
-                    spread = r.entry_premium_top - r.exit_premium_top - (usdt_spread or 0.0)
-                series.append({
-                    "ts": ts, "mid": r.mid_premium, "entry": r.entry_premium_top, "exit": r.exit_premium_top,
-                    "spread": spread, "usdt_spread": usdt_spread,
-                    "funding": _funding_8h_percent(r.funding_rate, r.funding_interval_hours),
-                    "tether": r.tether_premium, "site": r.site_premium,
-                    "usdt_krw": r.usdt_krw, "upbit_krw": r.upbit_mid_krw, "bybit_usdt": r.bybit_mid_usdt,
-                })
-    if series:
-        return {"coin": coin, "source": "봇 기록", "series": series,
-                "available": _available_keys(series), "recorded": recorded_coins(settings)}
 
+    # 1) 과거 1분봉으로 기간 전체를 채운다
     store = HistoryStore(make_history_session_factory(settings.history_db_path))
     skipped = False
     if md is not None:
@@ -183,21 +163,62 @@ def premium_history(settings: Settings, coin: str, hours: float = 24.0, now_ms: 
     bybit = store.load_closes(BYBIT, coin, start_ms, now_ms)
     usdt = store.load_closes(UPBIT_USDT, "USDT", start_ms, now_ms)
     funding = dict(store.load_funding(coin, start_ms, now_ms))
+    rows: Dict[int, Dict[str, Any]] = {}
     for ts in sorted(upbit.keys() & bybit.keys() & usdt.keys()):
         b, u = bybit[ts], usdt[ts]
-        if b > 0 and u > 0:
-            series.append({
-                "ts": ts, "mid": (upbit[ts] / (b * u) - 1) * 100, "entry": None, "exit": None,
-                "spread": None, "usdt_spread": None,
-                "funding": (funding[ts] * 100) if ts in funding else None,
-                "tether": None, "site": None,
-                "usdt_krw": u, "upbit_krw": upbit[ts], "bybit_usdt": b,
-            })
-    out = {"coin": coin, "source": "1분봉" if series else "없음", "series": series,
-           "available": _available_keys(series), "recorded": recorded_coins(settings)}
-    if skipped and len(series) < hours * 60 * 0.9:  # 받아야 할 양에 많이 모자라면 알려준다
+        if b <= 0 or u <= 0:
+            continue
+        rows[ts] = {"ts": ts, "mid": (upbit[ts] / (b * u) - 1) * 100, "entry": None, "exit": None,
+                    "spread": None, "usdt_spread": None,
+                    "funding": (funding[ts] * 100) if ts in funding else None,
+                    "tether": None, "site": None,
+                    "usdt_krw": u, "upbit_krw": upbit[ts], "bybit_usdt": b}
+    candle_count = len(rows)
+
+    # 2) 봇 기록이 있는 분은 그 값으로 덮어쓴다 (호가 정보가 들어 있어서 더 정확하다)
+    snap_count = 0
+    records = []
+    for path in settings.snapshot_db_paths():
+        if not os.path.exists(path):
+            continue
+        with make_session_factory(path)() as session:
+            records += session.execute(
+                select(PremiumSnapshot).where(PremiumSnapshot.coin == coin)
+                .order_by(PremiumSnapshot.created_at)
+            ).scalars().all()
+    if records:
+        for r in records:
+            if r.created_at is None:
+                continue
+            ts = int(r.created_at.replace(tzinfo=r.created_at.tzinfo or _utc()).timestamp() * 1000)
+            if ts < start_ms or ts > now_ms:
+                continue
+            minute = ts // MINUTE_MS * MINUTE_MS  # 1분봉과 같은 칸에 맞춘다
+            spread = None
+            if r.entry_premium_top is not None and r.exit_premium_top is not None:
+                spread = r.entry_premium_top - r.exit_premium_top - (r.usdt_spread_percent or 0.0)
+            rows[minute] = {
+                "ts": minute, "mid": r.mid_premium, "entry": r.entry_premium_top, "exit": r.exit_premium_top,
+                "spread": spread, "usdt_spread": r.usdt_spread_percent,
+                "funding": _funding_8h_percent(r.funding_rate, r.funding_interval_hours),
+                "tether": r.tether_premium, "site": r.site_premium,
+                "usdt_krw": r.usdt_krw, "upbit_krw": r.upbit_mid_krw, "bybit_usdt": r.bybit_mid_usdt,
+            }
+            snap_count += 1
+
+    series = [rows[k] for k in sorted(rows)]
+    if snap_count and candle_count:
+        source = f"1분봉 {candle_count:,}개 + 봇 기록 {snap_count:,}개"
+    elif snap_count:
+        source = f"봇 기록 {snap_count:,}개"
+    else:
+        source = f"1분봉 {candle_count:,}개" if candle_count else "없음"
+    out: Dict[str, Any] = {"coin": coin, "source": source, "series": series,
+                           "available": _available_keys(series), "recorded": recorded_coins(settings),
+                           "snapshots": snap_count, "candles": candle_count}
+    if skipped and candle_count < hours * 60 * 0.9:
         out["fetch_skipped"] = True
-        out["hint"] = (f"{hours / 24:.0f}일치는 자동으로 받지 않습니다 (코인당 약 {hours * 60 * 2 / 1000:.0f}천 개 캔들). "
+        out["hint"] = (f"{hours / 24:.0f}일치 1분봉이 아직 없습니다 (코인당 약 {hours * 60 * 2 / 1000:.0f}천 개). "
                        f"'지금 받아오기' 를 누르면 받아서 저장합니다 (시뮬레이션에서도 재사용됩니다).")
     return out
 
@@ -531,6 +552,11 @@ def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[st
         # 지우는 작업이라 화면에서 '정말 지웁니다' 를 체크했을 때만 (confirm=1) 받는다
         cmd = [sys.executable, "-m", "kimp.history", "prune"]
         allowed, env_map = {"days": "--days", "source": "--source", "coins": "--coins"}, {}
+    elif kind == "collect":
+        # 시세 수집기: 주문·포지션 없이 김프·호가만 적는다 (봇과 별개)
+        cmd = [sys.executable, "-m", "kimp.collect"]
+        allowed, env_map = {"coins": "--coins", "top": "--top", "interval": "--interval",
+                            "hours": "--hours"}, {}
     elif kind == "bot":
         # 페이퍼 모드로만 켠다 (화면에서 실거래를 켤 수 있으면 사고가 난다)
         cmd = [sys.executable, "main.py"]
@@ -546,6 +572,8 @@ def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[st
         value = (params.get(key) or "").strip()
         if value:
             env[name] = value
+    if kind == "collect" and params.get("all"):
+        cmd.append("--all")
     if kind == "prune":
         if not params.get("confirm"):
             raise ValueError("지우기는 '정말 지웁니다' 를 체크해야 합니다")

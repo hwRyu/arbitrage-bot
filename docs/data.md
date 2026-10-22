@@ -15,6 +15,7 @@
 | `data/kimp.db` | **페이퍼 매매 기록** + 김프 기록(호가 포함) | `main.py` (페이퍼) | ❌ 매매 이력. 처음부터 다시 할 때만 |
 | `data/dryrun.db` | 드라이런 매매 기록 | `main.py` (`PAPER_TRADING=false`, `LIVE_DRY_RUN=true`) | ❌ 같은 이유 |
 | `data/live.db` | **실거래 매매 기록** | `main.py` (실주문) | ❌ **절대** |
+| `data/market.db` | **시세 기록** (김프·호가·펀딩비). `SNAPSHOT_DB_PATH` | `python -m kimp.collect` (수집기) | ⚠️ 지우면 실측 호가가 사라져 시뮬레이션이 추측값으로 돌아간다 (다시 모으는 데 시간이 든다) |
 | `data/history.db` | 과거 캔들 **캐시** + **시뮬레이션 결과** | 스크리너 · 시뮬레이션 · 로컬 화면 | ⚠️ 캔들만 지워도 됨 (다시 받음). `sim_*` 는 되살릴 수 없음 |
 | `data/screen_latest.json` | 스크리너 마지막 결과 (화면이 읽음) | `kimp.screen` → `kimp.webui` | ✅ 다시 돌리면 생김 |
 | `data/STOP` | 이 파일이 있으면 신규 진입 중단 | 사람이 만들고 지움 | ✅ |
@@ -31,6 +32,12 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 ```
 
 ---
+
+### 시세 기록은 왜 따로 두나
+`premium_snapshots`(김프·호가 기록)는 **전략과 무관한 시장 데이터**다. 그래서 수집 전용 명령
+(`python -m kimp.collect`)이 `data/market.db` 에 쌓고, 매매 기록(`kimp.db`·`live.db`)과 섞지 않는다.
+봇도 돌면서 자기 DB 에 같은 기록을 남기므로, 읽을 때는 **`market.db` → 지금 모드 DB → 페이퍼 DB** 순서로 찾는다
+(`Settings.snapshot_db_paths()`). 모드를 바꿔도 전에 모아둔 시세 기록은 그대로 쓸 수 있다.
 
 ## 1. 매매 기록 DB (`kimp.db` / `dryrun.db` / `live.db`)
 
@@ -131,9 +138,10 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 | `client_id` | **우리가 붙인 추적번호** (바이비트 `orderLinkId`, 업비트 `identifier`) |
 | `state` | `SENT`(결과 모름) / `DONE`(체결 확인) / `VOID`(주문 안 들어감) |
 
-### 1-3. `premium_snapshots` — 김프 기록 (가장 중요한 분석 자료)
-코인마다 1분에 1줄. **과거 호가창은 거래소가 주지 않으므로, 이 기록이 유일한 호가 간격 실측값이다.**
-스크리너·시뮬레이션이 30건 이상 쌓이면 자동으로 이 값을 쓴다 (`kimp/spread.py`).
+### 1-3. `premium_snapshots` — 김프·호가 기록 (가장 중요한 분석 자료)
+**주로 수집기(`python -m kimp.collect`)가 `data/market.db` 에 쌓는다.** 봇도 돌면서 자기 DB 에 남긴다.
+코인마다 `--interval`(기본 60초)에 1줄. **과거 호가창은 거래소가 주지 않으므로, 이 기록이 유일한 호가 간격 실측값이다.**
+스크리너·시뮬레이션이 30줄 이상 쌓이면 자동으로 이 값을 쓴다 (`kimp/spread.py`).
 
 | 컬럼 | 뜻 |
 |---|---|
