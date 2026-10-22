@@ -14,12 +14,22 @@
 코인 데이터는 하나도 안 바뀌었는데 '그 순간 호가창' 때문에 순위가 뒤집힌 것이다.
 그래서 지금은 아래 순서로 정하고, 조회할 때도 여러 번 재서 중간값을 쓴다.
 
+    0) 코인별 설정 <코인>_SIM_SPREAD_PERCENT — **적어 두면 무조건 이 값** (아래 모드와 무관)
     1) 봇이 쌓은 기록 (premium_snapshots) 평균 — 가장 믿을 만하다
-    2) 코인별 설정 <코인>_SIM_SPREAD_PERCENT
-    3) 지금 호가창 여러 번 조회한 중간값
-    4) 공통 설정 SIM_DEFAULT_SPREAD_PERCENT (기본 0.1%)
+    2) 지금 호가창 여러 번 조회한 중간값
+    3) 공통 설정 SIM_DEFAULT_SPREAD_PERCENT (기본 0.1%)
 
 어느 것을 썼는지 'source' 로 함께 돌려줘서 결과 표에 그대로 보여준다.
+
+**어디서 가져올지 고를 수 있다 (mode)**
+    auto     위 순서대로 (기본)
+    records  실측 기록만 쓴다. 모자란 코인은 '불확실' 로 남겨 시뮬레이션이 멈추게 한다
+    common   공통 설정값으로 전부 통일 — 호가 차이를 지우고 코인의 김프 움직임만 비교할 때
+    live     지금 호가창을 여러 번 재서 쓴다 (기록을 무시)
+
+코인별 설정이 모드보다 먼저인 이유: 사람이 직접 적은 값이 조용히 무시되면 더 위험하다.
+전에는 기록이 30건을 넘으면 <코인>_SIM_SPREAD_PERCENT 가 무시돼서, 적어 둔 값으로
+'호가가 더 나빠지면?' 을 시험할 수 없었다. 대신 화면·출력에 '코인별 설정' 이라고 명시한다.
 """
 from __future__ import annotations
 
@@ -156,10 +166,24 @@ def median_spread_depth(md, coins: Sequence[str], usdt_krw: float, samples: int 
 
 
 # 출처 라벨. '기록' 과 '코인별 설정' 만 믿을 만한 값으로 본다 (아래 is_rough)
+# 호가 간격을 어디서 가져올지 (화면·명령어에서 고를 수 있다)
+MODE_AUTO = "auto"
+MODE_RECORDS = "records"
+MODE_COMMON = "common"
+MODE_LIVE = "live"
+MODES = (MODE_AUTO, MODE_RECORDS, MODE_COMMON, MODE_LIVE)
+MODE_LABELS = {
+    MODE_AUTO: "자동 (기록 → 지금 호가 → 공통값)",
+    MODE_RECORDS: "실측 기록만",
+    MODE_COMMON: "공통값으로 통일",
+    MODE_LIVE: "지금 호가로",
+}
+
 SOURCE_RECORDS = "기록"
 SOURCE_ENV = "코인별 설정"
 SOURCE_LIVE = f"지금 호가 {LIVE_SAMPLES}번 중간값"
 SOURCE_DEFAULT = "기본 설정"
+SOURCE_NEED_RECORDS = "기록 부족"  # records 모드에서 기록이 모자란 코인
 
 
 def is_rough(source: str) -> bool:
@@ -170,7 +194,8 @@ def is_rough(source: str) -> bool:
     실제로 같은 기간을 돌렸는데 실행마다 CAP 호가가 0.125% / 0.266% 로 잡혀서
     거래 수가 115건 / 76건, 손익이 +63 / +42 USDT 로 갈렸다. (2026-10-22)
     """
-    return source.startswith(SOURCE_LIVE[:6]) or source == SOURCE_DEFAULT
+    return (source.startswith(SOURCE_LIVE[:6]) or source == SOURCE_DEFAULT
+            or source.startswith(SOURCE_NEED_RECORDS))
 
 
 def accumulate_hint(coins: Sequence[str], rough_flag: str = "--rough-spread") -> str:
@@ -197,31 +222,77 @@ def accumulate_hint(coins: Sequence[str], rough_flag: str = "--rough-spread") ->
     return chr(10).join(lines)
 
 
+def forced_coins(coins: Sequence[str]) -> Dict[str, float]:
+    """<코인>_SIM_SPREAD_PERCENT 로 값이 고정된 코인들 (화면에 '강제' 로 표시하려고)"""
+    out: Dict[str, float] = {}
+    for coin in coins:
+        raw = os.getenv(f"{coin}_SIM_SPREAD_PERCENT", "").strip()
+        if not raw:
+            continue
+        try:
+            out[coin] = float(raw)
+        except ValueError:
+            logger.warning("%s_SIM_SPREAD_PERCENT 값이 숫자가 아닙니다: %r (무시)", coin, raw)
+    return out
+
+
 def resolve_spreads(coins: Sequence[str], db_path, default_percent: float,
                     live: Optional[Dict[str, Optional[float]]] = None,
-                    min_snapshots: int = MIN_SNAPSHOTS_FOR_SPREAD) -> Tuple[Dict[str, float], Dict[str, str]]:
+                    min_snapshots: int = MIN_SNAPSHOTS_FOR_SPREAD,
+                    mode: str = MODE_AUTO) -> Tuple[Dict[str, float], Dict[str, str]]:
     """
-    코인별 호가 간격을 정한다: 기록 평균 → 코인별 설정 → 지금 호가창 중간값 → 공통 기본값
+    코인별 호가 간격을 정한다
+
+    코인별 설정(<코인>_SIM_SPREAD_PERCENT)이 있으면 **모드와 무관하게 그 값**을 쓴다.
+    없으면 mode 에 따라 고른다.
+
+        auto     기록(min_snapshots 이상) → 지금 호가창 → 공통값
+        records  기록만. 모자라면 공통값을 쓰되 '기록 부족' 으로 표시해 시뮬레이션이 멈추게 한다
+        common   공통값으로 통일 (호가 차이를 지우고 비교할 때)
+        live     지금 호가창 → (없으면) 기록 → 공통값
 
     Args:
         db_path: 기록 DB 경로 하나, 또는 여러 개 (앞쪽 우선). 없는 파일은 건너뛴다
-        default_percent: 아무것도 없을 때 쓸 값 (SIM_DEFAULT_SPREAD_PERCENT)
+        default_percent: 공통 설정값 (SIM_DEFAULT_SPREAD_PERCENT)
         live: {코인: 지금 호가 간격 %} (median_spread_depth 결과). 없으면 건너뛴다
+        mode: MODES 중 하나. 모르는 값이면 auto 로 본다
     Returns:
         ({코인: %}, {코인: 어디서 온 값인지 설명})
     """
+    if mode not in MODES:
+        logger.warning("모르는 호가 간격 모드 %r → %s 로 봅니다", mode, MODE_AUTO)
+        mode = MODE_AUTO
     paths = [db_path] if isinstance(db_path, str) else list(db_path)
     measured = snapshot_spreads_multi(paths, coins)
+    forced = forced_coins(coins)
     spreads: Dict[str, float] = {}
     sources: Dict[str, str] = {}
     for coin in coins:
         avg_n = measured.get(coin)
-        env_value = os.getenv(f"{coin}_SIM_SPREAD_PERCENT", "").strip()
+        enough = bool(avg_n and avg_n[1] >= min_snapshots)
+        records_label = f"{SOURCE_RECORDS} {avg_n[1]:,}건" if avg_n else SOURCE_RECORDS
         live_value = (live or {}).get(coin)
-        if avg_n and avg_n[1] >= min_snapshots:
-            spreads[coin], sources[coin] = avg_n[0], f"{SOURCE_RECORDS} {avg_n[1]:,}건"
-        elif env_value:
-            spreads[coin], sources[coin] = float(env_value), SOURCE_ENV
+
+        if coin in forced:  # 사람이 적어 둔 값이 가장 먼저 (모드와 무관)
+            spreads[coin], sources[coin] = forced[coin], SOURCE_ENV
+        elif mode == MODE_COMMON:
+            spreads[coin], sources[coin] = default_percent, SOURCE_DEFAULT
+        elif mode == MODE_RECORDS:
+            if enough:
+                spreads[coin], sources[coin] = avg_n[0], records_label
+            else:
+                have = avg_n[1] if avg_n else 0
+                spreads[coin] = default_percent
+                sources[coin] = f"{SOURCE_NEED_RECORDS} ({have}/{min_snapshots}건)"
+        elif mode == MODE_LIVE:
+            if live_value is not None:
+                spreads[coin], sources[coin] = live_value, SOURCE_LIVE
+            elif enough:
+                spreads[coin], sources[coin] = avg_n[0], records_label
+            else:
+                spreads[coin], sources[coin] = default_percent, SOURCE_DEFAULT
+        elif enough:
+            spreads[coin], sources[coin] = avg_n[0], records_label
         elif live_value is not None:
             spreads[coin], sources[coin] = live_value, SOURCE_LIVE
         else:

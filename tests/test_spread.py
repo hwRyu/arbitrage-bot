@@ -8,7 +8,9 @@ import unittest
 from unittest import mock
 
 from kimp.db import PremiumSnapshot, make_session_factory
-from kimp.spread import (MIN_SNAPSHOTS_FOR_SPREAD, median_spread_depth, resolve_spreads, snapshot_spreads)
+from kimp.spread import (MIN_SNAPSHOTS_FOR_SPREAD, MODE_COMMON, MODE_LIVE, MODE_RECORDS, MODES,
+                         SOURCE_ENV, is_rough, median_spread_depth, resolve_spreads,
+                         snapshot_spreads)
 
 
 class FakeBooks:
@@ -96,15 +98,95 @@ class ResolveSpreadTest(unittest.TestCase):
             got = snapshot_spreads(path, ["CAP"])
             self.assertEqual(got["CAP"][1], MIN_SNAPSHOTS_FOR_SPREAD)
             self.assertAlmostEqual(got["CAP"][0], 0.225, places=6)
-            with mock.patch.dict(os.environ, {"CAP_SIM_SPREAD_PERCENT": "0.5"}, clear=True):
+            # 코인별 설정이 없으면 기록이 이긴다 (지금 호가 0.35 보다 기록 0.225 가 먼저)
+            with mock.patch.dict(os.environ, {}, clear=True):
                 spreads, sources = resolve_spreads(["CAP"], db_path=path, default_percent=0.1, live={"CAP": 0.35})
             self.assertAlmostEqual(spreads["CAP"], 0.225, places=6)
             self.assertIn("기록", sources["CAP"])
+
+            # 코인별 설정이 있으면 기록보다 먼저다 (사람이 적은 값이 조용히 무시되면 안 된다)
+            with mock.patch.dict(os.environ, {"CAP_SIM_SPREAD_PERCENT": "0.5"}, clear=True):
+                spreads, sources = resolve_spreads(["CAP"], db_path=path, default_percent=0.1, live={"CAP": 0.35})
+            self.assertAlmostEqual(spreads["CAP"], 0.5, places=6)
+            self.assertEqual(sources["CAP"], SOURCE_ENV)
+
+            # 모드를 바꿔도 코인별 설정은 그대로 (common 으로 통일해도 이 코인만 예외)
+            for mode in MODES:
+                with mock.patch.dict(os.environ, {"CAP_SIM_SPREAD_PERCENT": "0.5"}, clear=True):
+                    sp, sr = resolve_spreads(["CAP"], db_path=path, default_percent=0.1,
+                                             live={"CAP": 0.35}, mode=mode)
+                self.assertAlmostEqual(sp["CAP"], 0.5, places=6, msg=mode)
+                self.assertEqual(sr["CAP"], SOURCE_ENV, msg=mode)
+
+            # 모드별로 어디서 가져오는지
+            with mock.patch.dict(os.environ, {}, clear=True):
+                sp, sr = resolve_spreads(["CAP"], db_path=path, default_percent=0.1,
+                                         live={"CAP": 0.35}, mode=MODE_COMMON)
+                self.assertAlmostEqual(sp["CAP"], 0.1)          # 공통값으로 통일
+                sp, sr = resolve_spreads(["CAP"], db_path=path, default_percent=0.1,
+                                         live={"CAP": 0.35}, mode=MODE_LIVE)
+                self.assertAlmostEqual(sp["CAP"], 0.35)         # 기록이 있어도 지금 호가
+                sp, sr = resolve_spreads(["CAP"], db_path=path, default_percent=0.1,
+                                         live={"CAP": 0.35}, mode=MODE_RECORDS)
+                self.assertAlmostEqual(sp["CAP"], 0.225)        # 기록만
         finally:
             try:  # 윈도우는 SQLAlchemy 연결이 남아 있으면 못 지운다 → 남아도 테스트에 지장 없음
                 os.remove(path)
             except OSError:
                 pass
+
+
+class SpreadModeTest(unittest.TestCase):
+    """호가 간격을 어디서 가져올지 (auto / records / common / live) — 기록이 없는 코인 기준"""
+
+    def _resolve(self, mode, live=None, env=None):
+        with mock.patch.dict(os.environ, env or {}, clear=True):
+            return resolve_spreads(["ZZZ"], db_path="없는파일.db", default_percent=0.1,
+                                   live=live, mode=mode)
+
+    def test_common_ignores_live(self):
+        """공통값 통일: 지금 호가가 있어도 공통값을 쓴다 (호가 차이를 지우고 비교할 때)"""
+        sp, sr = self._resolve(MODE_COMMON, live={"ZZZ": 0.9})
+        self.assertAlmostEqual(sp["ZZZ"], 0.1)
+        self.assertEqual(sr["ZZZ"], "기본 설정")
+
+    def test_records_mode_flags_missing(self):
+        """실측 기록만: 기록이 모자라면 '기록 부족' 으로 표시하고 시뮬레이션이 멈추게 한다"""
+        sp, sr = self._resolve(MODE_RECORDS, live={"ZZZ": 0.9})
+        self.assertAlmostEqual(sp["ZZZ"], 0.1)          # 값은 공통값으로 때우되
+        self.assertIn("기록 부족", sr["ZZZ"])            # 출처는 부족하다고 알린다
+        self.assertIn("0/30", sr["ZZZ"])
+        self.assertTrue(is_rough(sr["ZZZ"]))            # → 시뮬레이션이 거부한다
+
+    def test_live_mode_uses_live(self):
+        sp, sr = self._resolve(MODE_LIVE, live={"ZZZ": 0.9})
+        self.assertAlmostEqual(sp["ZZZ"], 0.9)
+
+    def test_live_mode_falls_back_without_live(self):
+        """지금 호가를 못 받았으면 공통값으로 (화면에서 조회 없이 불러올 때)"""
+        sp, sr = self._resolve(MODE_LIVE, live=None)
+        self.assertAlmostEqual(sp["ZZZ"], 0.1)
+
+    def test_unknown_mode_falls_back_to_auto(self):
+        """모르는 모드는 auto 로 본다 (화면에서 엉뚱한 값이 와도 죽지 않게)"""
+        sp, sr = self._resolve("그런모드없음", live={"ZZZ": 0.9})
+        self.assertAlmostEqual(sp["ZZZ"], 0.9)          # auto = 기록 없음 → 지금 호가
+
+    def test_env_wins_in_every_mode(self):
+        """코인별 설정은 모든 모드에서 1순위 (표에 '강제' 로 표시된다)"""
+        for mode in MODES:
+            sp, sr = self._resolve(mode, live={"ZZZ": 0.9}, env={"ZZZ_SIM_SPREAD_PERCENT": "0.42"})
+            self.assertAlmostEqual(sp["ZZZ"], 0.42, msg=mode)
+            self.assertEqual(sr["ZZZ"], SOURCE_ENV, msg=mode)
+
+    def test_forced_coins_lists_and_skips_bad_values(self):
+        """강제된 코인 목록. 숫자가 아닌 값은 무시한다 (경고만)"""
+        from kimp.spread import forced_coins
+        with mock.patch.dict(os.environ, {"AAA_SIM_SPREAD_PERCENT": "0.3",
+                                          "BBB_SIM_SPREAD_PERCENT": "저렴함",
+                                          "CCC_SIM_SPREAD_PERCENT": "  "}, clear=True):
+            got = forced_coins(["AAA", "BBB", "CCC", "DDD"])
+        self.assertEqual(got, {"AAA": 0.3})
 
 
 class RoughSpreadTest(unittest.TestCase):
@@ -131,7 +213,9 @@ class RoughSpreadTest(unittest.TestCase):
         from kimp.config import Settings
         from kimp.simulate import decide_spreads
         from kimp.spread import is_rough
-        settings = replace(Settings(coins=["CAP"], db_path="없는파일.db"), sim_default_spread_percent=0.1)
+        # snapshot_db_path 까지 비켜야 한다 — 기본값 data/market.db 에 기록이 쌓이면 이 테스트가 깨진다
+        settings = replace(Settings(coins=["CAP"], db_path="없는파일.db",
+                                    snapshot_db_path="없는수집파일.db"), sim_default_spread_percent=0.1)
         with mock.patch.dict(os.environ, {}, clear=True):
             spreads, sources = decide_spreads(settings, ["CAP"])
         self.assertAlmostEqual(spreads["CAP"], 0.1)

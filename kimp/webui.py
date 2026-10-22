@@ -37,7 +37,8 @@ from kimp.dashboard import dashboard
 from kimp.levels import plan as level_plan
 from kimp.db import PaperBalance, Position, PositionStatus, PremiumSnapshot, make_session_factory
 from kimp.history import BYBIT, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade, make_history_session_factory
-from kimp.spread import resolve_spreads, snapshot_spreads_multi
+from kimp.spread import (MODE_AUTO, MODE_LABELS, MODES, forced_coins, resolve_spreads,
+                         snapshot_spreads_multi)
 
 logger = logging.getLogger(__name__)
 
@@ -98,20 +99,35 @@ def _file_mb(path: str) -> Optional[float]:
         return None
 
 
-def spread_summary(settings: Settings, coins: Sequence[str]) -> List[Dict[str, Any]]:
-    """코인별 호가 간격과 그 출처 (봇 기록이 쌓였는지 한눈에 보기)"""
+def spread_summary(settings: Settings, coins: Sequence[str],
+                   mode: str = MODE_AUTO) -> Dict[str, Any]:
+    """
+    코인별 호가 간격과 그 출처 (어느 모드로 보면 어떤 값이 쓰이는지)
+
+    코인별 설정(<코인>_SIM_SPREAD_PERCENT)으로 고정된 코인은 forced 로 알려준다 —
+    모드를 바꿔도 그 코인은 안 바뀌므로 화면에 명시해야 한다.
+    """
     paths = settings.snapshot_db_paths()
     records = snapshot_spreads_multi(paths, coins)
-    spreads, sources = resolve_spreads(coins, paths, settings.sim_default_spread_percent)
-    return [
-        {
-            "coin": c,
-            "percent": spreads.get(c),
-            "source": sources.get(c, "-"),
-            "records": records.get(c, (None, 0))[1],
-        }
-        for c in coins
-    ]
+    forced = forced_coins(coins)
+    spreads, sources = resolve_spreads(coins, paths, settings.sim_default_spread_percent, mode=mode)
+    return {
+        "mode": mode,
+        "modes": [{"value": m, "label": MODE_LABELS[m]} for m in MODES],
+        "common_percent": settings.sim_default_spread_percent,
+        "forced": forced,
+        "rows": [
+            {
+                "coin": c,
+                "percent": spreads.get(c),
+                "source": sources.get(c, "-"),
+                "records": records.get(c, (None, 0))[1],
+                "records_percent": records.get(c, (None, 0))[0],
+                "forced": c in forced,
+            }
+            for c in coins
+        ],
+    }
 
 
 def recorded_coins(settings: Settings) -> List[Dict[str, Any]]:
@@ -524,10 +540,12 @@ JOB_LOG_LINES = 400  # 로그는 마지막 400줄만 들고 있는다
 # 화면에서 받을 수 있는 값만 허용한다 (아무 설정이나 넘기지 못하게)
 SCREEN_PARAMS = {"days": "--days", "top": "--top", "coins": "--coins", "timeframe": "--timeframe",
                  "refine_top": "--refine-top", "refine_timeframe": "--refine-timeframe",
-                 "target": "--target", "recent_days": "--recent-days"}
+                 "target": "--target", "recent_days": "--recent-days",
+                 "spread_source": "--spread-source"}
 # 손절은 스크리너에 옵션이 없고 설정에서 읽는다 → 환경 변수로 넘긴다 (비우면 .env 값)
 SCREEN_ENV = {"stop": "STOP_LOSS_PERCENT"}
-SIM_PARAMS = {"start": "--from", "end": "--to", "coins": "--coins"}
+SIM_PARAMS = {"start": "--from", "end": "--to", "coins": "--coins",
+              "spread_source": "--spread-source"}
 SIM_ENV = {"seed": "PAPER_INITIAL_TOTAL_USDT", "size": "POSITION_SIZE_USDT",
            "max_positions": "MAX_OPEN_POSITIONS", "target": "TARGET_NET_PROFIT_PERCENT",
            "stop": "STOP_LOSS_PERCENT"}
@@ -704,7 +722,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(config_summary(self.settings))
             elif url.path == "/api/spreads":
                 coins = self._coins(query)
-                self._json(spread_summary(self.settings, coins))
+                mode = (query.get("mode") or [MODE_AUTO])[0]
+                self._json(spread_summary(self.settings, coins, mode))
             elif url.path == "/api/premium":
                 coin = (query.get("coin") or [self.settings.coins[0]])[0].upper()
                 hours = float((query.get("hours") or ["24"])[0])

@@ -220,9 +220,14 @@
     <div class="wrap"><table id="liveTable"></table></div>
     <p class="note">진입 김프 = 지금 사고 숏 칠 때 / 청산 김프 = 지금 팔고 숏 닫을 때. 둘의 차이가 호가 간격입니다.
 코인 몫 김프만 봇 손익에 영향을 줍니다 (테더 프리미엄·환율은 상쇄).</p>
-    <h3 style="font-size:14px;margin:18px 0 8px">호가 간격 기록</h3>
+    <h3 style="font-size:14px;margin:18px 0 8px">호가 간격 — 어디서 가져오나
+      <span class="muted" style="font-weight:400">(스크리너·시뮬레이션이 쓰는 값)</span></h3>
+    <div class="row">
+      <label><span class="hint" id="spModeTip">출처</span> <select id="spMode"></select></label>
+      <span class="muted" id="spInfo"></span>
+    </div>
     <div class="wrap"><table id="spreadTable"></table></div>
-    <p class="note">기록이 30건을 넘으면 스크리너·시뮬레이션이 자동으로 그 값을 씁니다. 기록이 없으면 시뮬레이션은 멈춥니다.</p>
+    <p class="note" id="spNote"></p>
   </section>
 
   <section id="chart">
@@ -286,6 +291,8 @@
         <label>상위 <input id="scTop" type="number" value="20" min="5" max="80" style="width:60px"></label>
         <label>2단계 재평가 <input id="scRefine" type="number" value="20" min="0" max="80" style="width:60px"></label>
         <label>코인 <input id="scCoins" placeholder="비우면 전체 80개" style="width:190px"></label>
+        <label><span class="hint" id="scSpreadTip">호가 간격</span>
+          <select id="scSpread"></select></label>
       </div>
       <div class="row">
         <label><span class="hint" id="scTargetTip">목표 순이익</span>
@@ -331,6 +338,8 @@
         <label>시작 <input id="smFrom" type="date" value="2026-09-22"></label>
         <label>끝 <input id="smTo" type="date" value="2026-10-22"></label>
         <label>코인 <input id="smCoins" placeholder="비우면 .env COINS" style="width:170px"></label>
+        <label><span class="hint" id="smSpreadTip">호가 간격</span>
+          <select id="smSpread"></select></label>
       </div>
       <div class="row">
         <label>시드 <input id="smSeed" type="number" value="1500" style="width:90px"> USDT</label>
@@ -543,6 +552,16 @@ const TIP = {
               "0 이면 한 번도 뒷걸음질하지 않았다는 뜻. 자본을 얼마나 버텨야 하는지 가늠하는 값.",
   dbMonth: "월 환산 = 기간 순손익 ÷ 기간 일수 × 30" + NL +
            "기간이 짧으면 크게 흔들린다. 며칠치로 월 수익을 단정하지 말 것.",
+  spreadSource: "호가 간격을 어디서 가져올지 (스크리너·시뮬레이션 전용)" + NL +
+                "과거 호가창은 거래소가 주지 않는다 → 백테스트는 '가정값' 하나를 써야 한다." + NL +
+                "실거래·페이퍼는 이 설정과 무관하게 항상 그 순간 진짜 호가창을 읽는다." + NL + NL +
+                "자동      기록(30건↑) → 지금 호가 → 공통값.  평소에 쓰는 값" + NL +
+                "실측 기록만  쌓아 둔 기록만 쓴다. 모자란 코인은 '기록 부족' 으로 표시되고 시뮬레이션이 멈춘다" + NL +
+                "공통값 통일  모든 코인을 SIM_DEFAULT_SPREAD_PERCENT 로 — 호가 차이를 지우고" + NL +
+                "            '김프 움직임' 만 코인끼리 비교할 때 (실제 수익 추정에는 쓰지 말 것)" + NL +
+                "지금 호가   그 자리에서 여러 번 재서 중간값. 순간값에 휘둘리므로 참고용" + NL + NL +
+                "<코인>_SIM_SPREAD_PERCENT 를 .env 에 적어 두면 그 코인은 이 설정과 무관하게 그 값으로 간다" + NL +
+                "(표에 '강제' 로 표시된다). 사람이 적은 값이 조용히 무시되지 않게 하려는 것이다.",
   scTarget: "목표 순이익 (%)  — 포지션 금액 대비 남기고 싶은 돈" + NL +
             "백테스트가 이 값에 닿으면 청산한 것으로 본다. **순위를 가장 크게 바꾸는 값이다.**" + NL + NL +
             "필요한 상승폭 = 목표 + 왕복 수수료 + 코인 호가 간격 + USDT 호가 간격 + 전송비 + 여유" + NL +
@@ -646,6 +665,7 @@ $("bandFromSigma").onclick = () => {
 $("chartForce").onclick = () => loadChart("force");
 $("liveScope").onchange = loadLive;
 $("liveSort").onchange = loadLive;
+$("spMode").onchange = loadLive;
 $("chartHours").onchange = loadChart;
 $("auto").onchange = (e) => {
   clearInterval(TIMER);
@@ -742,16 +762,38 @@ async function loadLive() {
     $("liveInfo").textContent = "";
   }
   try {
-    const rows = await api("/api/spreads");
+    const d = await api("/api/spreads?mode=" + encodeURIComponent($("spMode").value || "auto"));
+    fillSpreadModes(d);
     table($("spreadTable"), [
       { t: "코인", v: (r) => r.coin },
-      { t: "호가 간격", tip: TIP.coinSpread, v: (r) => fmt(r.percent, 3) + "%" },
-      { t: "출처", tip: TIP.source, v: (r) => r.source },
+      { t: "쓰는 값", tip: TIP.coinSpread, v: (r) => fmt(r.percent, 3) + "%" },
+      { t: "출처", tip: TIP.source,
+        v: (r) => r.forced ? `<b style="color:var(--warn)">${r.source} (강제)</b>` : r.source },
       { t: "기록 건수", tip: TIP.records, v: (r) => (r.records || 0).toLocaleString() },
-    ], rows);
+      { t: "기록 중간값", tip: TIP.records,
+        v: (r) => r.records_percent === null || r.records_percent === undefined ? "-" : fmt(r.records_percent, 3) + "%" },
+    ], d.rows);
+    const forced = Object.keys(d.forced || {});
+    $("spInfo").textContent = `공통값 ${fmt(d.common_percent, 3)}%`
+      + (forced.length ? ` · 강제: ${forced.map((c) => `${c}=${fmt(d.forced[c], 3)}%`).join(", ")}` : "");
+    $("spNote").textContent = forced.length
+      ? `${forced.join(", ")} 는 .env 의 <코인>_SIM_SPREAD_PERCENT 로 고정돼 있어 출처를 바꿔도 그 값으로 돕니다.`
+        + NL + "그 줄을 지우면 아래 출처 설정을 따릅니다."
+      : "기록이 30건을 넘으면 '실측 기록' 으로 잡힙니다. 모자란 코인은 '지금 호가' 나 공통값으로 대체되고,"
+        + NL + "시뮬레이션은 그 상태에서 멈춥니다 (강행하려면 '호가 기록 없어도 강행' 체크).";
   } catch (e) {
     $("spreadTable").innerHTML = `<tr><td class="err">${e.message}</td></tr>`;
   }
+}
+
+// 출처 콤보 세 군데(지금 김프 · 추천 코인 · 시뮬레이션)를 같은 목록으로 채운다
+function fillSpreadModes(d) {
+  ["spMode", "scSpread", "smSpread"].forEach((id) => {
+    const sel = $(id);
+    if (!sel || sel.options.length) return;        // 이미 채웠으면 그대로 (사용자 선택 유지)
+    sel.innerHTML = d.modes.map((m) =>
+      `<option value="${m.value}"${m.value === d.mode ? " selected" : ""}>${m.label}</option>`).join("");
+  });
 }
 
 function openChart(coin) {
@@ -1381,9 +1423,11 @@ $("jobStop").onclick = async () => { if (JOB) { await api(`/api/stop?id=${JOB}`)
 $("scRun").onclick = () => runJob("screen", {
   days: $("scDays").value, top: $("scTop").value, refine_top: $("scRefine").value, coins: $("scCoins").value,
   recent_days: $("scRecent").value, target: $("scTarget").value, stop: $("scStop").value,
+  spread_source: $("scSpread").value,
 });
 $("smRun").onclick = () => runJob("sim", {
   start: $("smFrom").value, end: $("smTo").value, coins: $("smCoins").value, seed: $("smSeed").value,
+  spread_source: $("smSpread").value,
   size: $("smSize").value, max_positions: $("smMax").value, target: $("smTarget").value,
   stop: $("smStop").value,
   thresholds: $("smTh").value, rough: $("smRough").checked ? "1" : "", verbose: $("smVerbose").checked ? "1" : "",
@@ -1792,6 +1836,7 @@ $("levelTip").setAttribute("data-tip", TIP.levels);
 $("scTargetTip").setAttribute("data-tip", TIP.scTarget);
 $("scStopTip").setAttribute("data-tip", TIP.scStop);
 $("scRecentTip").setAttribute("data-tip", TIP.scRecent);
+["spModeTip", "scSpreadTip", "smSpreadTip"].forEach((id) => $(id).setAttribute("data-tip", TIP.spreadSource));
 loadBands();
 reload();
 </script>

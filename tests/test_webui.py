@@ -70,7 +70,7 @@ class SnapshotBackedTest(unittest.TestCase):
 
     def test_spread_summary_uses_records(self):
         """진입 김프 − 청산 김프 − USDT 호가 = 0.16 + 0.26 − 0.075 = 0.345%"""
-        row = spread_summary(self.settings, ["CAP"])[0]
+        row = spread_summary(self.settings, ["CAP"])["rows"][0]
         self.assertAlmostEqual(row["percent"], 0.345, places=6)
         self.assertIn("기록", row["source"])
         self.assertEqual(row["records"], 40)

@@ -44,7 +44,8 @@ from sqlalchemy import func, select
 
 from kimp.config import Settings, load_settings
 from kimp.db import Position, PositionStatus, make_session_factory
-from kimp.spread import (LIVE_SAMPLES, MIN_SNAPSHOTS_FOR_SPREAD, accumulate_hint, is_rough,
+from kimp.spread import (LIVE_SAMPLES, MIN_SNAPSHOTS_FOR_SPREAD, MODE_AUTO, MODE_COMMON, MODE_LIVE,
+                         MODE_RECORDS, MODES, accumulate_hint, forced_coins, is_rough,
                          median_spread_depth, resolve_spreads, snapshot_spreads_multi)
 from kimp.engine import Engine
 from kimp.fx import FxQuote
@@ -429,30 +430,36 @@ def apply_tick_floor(spreads: Dict[str, float], sources: Dict[str, str],
 
 
 def decide_spreads(settings: Settings, coins: List[str], md=None, usdt_krw: float = 1.0,
-                   allow_live: bool = True) -> Tuple[Dict[str, float], Dict[str, str]]:
+                   allow_live: bool = True, mode: str = MODE_AUTO) -> Tuple[Dict[str, float], Dict[str, str]]:
     """
     코인별 코인 호가 간격(%) 정하기 — 스크리너와 같은 규칙 (kimp/spread.py)
 
-    순서: 봇이 쌓은 기록 평균 → 코인별 설정 → 지금 호가창 여러 번 중간값 → 공통 기본값
+    코인별 설정 <코인>_SIM_SPREAD_PERCENT 가 있으면 모드와 무관하게 그 값.
+    없으면 mode 에 따라: auto(기록 → 지금 호가 → 공통) / records(기록만) /
+    common(공통값 통일) / live(지금 호가)
 
     과거 호가창은 거래소가 주지 않는다. 그래서 기록이 없으면 '지금' 호가를 대신 쓴다.
-    기본값 0.1% 를 쓰면 실제(예: CAP 0.35%)보다 싸게 계산돼서 가짜 수익이 나온다.
+    공통값 0.1% 를 쓰면 실제(예: CAP 0.27%)보다 싸게 계산돼서 가짜 수익이 나온다.
 
     Args:
-        md: MarketData. 주면 기록이 없는 코인의 호가창을 조회해서 중간값을 쓴다
+        md: MarketData. 주면 호가창을 조회해서 중간값을 쓴다
         usdt_krw: 업비트 USDT 가격 (물량을 USDT 로 바꿀 때만 쓴다)
         allow_live: False 면 지금 호가창을 조회하지 않는다 (어차피 막힐 실행에서 10초를 버리지 않도록)
+        mode: 호가 간격을 어디서 가져올지 (kimp.spread.MODES)
     """
     live = None
-    if md is not None and allow_live:
-        need = [c for c in coins
-                if not os.getenv(f"{c}_SIM_SPREAD_PERCENT", "").strip()
-                and snapshot_spreads_multi(settings.snapshot_db_paths(), [c]).get(c, (0, 0))[1]
-                < MIN_SNAPSHOTS_FOR_SPREAD]
+    # common 모드는 조회가 필요 없고, records 모드는 기록만 쓰므로 조회하지 않는다
+    if md is not None and allow_live and mode not in (MODE_COMMON, MODE_RECORDS):
+        forced = forced_coins(coins)
+        need = [c for c in coins if c not in forced
+                and (mode == MODE_LIVE
+                     or snapshot_spreads_multi(settings.snapshot_db_paths(), [c]).get(c, (0, 0))[1]
+                     < MIN_SNAPSHOTS_FOR_SPREAD)]
         if need:
-            print(f"호가 간격 확인 중 (기록이 없는 {len(need)}개 코인, {LIVE_SAMPLES}번 재서 중간값)...")
+            print(f"호가 간격 확인 중 ({len(need)}개 코인, {LIVE_SAMPLES}번 재서 중간값)...")
             live = {c: v[0] for c, v in median_spread_depth(md, need, usdt_krw).items()}
-    return resolve_spreads(coins, settings.snapshot_db_paths(), settings.sim_default_spread_percent, live)
+    return resolve_spreads(coins, settings.snapshot_db_paths(), settings.sim_default_spread_percent,
+                           live, mode=mode)
 
 
 # ----------------------------------------------------------------------
@@ -611,6 +618,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--coins", default=None, help="코인 목록 (안 적으면 .env 의 COINS) 예: XRP,SOL")
     parser.add_argument("--verbose", action="store_true", help="거래 내역 하나하나 보기")
     parser.add_argument("--no-save", action="store_true", help="결과를 history DB 에 저장하지 않음")
+    parser.add_argument("--spread-source", default=MODE_AUTO, choices=list(MODES),
+                        help="호가 간격을 어디서 가져올지. auto=기록→지금 호가→공통값 (기본) / "
+                             "records=실측 기록만 / common=공통값으로 통일 / live=지금 호가. "
+                             "<코인>_SIM_SPREAD_PERCENT 가 있으면 그 코인은 모드와 무관하게 그 값")
     parser.add_argument("--rough-spread", action="store_true",
                         help="호가 간격 기록이 없어도 '지금 호가' 로 대충 돌린다 (숫자가 실행마다 바뀜)")
     args = parser.parse_args(argv)
@@ -642,6 +653,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     bybit = {c: store.load_closes(BYBIT, c, start_ms - pad, end_ms) for c in coins}
     usdt = store.load_closes(UPBIT_USDT, "USDT", start_ms - pad, end_ms)
     spreads, sources = decide_spreads(settings, coins, md, usdt[max(usdt)] if usdt else 1.0,
+                                      mode=getattr(args, 'spread_source', MODE_AUTO),
                                       allow_live=args.rough_spread)
     rough = [c for c in coins if is_rough(sources.get(c, ""))]
     if rough and not args.rough_spread:

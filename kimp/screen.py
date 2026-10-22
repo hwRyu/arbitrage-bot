@@ -80,7 +80,8 @@ from kimp.history import (
 )
 from kimp.market_data import USDT_KRW_SYMBOL, bybit_symbol, upbit_symbol
 from kimp.simulate import tick_floor_percent, usdt_tick_percent
-from kimp.spread import LIVE_SAMPLES, is_rough, median_spread_depth, resolve_spreads
+from kimp.spread import (LIVE_SAMPLES, MODE_AUTO, MODE_COMMON, MODE_LIVE, MODE_RECORDS, MODES,
+                         is_rough, median_spread_depth, resolve_spreads)
 
 logger = logging.getLogger(__name__)
 
@@ -857,6 +858,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="추천 코인 순위 (최근 김프 움직임으로 전략이 잘 통했을 코인 찾기)")
     parser.add_argument("--days", type=float, default=30, help="최근 며칠을 볼지 (기본 30)")
     parser.add_argument("--top", type=int, default=20, help="몇 위까지 보여줄지 (기본 20)")
+    parser.add_argument("--spread-source", default=MODE_AUTO, choices=list(MODES),
+                        help="호가 간격을 어디서 가져올지. auto=기록→지금 호가→공통값 (기본) / "
+                             "records=실측 기록만 / common=공통값으로 통일 / live=지금 호가. "
+                             "<코인>_SIM_SPREAD_PERCENT 가 있으면 그 코인은 모드와 무관하게 그 값")
     parser.add_argument("--recent-days", type=float, default=0.0,
                         help="검증에 쓸 최근 기간 (일). 0 = 기간의 뒤 1/3 (기본). "
                              "예: --days 30 --recent-days 7 → 앞 23일로 기준 고르고 최근 7일로 검증")
@@ -934,7 +939,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 봇이 쌓은 기록이 있으면 그게 우선 (시뮬레이션과 같은 규칙: kimp/spread.py)
     resolved, spread_sources = resolve_spreads(list(data), settings.snapshot_db_paths(),
                                                settings.sim_default_spread_percent,
-                                               {c: v[0] for c, v in books.items()})
+                                               {c: v[0] for c, v in books.items()},
+                                               mode=args.spread_source)
     for c in data:
         live[c].spread_percent, live[c].depth_usdt = books.get(c, (None, None))
 
