@@ -185,11 +185,24 @@ class LegSum:
 
     @property
     def avg(self) -> float:
+        """개수 가중 평균가. 같은 단계를 두 번 나눠 체결했을 때 단순 평균을 쓰면 틀린다"""
         return self.cost / self.qty if self.qty else 0.0
 
 
 class HedgeBroker:
-    """진입·청산·송금·대조 공통 로직. 체결은 executor 가 한다"""
+    """
+    진입·청산·송금·대조 공통 로직. 체결은 executor 가 한다 (페이퍼/드라이런/실거래)
+
+    설계의 핵심: **모드가 달라도 이 클래스의 판단은 똑같다.** 순서·되돌리기·손익·대조가
+    여기 한 곳에만 있어서, 페이퍼에서 맞으면 실거래에서도 같은 판단이 나온다.
+
+    중간에 끊겨도 이어서 할 수 있게 만든 장치 셋
+      1) 주문을 내기 **전에** 체결 기록을 SENT 로 먼저 적고 추적번호를 같이 저장한다
+         → 응답이 끊겨도 다음 스캔에 추적번호로 조회해서 결과를 채운다 (_resolve_sent)
+      2) 남은 양은 '체결 기록이 있나' 가 아니라 **'목표 양에 닿았나'** 로 판단한다
+         → 30개 중 20개만 팔렸으면 남은 10개만 다시 주문한다 (_continue_close)
+      3) 결과를 모르는 주문은 **추측하지 않는다**. 포지션을 그대로 두고 신규 진입만 막는다
+    """
 
     def __init__(self, executor, fees: FeeSettings, max_slippage_percent: float, leverage: float = 1.0,
                  mmr: float = 0.005, now_fn: Callable[[], datetime] = utcnow, safety: Optional[Safety] = None,
@@ -293,6 +306,7 @@ class HedgeBroker:
 
     @staticmethod
     def _fill_row(row: Fill, f: LegFill) -> None:
+        """미리 적어 둔 체결 기록(SENT)에 실제 결과를 채우고 DONE 으로 바꾼다"""
         row.qty, row.avg_price, row.cost, row.fee = f.qty, f.avg_price, f.cost, f.fee
         row.order_id, row.slippage_percent, row.state = f.order_id, f.slippage_percent, FillState.DONE
 
@@ -625,6 +639,7 @@ class HedgeBroker:
             liquidated = False
             pos.exit_reason = ExitReason.STOP_LOSS
             logger.critical("#%d %s 강제청산 가격 도달했지만 숏이 아직 열려 있어서 바로 정리합니다", pos.id, pos.coin)
+        # 단계별 체결 합계를 짧게 꺼내 쓰는 도우미 (없는 단계는 0 으로)
         s = lambda k, sums: sums.get(k, LegSum())  # noqa: E731
         coin_bid = quote.upbit.best_bid if quote else None
         done = False
@@ -632,6 +647,8 @@ class HedgeBroker:
             for _ in range(MAX_LEG_RETRIES):
                 sums = self._sums(session, pos)
                 left = pos.upbit_qty - s("sell", sums).qty
+                # 실제로 가진 것보다 많이 팔 수는 없다. 수수료가 코인으로 떼이거나
+                # 대조가 어긋난 경우 진입 수량보다 적게 남아 있을 수 있다.
                 left = min(left, self.balance(session, coin_key(pos.coin)))
                 coin_done = left <= pos.upbit_qty * 1e-9 or (coin_bid is not None and
                                                               left * coin_bid < self.ex.min_order_krw(pos.coin))
@@ -732,12 +749,26 @@ class HedgeBroker:
         return list(session.scalars(select(Position).where(Position.status.in_(PositionStatus.UNFINISHED))))
 
     def entries_allowed(self, session: Session) -> Tuple[bool, str]:
+        """신규 진입을 해도 되나 (판단은 kimp/safety.py). 엔진이 진입 직전에 묻는다"""
         return self.safety.entries_allowed(session)
 
     # ------------------------------------------------------------------
     # 매 스캔: 송금 확인 → 덜 끝난 진입/청산 이어서 → 대조
     # ------------------------------------------------------------------
     def sync(self, session: Session, quotes: Dict[str, Quote], coins: Iterable[str] = ()) -> None:
+        """
+        스캔 맨 앞에서 하는 정리 — 덜 끝난 일을 이어서 하고 거래소와 대조한다
+
+        순서가 중요하다. 새 포지션을 잡기 전에 **어긋난 것을 먼저 맞춰야** 한다.
+            1) 잔고 캐시 비우기 (실거래)
+            2) 송금이 도착했나 확인 (_poll_transfers)
+            3) 덜 끝난 포지션(OPENING/CLOSING)을 이어서 처리.
+               ERROR 는 건드리지 않는다 — 사람이 거래소에서 직접 정리해야 하는 상태다
+            4) 거래소 실제 잔고·포지션이 DB 와 맞나 대조 (reconcile, 10분마다)
+
+        Args:
+            quotes: 코인별 지금 시세. 없는 코인은 이번 스캔에 건너뛴다 (시세 없이 주문하면 안 된다)
+        """
         self.ex.refresh()
         self._poll_transfers(session)
         for pos in self.unfinished_positions(session):
@@ -805,6 +836,11 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     @staticmethod
     def pending_transfers(session: Session) -> List[Transfer]:
+        """
+        아직 도착 확인이 안 된 송금 (REQUESTED)
+
+        하나라도 있으면 새 송금을 보내지 않는다 — 같은 돈을 두 번 보내는 사고를 막는다.
+        """
         return list(session.scalars(select(Transfer).where(Transfer.status == TransferStatus.REQUESTED)))
 
     @staticmethod

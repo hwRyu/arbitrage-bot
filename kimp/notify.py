@@ -38,15 +38,36 @@ INFO_TAGS = ("[진입]", "[청산", "[송금", "[펀딩비 진입]", "[펀딩비
 
 
 def _post(url: str, data: Dict[str, str], timeout: float = 10.0) -> dict:
+    """
+    텔레그램 API 에 POST (표준 라이브러리만 — requests 같은 것을 쓰지 않는다)
+
+    테스트에서는 이 함수를 가짜로 바꿔 끼운다 (TelegramNotifier(post=...)).
+    """
     body = urllib.parse.urlencode(data).encode()
     with urllib.request.urlopen(urllib.request.Request(url, data=body), timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
 class TelegramNotifier:
-    """텔레그램으로 보내기 (큐 + 보내는 스레드)"""
+    """
+    텔레그램으로 보내기 (큐 + 보내는 스레드)
+
+    **왜 큐와 스레드인가**: 매매 스레드가 텔레그램을 기다리면 안 된다. 텔레그램이 느리거나
+    죽어 있어도 진입·청산은 제 속도로 돌아야 한다. 그래서 send() 는 큐에 넣고 바로 돌아오고,
+    실제 전송은 데몬 스레드가 한다 (실패해도 로그만 남기고 삼킨다).
+
+    **왜 중복·과다를 버리나**: 같은 경고가 스캔마다(20초) 반복되면 텔레그램이 요청을 막는다.
+    같은 문장은 1분에 한 번, 전체는 1분에 20개까지만 보낸다.
+    """
 
     def __init__(self, token: str, chat_id: str, prefix: str = "", post: Callable = _post):
+        """
+        Args:
+            token: @BotFather 에서 받은 봇 토큰
+            chat_id: 받을 채팅 번호 (이 번호에서 온 명령만 받는다)
+            prefix: 모든 메시지 앞에 붙일 글자 (여러 봇을 구분할 때)
+            post: 보내는 함수 (테스트에서 가짜로 바꿔 끼운다)
+        """
         self.token = token
         self.chat_id = str(chat_id)
         self.prefix = prefix
@@ -58,6 +79,7 @@ class TelegramNotifier:
         self._thread.start()
 
     def url(self, method: str) -> str:
+        """텔레그램 API 주소 (sendMessage / getUpdates)"""
         return f"https://api.telegram.org/bot{self.token}/{method}"
 
     def send(self, text: str) -> None:
@@ -76,6 +98,14 @@ class TelegramNotifier:
             pass
 
     def _worker(self) -> None:
+        """
+        보내는 스레드 (데몬) — 큐에서 꺼내 하나씩 보낸다
+
+        실패해도 **다시 시도하지 않고 넘어간다.** 알림은 매매보다 중요하지 않고, 재시도하다
+        큐가 막히면 뒤에 쌓인 더 중요한 알림이 늦어진다.
+        로그는 'kimp.notify.quiet' 로 남긴다 — 이 이름은 TelegramLogHandler 가 걸러내서,
+        '텔레그램 실패' 알림을 또 텔레그램으로 보내려는 무한 고리를 막는다.
+        """
         while True:
             text = self._q.get()
             try:
@@ -94,13 +124,26 @@ class TelegramNotifier:
 
 
 class TelegramLogHandler(logging.Handler):
-    """로그 → 텔레그램 (경고 이상, 또는 INFO_TAGS 로 시작하는 INFO)"""
+    """
+    로그 → 텔레그램 (경고 이상, 또는 INFO_TAGS 로 시작하는 INFO)
+
+    엔진·브로커는 텔레그램을 모른다. 그냥 로그만 남기고, 이 핸들러가 **보낼 것만 골라낸다.**
+    덕분에 매매 코드에 알림 코드가 섞이지 않는다.
+    """
 
     def __init__(self, notifier: TelegramNotifier):
         super().__init__(level=logging.INFO)
         self.notifier = notifier
 
     def emit(self, record: logging.LogRecord) -> None:
+        """
+        로그 한 줄을 보고 텔레그램으로 보낼지 정한다
+
+        보내는 것: WARNING 이상 전부 + INFO_TAGS 로 시작하는 INFO (진입·청산·송금 등)
+        'kimp.notify' 로 시작하는 로그는 **반드시 건너뛴다** — 텔레그램 전송 실패 로그를
+        또 텔레그램으로 보내려 하면 무한히 반복된다.
+        앞에 붙는 그림: CRITICAL 🚨 / WARNING ⚠️ / INFO 없음
+        """
         if record.name.startswith("kimp.notify"):
             return
         try:
@@ -123,7 +166,15 @@ class TelegramCommands:
         self._offset = 0
 
     def handle(self, update: dict) -> Optional[str]:
-        """업데이트 하나 처리 → 답장 (허용 안 된 채팅이면 None)"""
+        """
+        업데이트 하나 처리 → 답장 글자 (허용 안 된 채팅이면 None)
+
+        **설정한 chat_id 에서 온 것만 받는다.** 봇 이름을 아는 사람은 누구나 말을 걸 수 있으므로,
+        이 확인이 없으면 남이 /close 를 눌러 포지션을 정리할 수 있다.
+        그룹에서는 명령이 '/stop@봇이름' 으로 오므로 @ 뒤를 떼어낸다.
+        핸들러가 인자를 받는지(/close CAP) 안 받는지(/status)는 함수 서명을 보고 판단한다.
+        처리 중 오류가 나도 예외를 올리지 않고 '처리 실패: …' 로 답장한다 (루프가 죽지 않게).
+        """
         msg = update.get("message") or {}
         if str((msg.get("chat") or {}).get("id")) != self.n.chat_id:
             return None
@@ -144,6 +195,14 @@ class TelegramCommands:
             return f"처리 실패: {exc}"
 
     def run(self, stop_event: threading.Event) -> None:
+        """
+        명령 받기 루프 (getUpdates 롱 폴링)
+
+        timeout=25 로 '새 메시지가 올 때까지 25초 기다려라' 고 요청한다 — 짧게 반복 조회하면
+        텔레그램이 요청을 막는다. offset 은 '여기까지 받았다' 는 표시로, 같은 명령을 두 번
+        처리하지 않게 한다 (봇을 다시 켜면 offset 이 0 이라 밀린 명령을 한 번 처리할 수 있다).
+        어떤 오류가 나도 루프를 멈추지 않는다 — 텔레그램이 죽어도 매매는 계속돼야 한다.
+        """
         while not stop_event.is_set():
             try:
                 r = self._post(self.n.url("getUpdates"), {"timeout": "25", "offset": str(self._offset)}, timeout=35)
@@ -157,6 +216,7 @@ class TelegramCommands:
                 stop_event.wait(5)
 
     def start(self, stop_event: threading.Event) -> threading.Thread:
+        """명령 받기를 데몬 스레드로 시작 (메인이 끝나면 같이 끝난다)"""
         t = threading.Thread(target=self.run, args=(stop_event,), name="telegram-cmd", daemon=True)
         t.start()
         return t

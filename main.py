@@ -203,6 +203,9 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
                                 prefix=f"[{MODE_LABEL[settings.mode]}] ")
     logging.getLogger().addHandler(TelegramLogHandler(notifier))
 
+    # ---- 텔레그램 명령 핸들러. 돌려주는 글자가 그대로 답장이 된다 ----
+    # 여기서 하는 일은 '깃발을 세우는 것' 뿐이다. 실제 동작은 다음 스캔에서 엔진이 한다 —
+    # 텔레그램 스레드가 매매 로직을 직접 건드리면 두 스레드가 같은 DB 를 동시에 고치게 된다.
     def stop() -> str:
         broker.safety.manual_stop = True
         return "신규 진입을 멈췄습니다 (가진 포지션은 계속 관리). 재개: /resume"
@@ -223,6 +226,12 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
     }).start(stop_event)
 
     def daily() -> None:
+        """
+        매일 한국 시간 9시에 하루 요약 보내기 (데몬 스레드)
+
+        sent_for 로 '어느 날짜 분을 보냈나' 를 기억한다. 30초마다 깨어나므로 9시대에
+        여러 번 걸리는데, 날짜가 같으면 다시 보내지 않는다.
+        """
         sent_for = None
         while not stop_event.wait(30):
             now = datetime.now(KST)
@@ -308,7 +317,17 @@ def print_one_shot_report(settings: Settings, session_factory) -> None:
 
 
 def main() -> int:
-    """설정 읽기 → 준비 → 엔진 실행. 돌려주는 값은 종료 코드 (0 = 정상)"""
+    """
+    설정 읽기 → 준비 → 엔진 실행. 돌려주는 값은 종료 코드 (0 = 정상)
+
+    준비 순서 (앞 단계가 실패하면 뒤로 가지 않는다)
+        1) .env 읽기·검증 — 실거래인데 LIVE_CONFIRM 이 YES 가 아니면 여기서 멈춘다
+        2) 모드에 맞는 DB 열기 (페이퍼 kimp.db / 드라이런 dryrun.db / 실거래 live.db)
+        3) 거래소 연결 + 실행기 만들기 (페이퍼는 키 없이도 된다)
+        4) 바이비트 설정 맞추기 (단방향·격리·레버리지)
+        5) 텔레그램 알림·명령 시작
+        6) 엔진 루프 — Ctrl+C 로 멈추면 들고 있는 포지션은 **그대로 둔다** (다시 켜면 이어서 관리)
+    """
     try:
         settings = load_settings()
     except ValueError as exc:
@@ -359,6 +378,7 @@ def main() -> int:
         p = settings.params_for(coin)
 
         def mark(name: str) -> str:
+            """코인별로 따로 적어 둔 값에 * 를 붙인다 (공통값과 구분해서 보여주려고)"""
             return "*" if name in p.overridden else " "
 
         size = f"{p.position_size_usdt:7.0f} USDT" if p.position_size_usdt else "   자동     "

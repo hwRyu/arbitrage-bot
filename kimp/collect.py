@@ -149,6 +149,12 @@ def _fx_or_none(previous: Optional[float]) -> Optional[float]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """
+    명령줄 실행 (python -m kimp.collect)
+
+    Ctrl+C 로 멈춰도 **그때까지 적은 기록은 남는다** (한 바퀴마다 커밋하기 때문).
+    봇과 같이 돌려도 된다 — DB 가 다르고(data/market.db) 주문을 내지 않는다.
+    """
     parser = argparse.ArgumentParser(
         description="시세 수집기 — 김프·호가 기록만 쌓는다 (주문·포지션 없음). 봇(main.py)과 따로 돈다")
     parser.add_argument("--coins", default=None, help="코인 지정. 예: CAP,SEI (안 적으면 .env 의 COINS)")
@@ -172,6 +178,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stop = threading.Event()
 
     def on_signal(*_):
+        """Ctrl+C / 종료 신호 → 루프에게 '그만' 을 알린다 (중간에 끊지 않고 한 바퀴를 마친다)"""
         print()
         logger.info("종료 신호를 받았습니다 (지금까지 적은 기록은 남습니다)")
         stop.set()
