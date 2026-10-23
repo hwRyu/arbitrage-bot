@@ -401,7 +401,8 @@ def main() -> int:
                     p.stop_loss_percent, mark("stop_loss_percent"), size, mark("position_size_usdt"))
     logger.info("=" * 70)
 
-    # 달러 환율은 표시용. 못 받아도 매매는 한다
+    # 달러 환율은 표시용(테더 프리미엄·사이트식 김프). 못 받아도 매매는 한다.
+    # 여기서 한 번 불러 두는 건 첫 스캔 전에 값을 채워 두려는 것 — 실패해도 그냥 넘어간다
     fx = FxProvider(settings.fx_refresh_sec, fixed_rate=settings.fixed_usd_krw)
     fx.get()
 

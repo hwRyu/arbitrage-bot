@@ -48,7 +48,6 @@ from kimp.spread import (LIVE_SAMPLES, MIN_SNAPSHOTS_FOR_SPREAD, MODE_AUTO, MODE
                          MODE_RECORDS, MODES, accumulate_hint, forced_coins, is_rough,
                          median_spread_depth, resolve_spreads, snapshot_spreads_multi)
 from kimp.engine import Engine
-from kimp.fx import FxQuote
 from kimp.history import (BYBIT, MINUTE_MS, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade,
                           make_history_session_factory, value_at)
 from kimp.market_data import FundingInfo
@@ -205,9 +204,8 @@ class SimFx:
         self.clock = clock
         self.series = list(series)
 
-    def get(self) -> Optional[FxQuote]:
-        rate = value_at(self.series, self.clock.now_ms)
-        return FxQuote(rate=rate, age_sec=0.0, is_stale=False) if rate else None
+    def get(self) -> Optional[float]:
+        return value_at(self.series, self.clock.now_ms) or None
 
 
 # ----------------------------------------------------------------------
@@ -351,8 +349,7 @@ def run_simulation(
         result.minutes_simulated += 1
         if progress and i % 1440 == 0:
             progress(i / max(total, 1))
-    fxq = fx.get()
-    result.fx_end = fxq.rate if fxq else None
+    result.fx_end = fx.get()
     transfers = engine.transfers
     result.transfer_count = len(transfers)
     result.transfer_fee_usdt = sum(t.fee_usdt for t in transfers)

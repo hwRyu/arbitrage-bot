@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 from kimp.config import CoinParams, FeeSettings, Settings
 from kimp.db import ExitReason, Fill, FundingEvent, Position, PositionStatus, PremiumSnapshot, make_session_factory
 from kimp.engine import Engine
+from kimp.fx import FxProvider
 from kimp.market_data import FundingInfo
 from kimp.paper_broker import BYBIT_USDT, UPBIT_USDT, EntryRejected, PaperBroker, coin_key
 from kimp.premium import OrderBook, Quote
@@ -156,10 +157,37 @@ class EngineTest(unittest.TestCase):
             return s.query(Position).all()
 
     def test_no_fx_still_trades(self):
-        """달러 환율이 없어도(표시용) 매매한다"""
+        """환율 공급기가 아예 없어도(표시용) 매매한다"""
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
         self.assertEqual(len(self._positions()), 1)
+
+    def test_fx_failing_from_start_still_enters(self):
+        """
+        봇을 켠 순간부터 환율 조회가 계속 실패해도 첫 진입을 한다
+
+        FxProvider 는 한 번도 성공 못 하면 None 을 돌려준다. 그 None 이 끝까지 흘러가도
+        막히는 데가 없어야 한다 — 환율은 테더 프리미엄·사이트식 김프를 '보여주는' 데만 쓴다.
+        """
+        def always_fail():
+            raise RuntimeError("yfinance 가 빈 환율 데이터를 돌려줬습니다")
+
+        fx = FxProvider(refresh_sec=0, fetcher=always_fail)
+        self.assertIsNone(fx.get())                       # 받아온 값이 없는 상태로 시작
+        engine, sf, _ = make_engine(make_settings(), self.market, fx=fx)
+        self.market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+
+        with sf() as s:
+            pos = s.query(Position).one()
+            snap = s.query(PremiumSnapshot).one()
+        self.assertEqual(pos.status, PositionStatus.OPEN)  # 진입은 됐고
+        self.assertLess(pos.entry_premium, 0)              # 진입 김프(매도호가 기준)가 제대로 찍혔고
+        self.assertIsNone(pos.entry_fx_krw)                # 환율에 기대는 칸만 비어 있다
+        self.assertIsNone(pos.entry_tether_premium)
+        self.assertIsNone(snap.tether_premium)
+        self.assertIsNone(snap.site_premium)
+        self.assertAlmostEqual(snap.mid_premium, -1.0, places=6)   # 봇 김프는 멀쩡하다
 
     def test_no_entry_above_threshold(self):
         """김프 -0.2% 는 기준 -0.5% 보다 높으니 진입 안 함"""

@@ -80,7 +80,8 @@ class Engine:
         Args:
             settings: 봇 설정
             market: 거래소 시세 조회기
-            fx: 달러 환율 공급기 (get() 이 FxQuote 또는 None). 표시용이라 None 이어도 매매는 된다
+            fx: 달러 환율 공급기 (get() 이 환율(원) 또는 None).
+                표시용이라 공급기가 None 이든 환율을 못 받든 진입·청산은 그대로 한다
             broker: 체결기 (실행기만 페이퍼/드라이런/실거래로 다름)
             session_factory: DB 연결 만드는 함수
             coins: 운용할 코인 (양쪽 거래소에 다 있는 것만)
@@ -226,8 +227,9 @@ class Engine:
 
     def step(self) -> None:
         """스캔 한 번 (순서는 파일 맨 위 설명 참고)"""
-        fxq = self.fx.get() if self.fx else None
-        quotes = self.market.fetch_quotes(self.coins, fxq.rate if fxq else None)
+        # 환율은 테더 프리미엄·사이트식 김프를 보여주는 데만 쓴다. 없으면 그 칸만 빈다
+        fx_krw = self.fx.get() if self.fx else None
+        quotes = self.market.fetch_quotes(self.coins, fx_krw)
         if not quotes:
             return
 
