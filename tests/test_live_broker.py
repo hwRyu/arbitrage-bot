@@ -894,6 +894,18 @@ class LiveTransferTest(unittest.TestCase):
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
             self.assertEqual(t.status, TransferStatus.CONFIRMED)
 
+    def test_bybit_withdraw_failure_moves_funds_back(self):
+        """바이비트 출금이 거절되면 펀딩 계좌로 옮겼던 돈을 통합 계좌로 되돌린다"""
+        prices, up, by, broker, sf = make_live()
+        by.fail.add("withdraw")
+        with sf() as s:
+            broker.ex.refresh()
+            sent = broker.transfer(s, -50.0, 1.3, reason="테스트")
+            self.assertEqual(sent, 0.0)
+            moves = [c for c in by.calls if isinstance(c, tuple) and c[0] == "transfer"]
+            self.assertEqual(moves, [("transfer", "unified", "funding"), ("transfer", "funding", "unified")])
+            self.assertEqual(s.query(Transfer).one().status, TransferStatus.FAILED)
+
     def test_bybit_to_upbit_moves_to_funding_first(self):
         prices, up, by, broker, sf = make_live()
         with sf() as s:
@@ -1120,21 +1132,22 @@ class TransferDecimalsTest(unittest.TestCase):
 
     2026-10-22 첫 실거래에서 업비트가 이렇게 거절했다.
         846.6747287521739 → "출금 소수점 자리수를 초과하였습니다. 6 이하 소수점 자리수만 적용됩니다."
-    자동 계산한 송금액은 소수점이 길게 나오므로 6자리로 **내려서** 보낸다 (올리면 잔고를 넘을 수 있다).
+    2026-10-24 바이비트는 더 짧다. 73.684303 → "withdraws amount scale more than 4"
+    자동 계산한 송금액은 소수점이 길게 나오므로 둘 중 짧은 4자리로 **내려서** 보낸다 (올리면 잔고를 넘을 수 있다).
     """
 
-    def test_amount_is_floored_to_six_decimals(self):
+    def test_amount_is_floored_to_four_decimals(self):
         from kimp.broker import TRANSFER_DECIMALS
-        self.assertEqual(TRANSFER_DECIMALS, 6)
+        self.assertEqual(TRANSFER_DECIMALS, 4)
         prices, up, by, broker, sf = make_live()
         up.bal["USDT"] = 1_000.0
         with sf() as session:
             broker.ensure_initial_balances(session, 0.0, 0.5)
             sent = broker.transfer(session, 846.6747287521739, 0.0, reason="테스트")
             rows = broker.transfers(session)
-        self.assertAlmostEqual(sent, 846.674728, places=9)          # 6자리로 잘렸다
-        self.assertAlmostEqual(rows[-1].amount_usdt, 846.674728, places=9)   # 기록도 같은 값
-        self.assertEqual(len(str(round(sent, 9)).split(".")[-1]), 6)
+        self.assertAlmostEqual(sent, 846.6747, places=9)            # 4자리로 잘렸다
+        self.assertAlmostEqual(rows[-1].amount_usdt, 846.6747, places=9)   # 기록도 같은 값
+        self.assertEqual(len(str(round(sent, 9)).split(".")[-1]), 4)
 
     def test_small_amount_still_blocked_by_minimum(self):
         """자리수를 자르는 것과 최소 금액 규칙은 따로다"""

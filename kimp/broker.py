@@ -89,12 +89,13 @@ from kimp.pnl import EntryLegs, ExitLegs, PnLBreakdown, compute_pnl, liquidation
 from kimp.premium import ExitPlan, Quote, premium_percent
 from kimp.safety import Safety, kst_midnight_utc
 
-# 송금 금액 소수점 자리수 상한. 업비트는 6자리를 넘으면 거절한다 (2026-10-22 실거래에서 겪음)
-#   846.6747287521739 → "출금 소수점 자리수를 초과하였습니다. 6 이하 소수점 자리수만 적용됩니다."
+# 송금 금액 소수점 자리수 상한. 거래소마다 다르다 — 둘 중 작은 쪽에 맞춘다
+#   업비트: 6자리 초과 거절 (2026-10-22: 846.6747287521739 → "6 이하 소수점 자리수만 적용됩니다")
+#   바이비트: 4자리 초과 거절 (2026-10-24: 73.684303 → "withdraws amount scale more than 4")
 # 내림으로 자른다 (올리면 잔고보다 많이 보내려 할 수 있다)
 LF = chr(10)
 
-TRANSFER_DECIMALS = 6
+TRANSFER_DECIMALS = 4
 
 # 거래소가 '규정상 지금은 안 된다' 고 거절할 때 나오는 말들.
 # 우리 잘못이 아니므로 연속 실패로 세지 않고(세면 신규 진입이 막힌다) 잠시 뒤 다시 시도한다.

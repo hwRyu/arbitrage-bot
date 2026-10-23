@@ -502,12 +502,23 @@ class LiveExecutor:
                     params["tag"] = tag
                 r = self.up.withdraw("USDT", amount_usdt, address, params)
             else:
-                # 바이비트는 거래(통합) 계좌 → 펀딩 계좌로 옮긴 뒤 출금
+                # 바이비트는 거래(통합) 계좌 → 펀딩 계좌로 옮긴 뒤 출금.
+                # 출금이 거절되면 펀딩 계좌에 남은 돈을 도로 옮긴다 — 안 그러면 봇이 보는 free 잔고에서
+                # 그 돈이 사라진 채 굳는다 (2026-10-24: 73.68 USDT 가 펀딩 계좌에 남았던 사고)
                 self.by.transfer("USDT", amount_usdt, "unified", "funding")
                 params = {"network": self.s.bybit_transfer_network}
                 if tag:
                     params["tag"] = tag
-                r = self.by.withdraw("USDT", amount_usdt, address, params)
+                try:
+                    r = self.by.withdraw("USDT", amount_usdt, address, params)
+                except Exception as exc:
+                    try:
+                        self.by.transfer("USDT", amount_usdt, "funding", "unified")
+                        logger.warning("바이비트 출금 실패 → 펀딩 계좌로 옮겼던 %.4f USDT 를 통합 계좌로 되돌림", amount_usdt)
+                    except Exception as back:
+                        logger.critical("바이비트 출금 실패 뒤 펀딩 → 통합 되돌리기도 실패: %s (펀딩 계좌에 %.4f USDT 남음)",
+                                        back, amount_usdt)
+                    raise
         except Exception as exc:
             raise OrderFailed(f"출금 실패: {exc}") from exc
         self.refresh()
