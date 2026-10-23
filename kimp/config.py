@@ -324,7 +324,7 @@ class Settings:
     # 주기
     # ------------------------------------------------------------------
     # 시세 보는 간격 (초). 바이비트는 코인 수만큼 요청이 나가니 코인이 많으면 늘릴 것
-    scan_interval_sec: float = 3.0
+    scan_interval_sec: float = 10.0
 
     # 김프 기록 저장 간격 (초). 코인마다 이 간격에 1건
     snapshot_interval_sec: float = 60.0
@@ -374,7 +374,7 @@ class Settings:
     # 펀딩비 수익 전략 (kimp/carry.py, 김프 전략과 따로 돈다. 기준: docs/carry.md)
     #   바이비트 현물 매수 + 바이비트 무기한 같은 개수 숏 → 가격 변동은 상쇄, 펀딩비(+)를 숏이 받는다
     # ------------------------------------------------------------------
-    carry_enabled: bool = True
+    carry_enabled: bool = False  # 김프 전략과 별개로 주문을 낸다 → 켤 때만 명시적으로 켠다
     # 대상 코인. 비워두면 자동: 바이비트 현물+무기한 둘 다 있고 거래대금이 충분한 코인 중 펀딩비 높은 순
     carry_coins: List[str] = field(default_factory=list)
     # 이 전략용 페이퍼 자본 (USDT, 처음 1번). 김프 전략 자본과 섞이지 않는다. 전부 바이비트에 있다고 본다
