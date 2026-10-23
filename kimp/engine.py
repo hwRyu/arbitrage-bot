@@ -266,7 +266,8 @@ class Engine:
             if allowed:
                 self._try_entries(session, quotes, open_positions)
             else:
-                self._log_throttled("entries-blocked", logging.WARNING, f"신규 진입 중단 중: {why}")
+                # 사람이 멈춘 상태는 몇 시간씩 가므로 1분마다 알리면 텔레그램이 도배된다 → 30분에 한 번
+                self._log_throttled("entries-blocked", logging.WARNING, f"신규 진입 중단 중: {why}", cooldown_sec=1800.0)
             self._save_snapshots(session, quotes)
             self._log_status(session, quotes, open_positions)
             if self.s.one_shot:
@@ -814,10 +815,10 @@ class Engine:
     # ------------------------------------------------------------------
     # 기록 / 로그
     # ------------------------------------------------------------------
-    def _log_throttled(self, key: str, level: int, message: str) -> None:
-        """같은 종류의 로그는 LOG_COOLDOWN_SEC 에 한 번만 (로그 도배 방지)"""
+    def _log_throttled(self, key: str, level: int, message: str, cooldown_sec: float = LOG_COOLDOWN_SEC) -> None:
+        """같은 종류의 로그는 cooldown_sec(기본 LOG_COOLDOWN_SEC)에 한 번만 (로그 도배 방지)"""
         now = self._clock()
-        if now - self._last_log.get(key, 0.0) >= LOG_COOLDOWN_SEC:
+        if now - self._last_log.get(key, 0.0) >= cooldown_sec:
             self._last_log[key] = now
             logger.log(level, message)
 
