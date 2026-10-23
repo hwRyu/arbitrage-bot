@@ -1051,8 +1051,7 @@ class TelegramTest(unittest.TestCase):
         self.assertTrue(e[2].startswith("바이비트 690개 숏"))
         # 태그 없는 문장과 HTML 특수문자
         self.assertEqual(pretty("a < b & c", "⚠️ "), "⚠️ a &lt; b &amp; c")
-        self.assertEqual(plain(pretty("[태그] x < y")), "[태그]
-x < y")   # 번호·코인이 없으면 몸통은 다음 줄
+        self.assertEqual(plain(pretty("[태그] x < y")), "[태그]" + chr(10) + "x < y")   # 번호·코인이 없으면 몸통은 다음 줄
 
     def test_worker_falls_back_to_plain_text_when_html_rejected(self):
         """HTML 전송이 거절되면 평문으로 한 번 더 보낸다 (알림을 잃지 않게)"""
