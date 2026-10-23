@@ -403,7 +403,8 @@ class Engine:
             self._log_throttled(
                 f"liq-warn-{pos.coin}", logging.WARNING,
                 f"[긴급] #{pos.id} {pos.coin} 강제청산까지 {distance:.1f}% 남음 (지금 {price:.6f}, 강제청산 "
-                f"{pos.liquidation_price:.6f}) → 바이비트 포지션에 증거금 약 {add:,.2f} USDT 추가하세요",
+                f"{pos.liquidation_price:.6f}) → 바이비트 포지션에 증거금 약 {add:,.2f} USDT 추가하세요 "
+                f"(격리 마진이라 계좌 잔고가 자동으로 들어가지 않습니다 — 직접 넣어야 합니다)",
             )
         return False
 

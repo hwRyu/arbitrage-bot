@@ -366,7 +366,8 @@ def main() -> int:
     logger.info("공통값: 진입 김프 ≤ %+.2f%% | 목표 순이익 %.2f%% | 손절 %.2f%% | 포지션 크기 %s | 최대 %d개",
                 settings.entry_premium_threshold_percent, settings.target_net_profit_percent,
                 settings.stop_loss_percent, size_text, settings.max_open_positions)
-    logger.info("바이비트 레버리지 %.0f배 → 목표 자본 비율 업비트 %.1f : 바이비트 %.1f (여유분 %.0f%%) | "
+    logger.info("바이비트 레버리지 %.0f배 → 목표 자본 비율 업비트 %.1f : 바이비트 %.1f "
+                "(여유분 %.0f%% — 수수료·펀딩비·추가 포지션용, 강제청산을 막아주지는 않음) | "
                 "강제청산 경고 %.0f%% 이내 | 리밸런싱 %.0f%%p 이탈",
                 settings.bybit_leverage, share * 100, (1 - share) * 100, settings.bybit_margin_buffer_percent,
                 settings.liquidation_warn_percent, settings.rebalance_threshold_percent)
