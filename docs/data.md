@@ -239,7 +239,9 @@ FROM premium_snapshots GROUP BY coin;
 | `no_slot` | 조건은 됐지만 자리(최대 포지션 수·한 번만 돌리기)가 없어 다른 코인에 밀림 |
 | `balance_block` | 한쪽 USDT 부족 |
 | `rejected` | 주문 단계 거절·되돌림 (`note`) |
+| `confirm_fail` | 조건은 됐는데 **주문 직전 확인 시세**에서는 기준을 못 넘음 — 한순간 튄 값 (`premium_depth` = 확인 시세 김프) |
 | `entered` | 진입함 |
+| `tp_confirm_fail` | 익절 조건이 됐는데 확인 시세에서는 목표 미달 (`premium_top` = 처음 순손익, `premium_depth` = 확인 순손익, `position_id`) |
 
 ```sql
 -- 코인별로 어디서 막히는지

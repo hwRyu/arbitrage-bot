@@ -168,6 +168,8 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
         balance_block  한쪽 USDT 가 모자람
         rejected       주문 단계에서 거절·되돌림 (note 에 이유)
         entered        진입함 (position_id)
+        confirm_fail   조건은 됐는데 주문 직전 확인 시세에서는 기준을 못 넘음 (한순간 튄 값. premium_depth = 확인 시세 김프)
+        tp_confirm_fail 익절 조건이 됐는데 확인 시세에서는 목표 미달 (premium_top = 처음 순손익, premium_depth = 확인 순손익)
     """
     session.add(Decision(coin=coin, stage=stage, premium_top=premium_top, threshold_percent=threshold,
                          premium_depth=premium_depth, size_usdt=size_usdt, bybit_qty=bybit_qty,

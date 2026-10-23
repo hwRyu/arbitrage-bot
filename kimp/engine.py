@@ -319,6 +319,21 @@ class Engine:
                          pos.coin, valuation.exit_premium, pnl.net_percent, pnl.net_usdt)
             return False
 
+        if reason == ExitReason.TAKE_PROFIT:
+            # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
+            fresh = self._fresh_quote(pos.coin)
+            confirmed = self.broker.value_exit(pos, fresh) if fresh else None
+            if confirmed is None or confirmed.pnl.net_percent < target:
+                again = confirmed.pnl.net_percent if confirmed else None
+                self._log_throttled(
+                    f"tp-confirm-{pos.coin}", logging.INFO,
+                    f"[익절 보류] #{pos.id} {pos.coin} 처음 {pnl.net_percent:+.3f}% → 확인 시세 "
+                    f"{'없음' if again is None else f'{again:+.3f}%'} (목표 {target:.2f}%) — 한순간 값이라 다음 스캔에 다시")
+                telemetry.decision(session, pos.coin, "tp_confirm_fail", pnl.net_percent, target,
+                                   premium_depth=again, position_id=pos.id, now=self._now_utc())
+                return False
+            valuation = confirmed   # 더 새 시세로 주문한다
+
         self._close(session, pos, valuation, reason)
         return True
 
@@ -365,6 +380,21 @@ class Engine:
             return
         if self._one_shot_opened:
             self._one_shot_done = True
+
+    def _fresh_quote(self, coin: str) -> Optional[Quote]:
+        """
+        주문 직전에 그 코인 시세를 한 번 더 받는다 (확인 시세)
+
+        스캔 시작 때 받은 시세는 업비트와 바이비트를 따로 받은 것이라 0.3~1초 어긋나 있고, 그 사이
+        가격이 움직이면 김프가 잠깐 튀어 보인다 (IRYS #3: 판단 +0.26% → 1초 뒤 체결 −0.82%).
+        한 번 더 받아서 여전히 조건을 만족할 때만 주문한다. 못 받으면 None → 이번 스캔은 건너뛴다.
+        """
+        try:
+            fx_krw = self.fx.get() if self.fx else None
+            return self.market.fetch_quotes([coin], fx_krw).get(coin)
+        except Exception as exc:
+            logger.warning("%s 확인 시세 조회 실패 (이번 스캔은 주문 안 함): %s", coin, exc)
+            return None
 
     def _now_utc(self):
         """지금 시각 (UTC)"""
@@ -665,6 +695,18 @@ class Engine:
             params = self.s.params_for(coin)
             threshold = params.entry_premium_threshold_percent
             depth = _margin + threshold
+            # 주문 직전 확인 시세: 스캔 시작 때 값이 한순간 튄 것이면 여기서 걸러진다
+            fresh = self._fresh_quote(coin)
+            again = fresh.entry_premium_for(bybit_qty, fee_rate) if fresh else None
+            if again is None or again > threshold:
+                self._log_throttled(
+                    f"entry-confirm-{coin}", logging.INFO,
+                    f"[진입 보류] {coin} 처음 {depth:+.3f}% → 확인 시세 "
+                    f"{'없음' if again is None else f'{again:+.3f}%'} (기준 {threshold:+.2f}%) — 한순간 값이라 다음 스캔에 다시")
+                telemetry.decision(session, coin, "confirm_fail", top, threshold, premium_depth=again,
+                                   size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, now=self._now_utc())
+                continue
+            quote, depth = fresh, again   # 더 새 시세로 주문한다
             try:
                 try:
                     pos = self.broker.open_hedge(session, quote, bybit_qty)

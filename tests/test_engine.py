@@ -44,9 +44,14 @@ class FakeMarket:
     def __init__(self):
         self.quotes: Dict[str, Quote] = {}
         self.funding: Optional[FundingInfo] = None
+        # 주문 직전 '확인 시세' 를 다르게 주고 싶을 때. 코인 하나만 다시 받는 호출에만 쓰이므로
+        # 이걸 쓰는 테스트는 엔진 코인을 둘 이상으로 만들어야 스캔 조회와 구분된다
+        self.confirm_quotes: Dict[str, Quote] = {}
 
     def fetch_quotes(self, coins: List[str], fx_krw=None) -> Dict[str, Quote]:
-        """넣어둔 시세 중 요청한 코인만"""
+        """넣어둔 시세 중 요청한 코인만. 코인 하나짜리 재조회에 confirm_quotes 가 있으면 그걸 준다"""
+        if len(coins) == 1 and coins[0] in self.confirm_quotes:
+            return {coins[0]: self.confirm_quotes[coins[0]]}
         return {c: q for c, q in self.quotes.items() if c in coins}
 
     def fetch_funding(self, coin: str) -> Optional[FundingInfo]:
@@ -188,6 +193,46 @@ class EngineTest(unittest.TestCase):
         self.assertIsNone(snap.tether_premium)
         self.assertIsNone(snap.site_premium)
         self.assertAlmostEqual(snap.mid_premium, -1.0, places=6)   # 봇 김프는 멀쩡하다
+
+    def test_entry_skipped_when_confirm_quote_is_worse(self):
+        """스캔 시세는 기준 통과, 주문 직전 확인 시세는 미달 → 진입 안 함 (한순간 튄 값)"""
+        from kimp.db import Decision
+        from sqlalchemy import select
+        engine, sf, _ = make_engine(make_settings(coins=["XRP", "DOGE"]), self.market)  # 코인 둘 → 확인 조회 구분
+        self.market.quotes = {"XRP": make_quote(-1.0)}
+        self.market.confirm_quotes = {"XRP": make_quote(-0.2)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).count(), 0)
+            stages = [d.stage for d in s.scalars(select(Decision))]
+        self.assertEqual(stages, ["confirm_fail"])
+        # 확인 시세도 통과하면 들어간다
+        self.market.confirm_quotes = {"XRP": make_quote(-0.9)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).count(), 1)
+
+    def test_take_profit_skipped_when_confirm_quote_is_worse(self):
+        """익절 조건이 스캔 시세로는 되지만 확인 시세로는 안 되면 들고 간다 (IRYS #3 사례)"""
+        from kimp.db import Decision
+        from sqlalchemy import select
+        engine, sf, _ = make_engine(make_settings(coins=["XRP", "DOGE"]), self.market)  # 코인 둘 → 확인 조회 구분
+        self.market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        self.market.quotes = {"XRP": make_quote(0.8)}        # 스캔: 목표 넘음
+        self.market.confirm_quotes = {"XRP": make_quote(-0.5)}  # 1초 뒤: 도로 내려옴
+        engine.step()
+        with sf() as s:
+            pos = s.query(Position).one()
+            d = [x for x in s.scalars(select(Decision)) if x.stage == "tp_confirm_fail"]
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        self.assertEqual(len(d), 1)
+        self.assertEqual(d[0].position_id, pos.id)
+        # 확인 시세도 넘으면 청산
+        self.market.confirm_quotes = {"XRP": make_quote(0.8)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).one().exit_reason, ExitReason.TAKE_PROFIT)
 
     def test_no_entry_above_threshold(self):
         """김프 -0.2% 는 기준 -0.5% 보다 높으니 진입 안 함"""
