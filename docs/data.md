@@ -19,7 +19,7 @@
 | `data/history.db` | 과거 캔들 **캐시** + **시뮬레이션 결과** | 스크리너 · 시뮬레이션 · 로컬 화면 | ⚠️ 캔들만 지워도 됨 (다시 받음). `sim_*` 는 되살릴 수 없음 |
 | `data/screen_latest.json` | 스크리너 마지막 결과 (화면이 읽음) | `kimp.screen` → `kimp.webui` | ✅ 다시 돌리면 생김 |
 | `data/STOP` | 이 파일이 있으면 신규 진입 중단 | 사람이 만들고 지움 | ✅ |
-| `logs/` | 실행 로그 | `main.py` | ✅ |
+| `logs/` | 실행 로그 (`bot.log`, 자정마다 `bot.log.YYYY-MM-DD` 로 넘기고 90일 보관) | `main.py` | ✅ |
 
 - `data/` 와 `logs/` 는 `.gitignore` 에 있어서 git 에 올라가지 않는다.
 - **모드마다 DB 가 따로다.** 페이퍼로 연습한 기록이 실거래 손익에 섞이지 않는다 (`Settings.active_db_path`).
@@ -50,6 +50,10 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 | `transfers` | 거래소 간 USDT 송금 한 건 | 리밸런싱할 때만 |
 | `paper_balances` | 페이퍼 가짜 잔고 | 페이퍼·시뮬레이션만 (실거래는 거래소가 진짜) |
 | `carry_positions` / `carry_funding` | 펀딩비 수익 전략 (따로 도는 전략) | `CARRY_ENABLED=true` 일 때 |
+| `runs` | 봇을 켠 기록 (모드·코인·설정·git 커밋) | 켤 때 1줄, 끌 때 채움 |
+| `decisions` | **진입 판단** — 기준 근처에 왔을 때 어느 단계에서 걸렸나 | 기준 +0.3%p 안에 들어온 스캔마다 |
+| `position_snapshots` | **보유 중 평가** — 순손익·청산 김프·펀딩·강제청산 거리 | 포지션마다 1분에 1줄 |
+| `engine_snapshots` | 양쪽 자본과 **스캔 소요 시간** | 1분에 1줄 |
 
 ### 1-1. `positions` — 포지션 하나
 업비트에서 USDT 를 팔아 코인을 사고, 바이비트에 같은 금액 숏을 친 **한 세트**. 손익은 모두 USDT.
@@ -106,6 +110,15 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 | `last_exit_premium` | 마지막으로 계산한 청산 김프 |
 | `last_liq_distance_percent` | 강제청산까지 남은 상승폭 (%). 15% 미만이면 긴급 경고 |
 
+**분석용** (매매 판단에는 안 쓴다, `kimp/telemetry.py`)
+
+| 컬럼 | 뜻 |
+|---|---|
+| `planned_entry_premium` | **판단 때 김프** (호가 소진 계산). `entry_premium − planned_entry_premium` = 주문 세 개 사이에 밀린 폭 |
+| `max_net_percent` · `max_net_at` | 보유 중 순손익 **최고**와 그 시각 — "목표에 얼마나 가까웠다가 놓쳤나" |
+| `min_net_percent` · `min_net_at` | 보유 중 순손익 **최저**와 그 시각 — 손절선에 얼마나 다가갔나 |
+| `run_id` | 어느 실행(`runs.id`)에서 잡았나 → 그때 설정·코드 버전 |
+
 **청산할 때 / 확정 손익**
 
 | 컬럼 | 뜻 |
@@ -137,6 +150,16 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 | `order_id` | 거래소 주문 번호 (페이퍼는 `paper-…`) |
 | `client_id` | **우리가 붙인 추적번호** (바이비트 `orderLinkId`, 업비트 `identifier`) |
 | `state` | `SENT`(결과 모름) / `DONE`(체결 확인) / `VOID`(주문 안 들어감) |
+| `created_at` · `done_at` | 주문을 **보낸** 시각 · 체결을 **확인한** 시각 (차이 = 주문 한 동작 소요) |
+| `expected_price` | 판단 때 호가 소진 계산으로 **예상한 평균가**. `avg_price` 와 비교하면 체결 계산이 얼마나 맞는지 나온다 |
+
+```sql
+-- 예상 체결가 vs 실제 (양수 = 예상보다 불리). 진입 세 단계 사이 소요 시간도 같이
+SELECT position_id, side, expected_price, avg_price,
+       ROUND((avg_price / expected_price - 1) * 100, 4) AS 차이_pct,
+       ROUND((julianday(done_at) - julianday(created_at)) * 86400, 2) AS 소요_초
+FROM fills WHERE expected_price IS NOT NULL AND state = 'DONE' ORDER BY id;
+```
 
 ### 1-3. `premium_snapshots` — 김프·호가 기록 (가장 중요한 분석 자료)
 **주로 수집기(`python -m kimp.collect`)가 `data/market.db` 에 쌓는다.** 봇도 돌면서 자기 DB 에 남긴다.
@@ -193,6 +216,83 @@ FROM premium_snapshots GROUP BY coin;
 | `upbit:<코인>` | 업비트에 들고 있는 코인 개수 |
 | `bybit:USDT` | 바이비트 남은 USDT (**증거금 제외**) |
 | `carry:USDT` · `carry:<코인>` | 펀딩비 전략 잔고 (김프 전략과 따로) |
+
+### 1-8. `decisions` — 진입 판단 기록 (왜 안 들어갔나)
+맨 앞 호가 진입 김프가 **기준 + 0.3%p 안**에 들어온 스캔마다 1줄. 기준을 못 넘긴 스캔은 안 남는다 (표가 커지기만 한다).
+
+| 컬럼 | 뜻 |
+|---|---|
+| `coin` · `created_at` | 코인 · 판단 시각 |
+| `stage` | 어디서 걸렸나 (아래) |
+| `premium_top` · `threshold_percent` | 맨 앞 호가 진입 김프 · 그때 기준 |
+| `premium_depth` | 수량만큼 호가를 소진한 평균가 김프 (계산한 단계부터) |
+| `size_usdt` · `bybit_qty` · `funding_8h_percent` | 그때 정한 크기 · 숏 개수 · 펀딩비(8h) |
+| `position_id` · `note` | 진입했으면 포지션 번호 · 거절 사유 |
+
+| `stage` | 뜻 |
+|---|---|
+| `near` | 기준 근처까지 왔지만 못 넘음 — **아깝게 놓친 순간** |
+| `funding_block` | 김프는 됐는데 펀딩비가 불리해서 보류 |
+| `size_reject` | 주문 크기가 거래소 최소 미만 |
+| `depth_reject` | 수량만큼 호가가 없음 |
+| `depth_fail` | 맨 앞 호가는 통과, 수량 소진 평균가로는 못 넘음 — **호가가 얇아서 밀린 경우** |
+| `no_slot` | 조건은 됐지만 자리(최대 포지션 수·한 번만 돌리기)가 없어 다른 코인에 밀림 |
+| `balance_block` | 한쪽 USDT 부족 |
+| `rejected` | 주문 단계 거절·되돌림 (`note`) |
+| `entered` | 진입함 |
+
+```sql
+-- 코인별로 어디서 막히는지
+SELECT coin, stage, COUNT(*) FROM decisions GROUP BY coin, stage ORDER BY coin, 3 DESC;
+-- 호가 밀림 때문에 못 들어간 평균 폭 (맨 앞 호가 → 수량 소진)
+SELECT coin, ROUND(AVG(premium_depth - premium_top), 3) FROM decisions WHERE stage = 'depth_fail' GROUP BY coin;
+```
+
+### 1-9. `position_snapshots` — 보유 중 평가 (목표에 얼마나 가까웠나)
+들고 있는 포지션마다 `SNAPSHOT_INTERVAL_SEC`(기본 60초)에 1줄. "지금 청산하면" 을 그대로 적는다.
+
+| 컬럼 | 뜻 |
+|---|---|
+| `position_id` · `created_at` | 포지션 · 시각 |
+| `net_percent` · `net_usdt` | 지금 청산하면 순손익 |
+| `exit_premium` | 지금 청산 김프 (수량 소진 평균가) |
+| `mid_premium` · `upbit_mid_krw` · `bybit_mid_usdt` · `usdt_krw` | 그때 시세 |
+| `funding_usdt` · `liq_distance_percent` | 그때까지 펀딩비 · 강제청산까지 거리 |
+
+```sql
+-- 포지션별: 최고점이 목표에 얼마나 못 미쳤나 (TIMEOUT 으로 끝난 것들 분석)
+SELECT p.id, p.coin, p.exit_reason, p.target_net_profit_percent AS 목표,
+       ROUND(p.max_net_percent, 3) AS 최고, p.max_net_at, ROUND(p.net_pnl_percent, 3) AS 결과
+FROM positions p WHERE p.status = 'CLOSED' ORDER BY p.id;
+```
+
+### 1-10. `engine_snapshots` — 자본 곡선과 스캔 소요
+1분에 1줄. `upbit_usdt + bybit_usdt` 가 **포지션과 무관한 총자본 곡선**이다 (손익 기록과 대조할 때 쓴다).
+`scan_ms` 가 평소(1~3초)보다 길게 이어지는 구간 = 거래소 응답이 느렸거나 통신 장애.
+
+### 1-11. `runs` — 실행 기록
+켤 때 `mode` · `coins` · `git_commit` · `settings_json`(비밀값 뺀 설정 전부) 을 적고, 끌 때 `ended_at` · `stop_reason`
+(`one_shot` / `stopped`) 을 채운다. 포지션의 `run_id` 로 "그 거래 때 설정이 뭐였나" 를 찾는다.
+
+### 1-12. `events` — 문제 기록 (WARNING 이상 로그 전부)
+텔레그램으로 가는 것과 같은 기준(WARNING 이상)으로 DB 에도 남긴다. `logger.exception` 으로 찍힌 예외는
+**traceback 전체**가 `exc_text` 에 들어간다. 로그 파일을 열지 않고도 "언제·어디서·몇 번" 을 센다.
+
+| 컬럼 | 뜻 |
+|---|---|
+| `level` · `logger` | `WARNING` / `ERROR` / `CRITICAL` · 어느 모듈 (`kimp.broker`, `kimp.engine` …) |
+| `message` | 로그 한 줄 (1,000자까지) |
+| `exc_text` | 예외였으면 traceback |
+| `run_id` · `created_at` | 어느 실행 · 시각 |
+
+```sql
+-- 종류별 횟수 (메시지 앞 30자로 묶기)
+SELECT level, SUBSTR(message, 1, 30) AS 종류, COUNT(*) FROM events GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 30;
+-- 예외만
+SELECT created_at, logger, message, exc_text FROM events WHERE exc_text IS NOT NULL ORDER BY id DESC;
+-- 포지션 번호가 들어간 메시지로 그 포지션의 사건 모으기
+SELECT created_at, level, message FROM events WHERE message LIKE '%#12 %' ORDER BY id;
+```
 
 ### 1-7. `carry_positions` / `carry_funding` — 펀딩비 수익 전략
 바이비트 현물 매수 + 같은 개수 숏 → 가격 변동은 상쇄되고 펀딩비(+)를 숏이 받는다 (`docs/carry.md`).

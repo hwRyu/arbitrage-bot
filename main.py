@@ -33,6 +33,7 @@ from kimp.db import make_session_factory
 from kimp.engine import Engine, _as_utc
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.fx import FxProvider
+from kimp.telemetry import end_run, install_db_log_handler, start_run
 from kimp.logging_setup import setup_logging
 from kimp.market_data import MarketData
 from kimp.safety import KST, Safety
@@ -415,6 +416,10 @@ def main() -> int:
     session_factory = make_session_factory(settings.active_db_path)
     engine = Engine(settings=settings, market=market, fx=fx, broker=broker,
                     session_factory=session_factory, coins=coins)
+    # 분석용: 이번 실행의 모드·코인·설정·코드 버전을 남기고, 새 포지션이 이 번호를 가리키게 한다.
+    # 그리고 여기서부터 WARNING 이상 로그(예외 traceback 포함)는 DB events 에도 쌓인다
+    engine.run_id = start_run(session_factory, settings, coins)
+    install_db_log_handler(session_factory, engine.run_id)
 
     # Ctrl+C 를 누르면 '끝내라' 표시만 해두고, 엔진이 하던 스캔을 마친 뒤 멈춘다
     stop_event = threading.Event()
@@ -441,6 +446,7 @@ def main() -> int:
             logger.exception("펀딩비 전략 시작 실패 (김프 전략은 계속)")
 
     engine.run(stop_event)
+    end_run(session_factory, engine.run_id, "one_shot" if engine._one_shot_done else "stopped")
     if carry_thread:
         carry_thread.join(timeout=30)
     if settings.one_shot:

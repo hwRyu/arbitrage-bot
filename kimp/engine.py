@@ -38,6 +38,7 @@ from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium, margin_to_add_usdt
 from kimp.premium import Quote
+from kimp import telemetry
 
 LF = chr(10)  # 줄바꿈 (편집 사고를 막으려고 상수로)
 
@@ -111,6 +112,12 @@ class Engine:
         # 한 번만 돌리기(ONE_SHOT): 포지션 하나를 끝까지 보고 종료한다
         self._one_shot_opened = False  # 이번 실행에서 포지션을 잡았나 (또는 이미 있던 걸 이어받았나)
         self._one_shot_done = False    # 그 포지션이 끝났나 → run 루프가 멈춘다
+
+        # 분석용 기록 (kimp/telemetry.py). 매매 판단에는 안 쓴다
+        self.run_id: Optional[int] = None            # main 이 넣어 준다 (runs.id). 새 포지션에 적어 둔다
+        self._last_pos_snapshot: Dict[int, float] = {}  # 포지션별 마지막 평가 기록 시각
+        self._step_started = 0.0                     # 이번 스캔 시작 (monotonic)
+        self._quote_ms = 0.0                         # 이번 스캔의 시세 조회 소요 (ms)
 
     def request_close(self, coins: Optional[Sequence[str]] = None) -> str:
         """
@@ -228,9 +235,11 @@ class Engine:
 
     def step(self) -> None:
         """스캔 한 번 (순서는 파일 맨 위 설명 참고)"""
+        self._step_started = time.monotonic()
         # 환율은 테더 프리미엄·사이트식 김프를 보여주는 데만 쓴다. 없으면 그 칸만 빈다
         fx_krw = self.fx.get() if self.fx else None
         quotes = self.market.fetch_quotes(self.coins, fx_krw)
+        self._quote_ms = (time.monotonic() - self._step_started) * 1000
         if not quotes:
             return
 
@@ -281,6 +290,12 @@ class Engine:
         pnl = valuation.pnl
         pos.last_net_percent = pnl.net_percent
         pos.last_exit_premium = valuation.exit_premium
+        # 분석용: 보유 중 순손익 최고·최저 + SNAPSHOT_INTERVAL_SEC 마다 평가 한 줄
+        now = self._clock()
+        telemetry.note_extremes(pos, pnl.net_percent, self._now_utc())
+        if now - self._last_pos_snapshot.get(pos.id, 0.0) >= self.s.snapshot_interval_sec:
+            self._last_pos_snapshot[pos.id] = now
+            telemetry.position_snapshot(session, pos, valuation, quote, self._now_utc())
         session.commit()
 
         # 목표 / 손절은 진입할 때 포지션에 저장한 값 (들고 있는 중에 .env 를 바꿔도 처음 값으로)
@@ -595,10 +610,16 @@ class Engine:
             # 맨 앞 호가 김프는 실제 체결 김프보다 **항상 유리하므로**, 여기서 떨어지면
             # 수량을 넣고 계산해도 절대 통과할 수 없다 → 안전하게 건너뛸 수 있다.
             top = quote.entry_premium_top
-            if top is None or top > threshold:
+            if top is None or top > threshold + telemetry.NEAR_MARGIN_PERCENT:
+                continue  # 기준 근처에도 못 왔으면 기록도 안 남긴다
+            # 분석용 기록: 기준 근처부터는 어느 단계에서 걸렸는지 한 줄씩 남긴다 (kimp/telemetry.py)
+            now_utc = self._now_utc()
+            if top > threshold:
+                telemetry.decision(session, coin, "near", top, threshold, now=now_utc)
                 continue  # 맨 앞 호가로도 조건이 안 되면 더 볼 필요 없음
             # 펀딩비 안전장치: 숏이 돈을 내는 쪽이 심하면 들어가지 않는다 (김프 조건을 통과한 코인만 확인)
             min_funding = self.s.entry_min_funding_8h_percent
+            funding = None
             if min_funding is not None:
                 funding = self._funding_8h_percent(coin)
                 if funding is None:
@@ -609,10 +630,12 @@ class Engine:
                         f"funding-block-{coin}", logging.INFO,
                         f"{coin} 진입 보류: 펀딩비 {funding:+.4f}%/8h < 기준 {min_funding:+.4f}%/8h "
                         f"(숏이 내는 쪽이라 오래 들고 있으면 김프가 올라도 손해)")
+                    telemetry.decision(session, coin, "funding_block", top, threshold, funding_8h=funding, now=now_utc)
                     continue
             size = self._position_size_usdt(session, coin, list(open_positions.values()), quotes)
             bybit_qty = self._plan_bybit_qty(coin, quote, size)
             if bybit_qty is None:
+                telemetry.decision(session, coin, "size_reject", top, threshold, size_usdt=size, now=now_utc)
                 continue
             # 2차: 실제 주문 수량만큼 호가를 소진한 평균 체결가로 다시 계산한다.
             # 수량이 크면 호가가 밀려서 1차는 통과했어도 여기서 떨어질 수 있다 — 그게 맞는 동작이다.
@@ -620,21 +643,37 @@ class Engine:
             if premium is None:
                 self._log_throttled(f"reject-{coin}", logging.INFO,
                                     f"{coin} 진입 보류: 호가가 모자라서 정한 크기를 다 못 채움")
+                telemetry.decision(session, coin, "depth_reject", top, threshold, size_usdt=size,
+                                   bybit_qty=bybit_qty, funding_8h=funding, now=now_utc)
                 continue
             if premium <= threshold:
                 # 정렬 기준으로 '기준보다 얼마나 더 낮은가'(음수, 작을수록 좋음)를 맨 앞에 둔다.
                 # 김프 절댓값으로 줄 세우면 기준이 느슨한 코인이 늘 이긴다 — 코인마다 기준이
                 # 다르므로 '자기 기준 대비 얼마나 유리한가' 로 비교해야 공평하다.
-                candidates.append((premium - threshold, coin, bybit_qty, quote))
+                candidates.append((premium - threshold, coin, bybit_qty, quote, top, size, funding))
+            else:
+                telemetry.decision(session, coin, "depth_fail", top, threshold, premium_depth=premium,
+                                   size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, now=now_utc)
 
-        for _margin, coin, bybit_qty, quote in sorted(candidates)[:slots]:
+        ranked = sorted(candidates)
+        for _margin, coin, bybit_qty, quote, top, size, funding in ranked[slots:]:
+            # 조건은 됐지만 자리가 없어 밀린 코인 (분석용). 기준은 코인마다 다르니 다시 꺼낸다
+            thr = self.s.params_for(coin).entry_premium_threshold_percent
+            telemetry.decision(session, coin, "no_slot", top, thr, premium_depth=_margin + thr,
+                               size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, now=self._now_utc())
+        for _margin, coin, bybit_qty, quote, top, size, funding in ranked[:slots]:
             params = self.s.params_for(coin)
+            threshold = params.entry_premium_threshold_percent
+            depth = _margin + threshold
             try:
                 try:
                     pos = self.broker.open_hedge(session, quote, bybit_qty)
                 except InsufficientBalance as exc:
                     # 한쪽이 모자람 → 리밸런싱 (페이퍼는 자동 송금 후 한 번 더 시도, 실거래는 알림만)
                     self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
+                    telemetry.decision(session, coin, "balance_block", top, threshold, premium_depth=depth,
+                                       size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, note=str(exc),
+                                       now=self._now_utc())
                     if not self._check_rebalance(session, list(open_positions.values()), quotes,
                                                  when="진입 막힘", need=exc) or not self.auto_transfer:
                         continue
@@ -643,22 +682,27 @@ class Engine:
                     pos = self.broker.open_hedge(session, quote, bybit_qty)
             except EntryRejected as exc:
                 self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
+                telemetry.decision(session, coin, "rejected", top, threshold, premium_depth=depth, size_usdt=size,
+                                   bybit_qty=bybit_qty, funding_8h=funding, note=str(exc), now=self._now_utc())
                 continue
             # 진입 때 기준을 포지션에 적어둔다 (나중에 설정을 바꿔도 이 포지션은 이 값으로 청산)
             # 이게 없으면 들고 있는 중에 .env 목표를 올리면 이미 목표에 닿은 포지션이 안 팔린다.
             pos.entry_threshold_percent = params.entry_premium_threshold_percent
             pos.target_net_profit_percent = params.target_net_profit_percent
             pos.stop_loss_percent = params.stop_loss_percent
+            pos.run_id = self.run_id
             session.commit()
+            telemetry.decision(session, coin, "entered", top, threshold, premium_depth=depth, size_usdt=size,
+                               bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id, now=self._now_utc())
             notional = pos.bybit_qty * pos.entry_bybit_price_usdt
             target = estimated_exit_premium(pos.entry_premium, params.target_net_profit_percent, notional, 0.0,
                                             self.s.fees, quote.usdt_spread_percent or 0.0)
             logger.info(
                 "[진입] #%d %s | 업비트 USDT %.2f개 매도(%.1f원) → %.6g개 매수(%s원) / 바이비트 %g개 숏(%.6f, %.0f배, "
-                "강제청산 %.6f) | 진입 김프 %+.3f%% (기준 %+.2f%%) → 목표 %.2f%% 되려면 김프 약 %+.2f%%",
+                "강제청산 %.6f) | 진입 김프 %+.3f%% (판단 %+.3f%%, 기준 %+.2f%%) → 목표 %.2f%% 되려면 김프 약 %+.2f%%",
                 pos.id, coin, pos.usdt_sold, pos.entry_usdt_price_krw, pos.upbit_qty,
                 f"{pos.entry_upbit_price_krw:,.2f}", pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage,
-                pos.liquidation_price, pos.entry_premium, params.entry_premium_threshold_percent,
+                pos.liquidation_price, pos.entry_premium, depth, params.entry_premium_threshold_percent,
                 params.target_net_profit_percent, target,
             )
             open_positions[coin] = pos
@@ -776,10 +820,16 @@ class Engine:
         upbit, bybit = self.broker.capital_split(session, list(open_positions.values()), quotes)
         total = upbit + bybit
         target = self.s.upbit_target_share()
+        scan_ms = (time.monotonic() - self._step_started) * 1000 if self._step_started else 0.0
         logger.info(
-            "[현황] %s | %s | 포지션 %d/%d | 자본 업비트 %s / 바이비트 %s USDT (%.1f:%.1f, 목표 %.1f:%.1f)",
+            "[현황] %s | %s | 포지션 %d/%d | 자본 업비트 %s / 바이비트 %s USDT (%.1f:%.1f, 목표 %.1f:%.1f) | "
+            "스캔 %.1f초 (시세 %.1f초)",
             head, ", ".join(parts), len(open_positions), self.s.max_open_positions,
             f"{upbit:,.2f}", f"{bybit:,.2f}",
             upbit / total * 100 if total else 0, bybit / total * 100 if total else 0,
-            target * 100, (1 - target) * 100,
+            target * 100, (1 - target) * 100, scan_ms / 1000, self._quote_ms / 1000,
         )
+        # 분석용: 자본 곡선과 스캔 소요 시간 (느려진 구간·통신 장애를 나중에 찾으려고)
+        telemetry.engine_snapshot(session, upbit, bybit, len(open_positions), scan_ms, self._quote_ms,
+                                  q0.usdt_krw, q0.fx_krw, self._now_utc())
+        session.commit()

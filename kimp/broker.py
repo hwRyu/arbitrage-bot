@@ -295,16 +295,19 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     # 주문 한 동작 + 기록
     # ------------------------------------------------------------------
-    def _leg(self, session: Session, pos: Position, side: str, call: Callable[[str], LegFill]) -> LegFill:
+    def _leg(self, session: Session, pos: Position, side: str, call: Callable[[str], LegFill],
+             expected_price: Optional[float] = None) -> LegFill:
         """
         주문 한 동작: 추적번호를 붙여 SENT 로 먼저 저장 → 주문 → 결과로 DONE (안 들어갔으면 VOID)
 
         결과를 모르면(OrderUnknown) SENT 그대로 둔다 → 다음 스캔(sync)에서 추적번호로 조회해서 채운다.
+        expected_price 는 분석용: 판단 때 호가 소진 계산으로 예상한 평균가 (실제 avg_price 와 비교하려고 남긴다).
         """
         exchange, cur = LEG_INFO[side]
         cid = new_client_id()
         row = Fill(position_id=pos.id, exchange=exchange, side=side, qty=0.0, avg_price=0.0, cost=0.0, fee=0.0,
-                   fee_currency=cur, slippage_percent=0.0, client_id=cid, state=FillState.SENT)
+                   fee_currency=cur, slippage_percent=0.0, client_id=cid, state=FillState.SENT,
+                   expected_price=expected_price, created_at=self._now())
         session.add(row)
         session.commit()
         try:
@@ -313,9 +316,11 @@ class HedgeBroker:
             raise
         except OrderFailed:
             row.state = FillState.VOID
+            row.done_at = self._now()
             session.commit()
             raise
         self._fill_row(row, f)
+        row.done_at = self._now()
         session.commit()
         return f
 
@@ -360,6 +365,7 @@ class HedgeBroker:
                 self._fill_row(row, f)
                 logger.warning("[복구] #%d %s %s 주문 결과를 조회로 찾음: %g개 평균 %.8g",
                                pos.id, pos.coin, row.side, f.qty, f.avg_price)
+            row.done_at = self._now()
             session.commit()
         self.safety.clear(f"unknown-{pos.id}")
         return True
@@ -416,6 +422,7 @@ class HedgeBroker:
             entry_bybit_fee_usdt=0.0, entry_premium=plan.premium, entry_tether_premium=quote.tether_premium,
             entry_site_premium=quote.site_premium, entry_fx_krw=quote.fx_krw, leverage=self.leverage,
             bybit_margin_usdt=0.0, liquidation_price=0.0, funding_usdt=0.0,
+            planned_entry_premium=plan.premium,   # 분석용: 실제 entry_premium 과의 차이 = 주문 사이 밀림
         )
         session.add(pos)
         session.commit()
@@ -423,12 +430,15 @@ class HedgeBroker:
         coin, ex = quote.coin, self.ex
         try:
             short = self._leg(session, pos, "open_short",  # 1)
-                              lambda cid: ex.open_short(session, quote, coin, bybit_qty, client_id=cid))
+                              lambda cid: ex.open_short(session, quote, coin, bybit_qty, client_id=cid),
+                              expected_price=plan.bybit.avg_price)
             usdt = self._leg(session, pos, "sell_usdt",  # 2)
-                             lambda cid: ex.sell_usdt(session, quote, short.cost, client_id=cid))
+                             lambda cid: ex.sell_usdt(session, quote, short.cost, client_id=cid),
+                             expected_price=plan.usdt.avg_price)
             krw_for_coin = (usdt.cost - usdt.fee) / (1 + rate)  # 3)
             self._leg(session, pos, "buy",
-                      lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid))
+                      lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid),
+                      expected_price=plan.upbit.avg_price)
         except OrderUnknown as exc:
             self._order_unknown(session, pos, exc)
             raise EntryRejected(f"주문 결과 모름 → 다음 스캔에 조회: {exc}") from exc
@@ -665,9 +675,10 @@ class HedgeBroker:
         pos.exit_tether_premium, pos.exit_site_premium, pos.exit_fx_krw = (
             valuation.tether_premium, valuation.site_premium, valuation.fx_krw)
         session.commit()
-        return self._continue_close(session, pos, valuation.quote)
+        return self._continue_close(session, pos, valuation.quote, valuation.plan)
 
-    def _continue_close(self, session: Session, pos: Position, quote: Optional[Quote]) -> Optional[PnLBreakdown]:
+    def _continue_close(self, session: Session, pos: Position, quote: Optional[Quote],
+                        plan: Optional[ExitPlan] = None) -> Optional[PnLBreakdown]:
         """
         청산 남은 양만 실행 ('체결 기록이 있나' 가 아니라 '목표 양에 닿았나' 로 판단)
 
@@ -688,6 +699,10 @@ class HedgeBroker:
         # 단계별 체결 합계를 짧게 꺼내 쓰는 도우미 (없는 단계는 0 으로)
         s = lambda k, sums: sums.get(k, LegSum())  # noqa: E731
         coin_bid = quote.upbit.best_bid if quote else None
+        # 분석용 예상가 (판단 때 호가 소진 계산). sync 에서 이어서 할 때는 plan 이 없어 비워 둔다
+        exp_sell = plan.upbit.avg_price if plan else None
+        exp_usdt = plan.usdt.avg_price if plan else None
+        exp_short = plan.bybit.avg_price if plan else None
         done = False
         try:
             for _ in range(MAX_LEG_RETRIES):
@@ -700,14 +715,15 @@ class HedgeBroker:
                                                               left * coin_bid < self.ex.min_order_krw(pos.coin))
                 if not coin_done:  # 1)
                     f = self._leg(session, pos, "sell",
-                                  lambda cid: self.ex.sell_coin(session, quote, pos.coin, left, client_id=cid))
+                                  lambda cid: self.ex.sell_coin(session, quote, pos.coin, left, client_id=cid),
+                                  expected_price=exp_sell)
                     coin_done = f.qty <= 0
                 sums = self._sums(session, pos)
                 krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +
                                                                            s("buy_usdt", sums).fee)
                 if krw_left >= self.ex.min_order_krw("USDT"):  # 2)
                     self._leg(session, pos, "buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
-                        session, quote, krw_left / (1 + rate), client_id=cid))
+                        session, quote, krw_left / (1 + rate), client_id=cid), expected_price=exp_usdt)
                 if liquidated:  # 3) 강제청산됨 (거래소가 이미 정리)
                     if not s("liquidated", sums).qty:
                         self.ex.mark_liquidated(session, pos.coin, pos.bybit_qty)
@@ -724,7 +740,8 @@ class HedgeBroker:
                     if not short_done:
                         f = self._leg(session, pos, "close_short", lambda cid: self.ex.close_short(
                             session, quote, pos.coin, short_left, pos.entry_bybit_price_usdt,
-                            pos.bybit_margin_usdt * short_left / pos.bybit_qty, client_id=cid))
+                            pos.bybit_margin_usdt * short_left / pos.bybit_qty, client_id=cid),
+                            expected_price=exp_short)
                         short_done = f.qty >= short_left * (1 - 1e-9) or f.qty <= 0
                 sums = self._sums(session, pos)
                 krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +

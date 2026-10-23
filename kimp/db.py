@@ -11,6 +11,11 @@ DB 테이블 정의 (SQLite 파일 하나에 저장)
 - carry_positions   : 펀딩비 수익 전략 포지션 (바이비트 현물 + 바이비트 숏, kimp/carry.py)
 - carry_funding     : 펀딩비 전략 포지션이 받거나 낸 펀딩비 기록
 - transfers         : 거래소 간 USDT 송금 (리밸런싱). 요청 → 도착 확인까지
+- runs              : 봇을 켠 기록 (모드·코인·설정·git 커밋·종료 사유) — 나중에 "그때 설정이 뭐였지" 용
+- decisions         : 진입 판단 기록 (기준 근처에 왔을 때 어느 단계에서 걸렸나) — kimp/telemetry.py
+- position_snapshots: 보유 중 포지션 평가 기록 (1분마다 순손익·청산 김프·펀딩·강제청산 거리)
+- engine_snapshots  : 양쪽 자본과 스캔 소요 시간 (1분마다)
+- events            : WARNING 이상 로그 전부 (예외는 traceback 까지) — "언제 무슨 문제가 있었나"
 
 시간은 모두 UTC(세계 표준시)로 저장한다. (한국 시간 = UTC + 9시간)
 old 봇은 저장할 때와 읽을 때 시간대가 달라서 날짜가 9시간 밀렸었다.
@@ -118,6 +123,14 @@ class Position(Base):
     last_exit_premium: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 마지막 평가 청산 김프
     last_liq_distance_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 강제청산까지 남은 상승폭
 
+    # ---------------- 분석용 (매매 판단에는 안 쓴다, kimp/telemetry.py) ----------------
+    planned_entry_premium: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 판단 때 김프 (실제와의 차이 = 주문 사이 밀림)
+    max_net_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 보유 중 순손익 최고 (목표에 얼마나 가까웠나)
+    max_net_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    min_net_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 보유 중 순손익 최저
+    min_net_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 어느 실행(runs.id)에서 잡았나
+
     # ---------------- 청산할 때 ----------------
     exit_upbit_price_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     exit_upbit_fee_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
@@ -172,7 +185,9 @@ class Fill(Base):
     cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 체결 금액 (업비트 원, 바이비트 USDT)
     client_id: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)  # 우리가 붙인 추적번호
     state: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # FillState (비어 있으면 DONE)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)  # 주문을 보낸 시각
+    done_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)  # 체결을 확인한 시각 (created_at 과의 차 = 주문 소요)
+    expected_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 판단 때 호가 소진 계산으로 예상한 평균가 (avg_price 와 비교)
 
 
 class FundingEvent(Base):
@@ -213,6 +228,94 @@ class PremiumSnapshot(Base):
     funding_interval_hours: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     upbit_mid_krw: Mapped[float] = mapped_column(Float)
     bybit_mid_usdt: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class Run(Base):
+    """봇을 한 번 켠 기록. 포지션의 run_id 가 여기를 가리킨다 → '그 거래 때 설정·코드가 뭐였나' 를 되짚는다"""
+
+    __tablename__ = "runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mode: Mapped[str] = mapped_column(String(10))  # paper / dry_run / live
+    coins: Mapped[str] = mapped_column(String(200))  # 쉼표로 이은 코인
+    git_commit: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    settings_json: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # 비밀값 뺀 설정 전부
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    stop_reason: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)  # one_shot / stopped / …
+
+
+class Decision(Base):
+    """
+    진입 판단 한 줄 (kimp/telemetry.py decision)
+
+    맨 앞 호가 김프가 기준 근처에 왔을 때만 남긴다. stage 가 어디서 걸렸는지:
+    near / funding_block / size_reject / depth_reject / depth_fail / no_slot / balance_block / rejected / entered
+    """
+
+    __tablename__ = "decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    coin: Mapped[str] = mapped_column(String(20), index=True)
+    stage: Mapped[str] = mapped_column(String(20), index=True)
+    premium_top: Mapped[float] = mapped_column(Float)  # 맨 앞 호가 진입 김프
+    threshold_percent: Mapped[float] = mapped_column(Float)  # 그때 기준
+    premium_depth: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 수량 소진 평균가 김프 (계산했을 때만)
+    size_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    bybit_qty: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    funding_8h_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    position_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # entered 일 때
+    note: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class PositionSnapshot(Base):
+    """보유 중 포지션의 '지금 청산하면' 평가 (SNAPSHOT_INTERVAL_SEC 마다 1줄)"""
+
+    __tablename__ = "position_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    position_id: Mapped[int] = mapped_column(ForeignKey("positions.id"), index=True)
+    net_percent: Mapped[float] = mapped_column(Float)  # 지금 청산하면 순손익률
+    net_usdt: Mapped[float] = mapped_column(Float)
+    exit_premium: Mapped[float] = mapped_column(Float)  # 지금 청산 김프 (수량 소진 평균가)
+    mid_premium: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    upbit_mid_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    bybit_mid_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    usdt_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    funding_usdt: Mapped[float] = mapped_column(Float, default=0.0)  # 그때까지 쌓인 펀딩비
+    liq_distance_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class EngineSnapshot(Base):
+    """엔진 현황 (SNAPSHOT_INTERVAL_SEC 마다 1줄): 양쪽 자본(USDT 환산)과 스캔 소요 시간"""
+
+    __tablename__ = "engine_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    upbit_usdt: Mapped[float] = mapped_column(Float)  # 업비트 자본 (USDT + 원화 + 코인 평가)
+    bybit_usdt: Mapped[float] = mapped_column(Float)  # 바이비트 자본 (USDT + 증거금 + 숏 평가)
+    open_positions: Mapped[int] = mapped_column(Integer)
+    scan_ms: Mapped[float] = mapped_column(Float)  # 이번 스캔에 걸린 시간 (현황 로그 시점까지)
+    quote_ms: Mapped[float] = mapped_column(Float)  # 그중 시세 조회
+    usdt_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fx_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class Event(Base):
+    """WARNING 이상 로그 한 줄 (kimp/telemetry.py DbLogHandler). 예외는 traceback 까지"""
+
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    level: Mapped[str] = mapped_column(String(10), index=True)  # WARNING / ERROR / CRITICAL
+    logger: Mapped[str] = mapped_column(String(40))  # 어느 모듈 (kimp.broker, kimp.engine …)
+    message: Mapped[str] = mapped_column(String(1000))
+    exc_text: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # 예외였으면 traceback
+    run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
