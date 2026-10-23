@@ -219,6 +219,10 @@ class LiveExecutor:
         self._shorts.pop(coin, None)
         return self.short_qty(session, coin) <= 0
 
+    def short_gone(self, session: Session, coin: str) -> bool:
+        """거래소에 숏이 남아 있지 않나 (캐시 비우고 다시 조회). 청산 도중 숏이 사라졌는지 볼 때 쓴다"""
+        return self.short_liquidated(session, coin)
+
     def mark_liquidated(self, session: Session, coin: str, qty: float) -> None:
         """거래소가 이미 정리했으니 할 일 없음"""
 

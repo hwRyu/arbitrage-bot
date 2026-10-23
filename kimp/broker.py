@@ -41,6 +41,13 @@
 ------------------------------------------------------------------
   DB 의 열린 포지션 ↔ 실행기가 알려주는 실제 숏 개수·업비트 코인 개수
   다르면 신규 진입 중단 + 긴급 알림 (자동으로 고치지 않는다)
+
+숏이 거래소에서 사라졌을 때 (매 스캔, sync 의 _close_vanished_shorts)
+------------------------------------------------------------------
+  봇은 '가격 ≥ 계산한 강제청산가' 로 강제청산을 알아채지만, 거래소는 수수료·유지증거금 구간 때문에
+  그보다 조금 아래에서 청산할 수 있다. 그러면 봇은 헷지가 살아 있다고 믿은 채 코인만 들고 있게 된다.
+  → OPEN 포지션인데 거래소 숏이 0 이면 그 스캔에 바로 강제청산 경로로 코인을 팔아 USDT 로 되돌린다.
+    청산 도중에 숏이 사라진 경우도 같다 (숏 닫기 주문을 내기 전에 확인해서 거절당하지 않는다).
 """
 from __future__ import annotations
 
@@ -724,18 +731,26 @@ class HedgeBroker:
                 if krw_left >= self.ex.min_order_krw("USDT"):  # 2)
                     self._leg(session, pos, "buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
                         session, quote, krw_left / (1 + rate), client_id=cid), expected_price=exp_usdt)
-                if liquidated:  # 3) 강제청산됨 (거래소가 이미 정리)
-                    if not s("liquidated", sums).qty:
-                        self.ex.mark_liquidated(session, pos.coin, pos.bybit_qty)
+                short_left = pos.bybit_qty - s("close_short", sums).qty
+                if not liquidated and short_left > pos.bybit_qty * 1e-9 and self.ex.short_gone(session, pos.coin):
+                    # 닫으려는데 거래소에 숏이 없다 (청산 도중 강제청산됐거나 누가 손으로 닫음).
+                    # 주문을 내면 '포지션 없음' 으로 거절만 당하므로, 남은 양은 강제청산된 것으로 마무리한다
+                    liquidated = True
+                    pos.exit_reason = ExitReason.LIQUIDATION
+                    session.commit()
+                    logger.critical("[숏 사라짐] #%d %s 청산 중 거래소에 숏이 없습니다 (남은 %g개) → 강제청산으로 보고 "
+                                    "증거금 손실로 기록해 마무리합니다", pos.id, pos.coin, short_left)
+                if liquidated:  # 3) 강제청산됨 (거래소가 이미 정리) — 남은 양만 기록한다
+                    if not s("liquidated", sums).qty and short_left > pos.bybit_qty * 1e-9:
+                        self.ex.mark_liquidated(session, pos.coin, short_left)
                         row = Fill(position_id=pos.id, exchange="bybit", side="liquidated", fee_currency="USDT",
                                    slippage_percent=0.0, client_id="liquidated", qty=0, avg_price=0, cost=0, fee=0)
-                        self._fill_row(row, LegFill(pos.bybit_qty, pos.liquidation_price,
-                                                    pos.bybit_qty * pos.liquidation_price, 0.0, "liquidated"))
+                        self._fill_row(row, LegFill(short_left, pos.liquidation_price,
+                                                    short_left * pos.liquidation_price, 0.0, "liquidated"))
                         session.add(row)
                         session.commit()
                     short_done = True
                 else:  # 3) 숏 닫기 (남은 개수만)
-                    short_left = pos.bybit_qty - s("close_short", sums).qty
                     short_done = short_left <= pos.bybit_qty * 1e-9
                     if not short_done:
                         f = self._leg(session, pos, "close_short", lambda cid: self.ex.close_short(
@@ -769,12 +784,18 @@ class HedgeBroker:
 
         sums = self._sums(session, pos)
         sold, bought = s("sell", sums), s("buy_usdt", sums)
-        short = s("liquidated", sums) if liquidated else s("close_short", sums)
+        closed, liq = s("close_short", sums), s("liquidated", sums)
+        short = liq if (liquidated and liq.qty) else closed
+        override = None
+        if liquidated:
+            # 바이비트 몫 = 강제청산된 양만큼 증거금 손실 + (그 전에 정상으로 닫은 양이 있으면 그 손익 − 수수료)
+            override = -pos.bybit_margin_usdt * (liq.qty / pos.bybit_qty if pos.bybit_qty else 1.0)
+            if closed.qty:
+                override += (pos.entry_bybit_price_usdt - closed.avg) * closed.qty - closed.fee
         legs = ExitLegs(upbit_price_krw=sold.avg, upbit_fee_krw=sold.fee, usdt_price_krw=bought.avg,
                         usdt_fee_krw=bought.fee, usdt_bought=bought.qty, bybit_price_usdt=short.avg,
                         bybit_fee_usdt=short.fee)
-        pnl = compute_pnl(entry_legs_of(pos), legs, pos.funding_usdt, self.fees,
-                          bybit_leg_override_usdt=-pos.bybit_margin_usdt if liquidated else None)
+        pnl = compute_pnl(entry_legs_of(pos), legs, pos.funding_usdt, self.fees, bybit_leg_override_usdt=override)
         pos.status, pos.closed_at = PositionStatus.CLOSED, self._now()
         pos.exit_upbit_price_krw, pos.exit_upbit_fee_krw = sold.avg, sold.fee
         pos.exit_usdt_price_krw, pos.exit_usdt_fee_krw, pos.usdt_bought = bought.avg, bought.fee, bought.qty
@@ -866,6 +887,7 @@ class HedgeBroker:
                 if pnl:
                     logger.warning("[청산 이어서 완료] #%d %s 순손익 %+.2f USDT (%+.3f%%)",
                                    pos.id, pos.coin, pnl.net_usdt, pnl.net_percent)
+        self._close_vanished_shorts(session, quotes)
         now = self._now().timestamp()
         if now - self._last_reconcile >= self.reconcile_interval_sec:
             self._last_reconcile = now
@@ -874,6 +896,38 @@ class HedgeBroker:
                 self.safety.block("reconcile", "대조 불일치: " + " / ".join(issues))
             else:
                 self.safety.clear("reconcile")
+
+    def _close_vanished_shorts(self, session: Session, quotes: Dict[str, Quote]) -> None:
+        """
+        OPEN 포지션인데 거래소에 숏이 없으면 (강제청산 또는 누가 손으로 닫음) 즉시 코인을 팔아 정리한다
+
+        10분마다 도는 대조는 신규 진입만 막는데, 그 사이 코인은 헷지 없이 가격에 노출된다.
+        그래서 매 스캔 숏 개수를 본다 (코인당 조회 1번). 손익은 강제청산과 같게 '증거금 전액 손실' 로
+        적는다 — 사람이 손으로 닫은 거라면 실제로는 증거금이 돌아와 있으니 기록이 더 비관적일 수 있다.
+        """
+        for pos in self.open_positions(session):
+            if pos.bybit_qty <= 0:
+                continue
+            try:
+                short = self.ex.short_qty(session, pos.coin)
+            except Exception as exc:
+                self._log_repeat(f"short-check-{pos.id}", logging.WARNING,
+                                 f"#{pos.id} {pos.coin} 거래소 숏 개수 조회 실패 (다음에 다시): {exc}")
+                continue
+            if short is None or short > pos.bybit_qty * 1e-9:
+                continue  # 숏이 있다 (개수 차이는 대조가 본다)
+            quote = quotes.get(pos.coin)
+            valuation = self.value_liquidation(pos, quote) if quote else None
+            if valuation is None:
+                self._log_repeat(f"vanished-{pos.id}", logging.CRITICAL,
+                                 f"[숏 사라짐] #{pos.id} {pos.coin} 거래소에 숏이 없는데 시세·호가가 없어 "
+                                 f"코인을 못 팔았습니다 — 다음 스캔에 다시 (그동안 코인만 들고 있어 가격에 노출)")
+                continue
+            logger.critical("[숏 사라짐] #%d %s 거래소에 숏이 없습니다 (DB %g개) — 강제청산으로 보고 업비트 코인을 "
+                            "즉시 정리합니다 (증거금 %.2f USDT 손실로 기록, 순손익 %+.3f%%)",
+                            pos.id, pos.coin, pos.bybit_qty, pos.bybit_margin_usdt, valuation.pnl.net_percent)
+            self.close_hedge(session, pos, valuation, ExitReason.LIQUIDATION, liquidated=True)
+            self._last_repeat.pop(f"vanished-{pos.id}", None)
 
     def reconcile(self, session: Session, coins: Iterable[str]) -> List[str]:
         """

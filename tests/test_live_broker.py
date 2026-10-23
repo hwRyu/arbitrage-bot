@@ -394,15 +394,18 @@ class ResumeTest(unittest.TestCase):
             self.assertEqual(by.short, 0.0)
 
     def test_reconcile_mismatch_blocks_entries(self):
+        """숏이 '일부' 만 어긋나면 (누가 손으로 30개 줄임) 자동으로 고치지 않고 신규 진입만 막는다.
+        숏이 '아예 없는' 경우는 VanishedShortTest — 그건 즉시 코인을 판다"""
         prices, up, by, broker, sf = make_live()
         with sf() as s:
-            broker.open_hedge(s, prices.quote(), 50.0)
-            by.short = 0.0  # 누가 거래소에서 손으로 닫음
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            by.short = 30.0  # 누가 거래소에서 손으로 일부 닫음
             broker._last_reconcile = -1e18
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
             ok, why = broker.entries_allowed(s)
             self.assertFalse(ok)
             self.assertIn("대조 불일치", why)
+            self.assertEqual(pos.status, PositionStatus.OPEN)   # 건드리지 않는다
 
     def test_liquidation_price_but_short_still_open_is_closed_normally(self):
         prices, up, by, broker, sf = make_live()
@@ -648,6 +651,88 @@ class HedgeGapTest(unittest.TestCase):
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])   # 이제 됨
             self.assertEqual(pos.status, PositionStatus.CLOSED)
             self.assertEqual(by.short, 0.0)
+
+
+class VanishedShortTest(unittest.TestCase):
+    """
+    거래소가 우리 계산보다 먼저 숏을 강제청산한 경우 (2026-10-23 빈틈 메우기)
+
+    전에는 포지션이 OPEN 인 채 코인만 들고 있었고(가격 노출), 청산하려 하면 숏 닫기가 거절되어 CLOSING 에 갇혔다.
+    """
+
+    def _liquidate_on_exchange(self, by):
+        """바이비트가 숏을 강제청산함: 포지션 사라지고 증거금은 돌아오지 않는다"""
+        by.short, by.margin, by.entry = 0.0, 0.0, 0.0
+
+    def test_open_position_with_no_short_is_closed_next_scan(self):
+        """OPEN 인데 거래소 숏이 0 → 다음 sync 에서 바로 코인을 팔아 LIQUIDATION 으로 마무리"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            self._liquidate_on_exchange(by)
+            prices.coin_bid, prices.coin_ask = 5600.0, 5601.0   # 코인은 2배 (강제청산 상황)
+            broker.ex.refresh()
+            with self.assertLogs("kimp.broker", level=logging.CRITICAL) as logs:
+                broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            self.assertTrue(any("숏 사라짐" in m for m in logs.output))
+            s.refresh(pos)
+            self.assertEqual(pos.status, PositionStatus.CLOSED)
+            self.assertEqual(pos.exit_reason, ExitReason.LIQUIDATION)
+            self.assertAlmostEqual(up.bal["XRP"], 0.0, places=6)            # 코인 즉시 정리
+            self.assertAlmostEqual(pos.bybit_leg_usdt, -pos.bybit_margin_usdt)  # 증거금 손실로 기록
+            self.assertGreater(pos.upbit_leg_usdt, 90)                       # 코인 2배 → 업비트 몫이 메움
+            self.assertEqual(by.calls.count("close_short"), 0)               # 없는 숏에 주문 안 냄
+            self.assertTrue(broker.entries_allowed(s)[0])                    # 정리됐으니 막히지 않는다
+
+    def test_close_when_short_already_gone_finishes_instead_of_sticking(self):
+        """목표 도달로 청산하는데 숏이 사라져 있음 → 거절·CLOSING 갇힘 대신 남은 양을 강제청산으로 마무리"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            val = broker.value_exit(pos, prices.quote())
+            self._liquidate_on_exchange(by)
+            broker.ex.refresh()
+            pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+            self.assertIsNotNone(pnl)
+            self.assertEqual(pos.status, PositionStatus.CLOSED)
+            self.assertEqual(pos.exit_reason, ExitReason.LIQUIDATION)
+            self.assertEqual(by.calls.count("close_short"), 0)
+            self.assertAlmostEqual(up.bal["XRP"], 0.0, places=6)
+            self.assertAlmostEqual(pos.bybit_leg_usdt, -pos.bybit_margin_usdt)
+
+    def test_partial_close_then_liquidated_records_both(self):
+        """숏 60% 닫은 뒤 나머지가 강제청산됨 → 닫은 몫 손익 + 남은 40% 증거금 손실"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            margin = pos.bybit_margin_usdt
+            by.partial["close_short"] = 0.6
+            val = broker.value_exit(pos, prices.quote())
+
+            orig = by.create_order
+
+            def close_then_vanish(symbol, type_, side, amount, price=None, params=None):
+                r = orig(symbol, type_, side, amount, price, params)
+                if side == "buy":            # 60% 체결 직후 나머지는 거래소가 청산
+                    self._liquidate_on_exchange(by)
+                return r
+
+            by.create_order = close_then_vanish
+            pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+            self.assertIsNotNone(pnl)
+            self.assertEqual(pos.status, PositionStatus.CLOSED)
+            self.assertEqual(by.calls.count("close_short"), 1)
+            # 바이비트 몫 = 닫은 30개 손익(가격 거의 같음 → ≈ −수수료) + 남은 20개 증거금 손실(40%)
+            self.assertAlmostEqual(pos.bybit_leg_usdt, -margin * 0.4, delta=0.1)
+
+    def test_live_position_still_there_is_left_alone(self):
+        """숏이 멀쩡히 있으면 아무것도 안 한다"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertEqual(by.short, 50.0)
 
 
 class MinOrderTest(unittest.TestCase):

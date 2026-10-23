@@ -249,6 +249,10 @@ class PaperExecutor:
         """거래소가 숏을 강제청산했나? 페이퍼 거래소는 강제청산 가격에 닿으면 바로 청산한다고 본다"""
         return True
 
+    def short_gone(self, session: Session, coin: str) -> bool:
+        """거래소에 숏이 남아 있지 않나 (장부 개수 0). short_liquidated 와 달리 '가격' 이 아니라 '실제 유무' 다"""
+        return self._get(session, short_key(coin)) <= 0
+
     def mark_liquidated(self, session: Session, coin: str, qty: float) -> None:
         """바이비트가 숏을 강제청산함: 증거금은 이미 빠져 있으니 숏 개수만 0으로"""
         self._add(session, short_key(coin), -qty)
