@@ -236,6 +236,25 @@ class EngineTest(unittest.TestCase):
         with sf() as s:
             self.assertEqual(s.query(Position).one().exit_reason, ExitReason.TAKE_PROFIT)
 
+    def test_vanished_short_closes_and_blocks_immediate_reentry(self):
+        """거래소에서 숏이 사라지면 그 스캔에 LIQUIDATION 으로 정리하고, 재진입 대기가 걸려 바로 다시 안 들어간다"""
+        from kimp.executor import short_key
+        self.market.quotes = {"XRP": make_quote(-1.0)}
+        self.engine.step()
+        [pos] = self._positions()
+        with self.sf() as s:
+            self.broker.ex._add(s, short_key("XRP"), -pos.bybit_qty)   # 거래소가 숏을 없앤 것처럼
+            s.commit()
+        with self.assertLogs("kimp.engine", level=logging.CRITICAL) as logs:
+            self.engine.step()                                          # 김프는 여전히 -1.0 → 조건상 재진입감
+        self.assertTrue(any("숏 사라짐" in m for m in logs.output))
+        self.assertTrue(any("[청산 LIQUIDATION]" in m for m in logs.output))   # 요약 로그가 나간다
+        positions = self._positions()
+        self.assertEqual([p.status for p in positions], [PositionStatus.CLOSED])   # 같은 스캔에 재진입 없음
+        self.assertEqual(positions[0].exit_reason, ExitReason.LIQUIDATION)
+        self.engine.step()
+        self.assertEqual(len(self._positions()), 1)                     # 대기 중이라 다음 스캔에도 없음
+
     def test_no_entry_above_threshold(self):
         """김프 -0.2% 는 기준 -0.5% 보다 높으니 진입 안 함"""
         self.market.quotes = {"XRP": make_quote(-0.2)}

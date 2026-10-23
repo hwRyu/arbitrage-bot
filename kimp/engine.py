@@ -246,6 +246,7 @@ class Engine:
         with self.session_factory() as session:
             # 송금 도착 확인, 덜 끝난 진입·청산 이어서, 거래소와 대조 (페이퍼도 같은 흐름)
             self.broker.sync(session, quotes, self.coins)
+            self._close_vanished_shorts(session, quotes)
             open_positions = {p.coin: p for p in self.broker.open_positions(session)}
 
             closed_any = self._handle_close_requests(session, quotes, open_positions)
@@ -421,6 +422,26 @@ class Engine:
             pos.usdt_sold, pos.usdt_bought, pos.usdt_bought - pos.usdt_sold,
             final.bybit_leg_usdt, final.funding_usdt, final.total_cost_usdt, final.net_usdt, final.net_percent,
         )
+
+    def _close_vanished_shorts(self, session: Session, quotes: Dict[str, Quote]) -> None:
+        """
+        거래소에서 숏이 사라진(강제청산된) OPEN 포지션을 그 스캔에 바로 정리한다
+
+        봇 계산 강제청산가보다 거래소가 먼저 자르는 경우가 있다 (IRYS #4: 봇 0.0572, 거래소 0.0559).
+        _close 를 거치므로 재진입 대기·"[청산 LIQUIDATION]" 요약 로그·기록이 정상 청산과 똑같이 남는다.
+        """
+        for pos in self.broker.vanished_shorts(session):
+            quote = quotes.get(pos.coin)
+            valuation = self.broker.value_liquidation(pos, quote) if quote else None
+            if valuation is None:
+                self._log_throttled(f"vanished-{pos.coin}", logging.CRITICAL,
+                                    f"[숏 사라짐] #{pos.id} {pos.coin} 거래소에 숏이 없는데 시세·호가가 없어 코인을 못 "
+                                    f"팔았습니다 — 다음 스캔에 다시 (그동안 코인만 들고 있어 가격에 노출)")
+                continue
+            logger.critical("[숏 사라짐] #%d %s 거래소에 숏이 없습니다 (DB %g개) — 강제청산으로 보고 업비트 코인을 "
+                            "즉시 정리합니다 (증거금 %.2f USDT 손실로 기록, 순손익 %+.3f%%)",
+                            pos.id, pos.coin, pos.bybit_qty, pos.bybit_margin_usdt, valuation.pnl.net_percent)
+            self._close(session, pos, valuation, ExitReason.LIQUIDATION, liquidated=True)
 
     def _check_liquidation(self, session: Session, pos: Position, quote: Quote) -> bool:
         """

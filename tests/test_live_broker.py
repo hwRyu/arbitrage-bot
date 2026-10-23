@@ -668,6 +668,13 @@ class VanishedShortTest(unittest.TestCase):
         """바이비트가 숏을 강제청산함: 포지션 사라지고 증거금은 돌아오지 않는다"""
         by.short, by.margin, by.entry = 0.0, 0.0, 0.0
 
+    @staticmethod
+    def _engine_like_scan(broker, s, quote):
+        """엔진 step 의 해당 부분: sync → 숏 사라진 포지션을 강제청산 경로로 정리"""
+        broker.sync(s, {"XRP": quote}, ["XRP"])
+        for pos in broker.vanished_shorts(s):
+            broker.close_hedge(s, pos, broker.value_liquidation(pos, quote), ExitReason.LIQUIDATION, liquidated=True)
+
     def test_open_position_with_no_short_is_closed_next_scan(self):
         """OPEN 인데 거래소 숏이 0 → 다음 sync 에서 바로 코인을 팔아 LIQUIDATION 으로 마무리"""
         prices, up, by, broker, sf = make_live()
@@ -676,9 +683,8 @@ class VanishedShortTest(unittest.TestCase):
             self._liquidate_on_exchange(by)
             prices.coin_bid, prices.coin_ask = 5600.0, 5601.0   # 코인은 2배 (강제청산 상황)
             broker.ex.refresh()
-            with self.assertLogs("kimp.broker", level=logging.CRITICAL) as logs:
-                broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
-            self.assertTrue(any("숏 사라짐" in m for m in logs.output))
+            self.assertEqual([p.id for p in broker.vanished_shorts(s)], [pos.id])
+            self._engine_like_scan(broker, s, prices.quote())
             s.refresh(pos)
             self.assertEqual(pos.status, PositionStatus.CLOSED)
             self.assertEqual(pos.exit_reason, ExitReason.LIQUIDATION)
@@ -734,7 +740,8 @@ class VanishedShortTest(unittest.TestCase):
         prices, up, by, broker, sf = make_live()
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)
-            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            self.assertEqual(broker.vanished_shorts(s), [])
+            self._engine_like_scan(broker, s, prices.quote())
             self.assertEqual(pos.status, PositionStatus.OPEN)
             self.assertEqual(by.short, 50.0)
 
