@@ -288,15 +288,6 @@ class Engine:
             return False
 
         pnl = valuation.pnl
-        pos.last_net_percent = pnl.net_percent
-        pos.last_exit_premium = valuation.exit_premium
-        # 분석용: 보유 중 순손익 최고·최저 + SNAPSHOT_INTERVAL_SEC 마다 평가 한 줄
-        now = self._clock()
-        telemetry.note_extremes(pos, pnl.net_percent, self._now_utc())
-        if now - self._last_pos_snapshot.get(pos.id, 0.0) >= self.s.snapshot_interval_sec:
-            self._last_pos_snapshot[pos.id] = now
-            telemetry.position_snapshot(session, pos, valuation, quote, self._now_utc())
-        session.commit()
 
         # 목표 / 손절은 진입할 때 포지션에 저장한 값 (들고 있는 중에 .env 를 바꿔도 처음 값으로)
         target, stop = self._exit_rules(pos)
@@ -314,11 +305,6 @@ class Engine:
                                "(지금 순손익 %+.3f%%)", pos.id, pos.coin, cost,
                                self.s.max_funding_cost_percent, pnl.net_percent)
                 reason = ExitReason.FUNDING_COST
-        if reason is None:
-            logger.debug("%s 보유 중: 청산 김프 %+.3f%%, 순손익 %+.3f%% (%+.2f USDT)",
-                         pos.coin, valuation.exit_premium, pnl.net_percent, pnl.net_usdt)
-            return False
-
         if reason == ExitReason.TAKE_PROFIT:
             # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
             fresh = self._fresh_quote(pos.coin)
@@ -331,8 +317,26 @@ class Engine:
                     f"{'없음' if again is None else f'{again:+.3f}%'} (목표 {target:.2f}%) — 한순간 값이라 다음 스캔에 다시")
                 telemetry.decision(session, pos.coin, "tp_confirm_fail", pnl.net_percent, target,
                                    premium_depth=again, position_id=pos.id, now=self._now_utc())
-                return False
-            valuation = confirmed   # 더 새 시세로 주문한다
+                reason = None
+                if confirmed is not None:
+                    valuation, pnl = confirmed, confirmed.pnl   # 한순간 튄 값이 아니라 확인된 값으로 기록한다
+            else:
+                valuation, pnl = confirmed, confirmed.pnl       # 더 새 시세로 주문한다
+
+        # 기록은 확인 시세 판정이 끝난 값으로 (가짜 꼭대기가 최고점·평가 기록에 남지 않게)
+        pos.last_net_percent = pnl.net_percent
+        pos.last_exit_premium = valuation.exit_premium
+        now = self._clock()
+        telemetry.note_extremes(pos, pnl.net_percent, self._now_utc())
+        if now - self._last_pos_snapshot.get(pos.id, 0.0) >= self.s.snapshot_interval_sec:
+            self._last_pos_snapshot[pos.id] = now
+            telemetry.position_snapshot(session, pos, valuation, quote, self._now_utc())
+        session.commit()
+
+        if reason is None:
+            logger.debug("%s 보유 중: 청산 김프 %+.3f%%, 순손익 %+.3f%% (%+.2f USDT)",
+                         pos.coin, valuation.exit_premium, pnl.net_percent, pnl.net_usdt)
+            return False
 
         self._close(session, pos, valuation, reason)
         return True

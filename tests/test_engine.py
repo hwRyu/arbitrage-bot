@@ -228,6 +228,8 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(pos.status, PositionStatus.OPEN)
         self.assertEqual(len(d), 1)
         self.assertEqual(d[0].position_id, pos.id)
+        self.assertLess(pos.max_net_percent, 1.0)            # 가짜 꼭대기(+0.8 스캔값)가 최고점에 안 남는다
+        self.assertLess(pos.last_net_percent, 1.0)           # 현황도 확인된 값
         # 확인 시세도 넘으면 청산
         self.market.confirm_quotes = {"XRP": make_quote(0.8)}
         engine.step()
