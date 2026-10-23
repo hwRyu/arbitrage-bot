@@ -295,6 +295,14 @@ class Settings:
     #   그래서 '목표만큼(1%)' 이 아니라 '필요 김프가 범위를 벗어나는 지점(0.3%)' 으로 잡는다.
     max_funding_cost_percent: float = 0.3
 
+    # ★ 호가 간격 안전장치: 진입 직전 '지금 왕복 호가' 가 이 % 를 넘으면 들어가지 않는다 (0 = 보지 않음)
+    #   왕복 호가 = 맨 앞 호가로 본 진입 김프 − 청산 김프 (업비트 코인 + 바이비트 + USDT/KRW 호가 간격의 합).
+    #   이게 목표 순이익보다 크면 그 거래는 애초에 이익이 날 수 없다.
+    #   왜 필요한가: 코인 가격이 호가 단위 경계(10·100·1,000원)를 넘으면 한 칸이 갑자기 10배 넓어진다.
+    #   IRYS 2026-10-24: 34원(한 칸 0.03%) 때 골랐는데 100원을 넘자 한 칸 1원(≈1%) → 0.2% 목표로 다섯 번
+    #   들어가 −4.05 USDT. 스크리너는 그때그때 가격을 모르므로 엔진이 봐야 한다.
+    entry_max_spread_percent: float = 0.8
+
     # ★ 한 번만 돌리기 (첫 실거래 점검용)
     # true 면 포지션을 **딱 하나만** 잡고, 그 포지션이 청산되면 봇이 스스로 종료한다.
     # 처음 실제 주문을 내볼 때 "한 바퀴가 제대로 도는지"만 확인하려고 쓴다.
@@ -573,6 +581,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
                                       if os.getenv("ENTRY_MIN_FUNDING_8H_PERCENT") is not None
                                       else d.entry_min_funding_8h_percent),
         max_funding_cost_percent=_env_float("MAX_FUNDING_COST_PERCENT", d.max_funding_cost_percent),
+        entry_max_spread_percent=_env_float("ENTRY_MAX_SPREAD_PERCENT", d.entry_max_spread_percent),
         one_shot=_env_bool("ONE_SHOT", d.one_shot),
         one_shot_max_hours=_env_float("ONE_SHOT_MAX_HOURS", d.one_shot_max_hours),
         transfer_fee_upbit_to_bybit_usdt=_env_float("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT",
@@ -712,6 +721,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("REENTRY_COOLDOWN_SEC 는 0 이상이어야 합니다")
     if s.max_slippage_percent < 0:
         errors.append("MAX_SLIPPAGE_PERCENT 는 0 이상이어야 합니다")
+    if s.entry_max_spread_percent < 0:
+        errors.append("ENTRY_MAX_SPREAD_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
     if s.scan_interval_sec < 1:
         errors.append("SCAN_INTERVAL_SEC 는 1 이상이어야 합니다 (거래소 요청 제한)")
     if s.orderbook_depth < 5:

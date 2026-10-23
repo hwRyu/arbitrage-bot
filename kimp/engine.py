@@ -661,6 +661,8 @@ class Engine:
         for coin, quote in quotes.items():
             if coin in open_positions or coin in busy or self._clock() < self._reentry_allowed_at.get(coin, 0.0):
                 continue
+            if coin not in self.s.coins:
+                continue  # 이어받은 포지션 때문에 관리만 하던 코인 — 청산됐으면 새로 들어가지 않는다
             threshold = self.s.params_for(coin).entry_premium_threshold_percent
             # 1차 걸러내기: 맨 앞 호가 한 칸만 보고 판단한다 (수량만큼 소진하는 계산은 비싸다).
             # 맨 앞 호가 김프는 실제 체결 김프보다 **항상 유리하므로**, 여기서 떨어지면
@@ -673,6 +675,18 @@ class Engine:
             if top > threshold:
                 telemetry.decision(session, coin, "near", top, threshold, now=now_utc)
                 continue  # 맨 앞 호가로도 조건이 안 되면 더 볼 필요 없음
+            # 호가 간격 안전장치: 지금 왕복 호가가 한도를 넘으면 (호가 단위가 넓어진 코인) 들어가지 않는다.
+            # 왕복 호가 > 목표면 수학적으로 이익이 날 수 없다 — 가격이 호가 단위 경계를 넘은 코인을 걸러낸다
+            exit_top = quote.exit_premium_top
+            spread = (top - exit_top) if exit_top is not None else None
+            limit = self.s.entry_max_spread_percent
+            if limit and spread is not None and spread > limit:
+                self._log_throttled(
+                    f"spread-{coin}", logging.INFO,
+                    f"[진입 보류] {coin} | 왕복 호가 {spread:.2f}% > 한도 {limit:.2f}% | 호가 단위가 넓어 목표 "
+                    f"{self.s.params_for(coin).target_net_profit_percent:.2f}% 가 안 나옵니다", cooldown_sec=600.0)
+                telemetry.decision(session, coin, "spread_block", top, threshold, premium_depth=spread, now=now_utc)
+                continue
             # 펀딩비 안전장치: 숏이 돈을 내는 쪽이 심하면 들어가지 않는다 (김프 조건을 통과한 코인만 확인)
             min_funding = self.s.entry_min_funding_8h_percent
             funding = None

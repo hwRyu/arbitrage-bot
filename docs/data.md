@@ -232,6 +232,7 @@ FROM premium_snapshots GROUP BY coin;
 | `stage` | 뜻 |
 |---|---|
 | `near` | 기준 근처까지 왔지만 못 넘음 — **아깝게 놓친 순간** |
+| `spread_block` | 김프는 됐는데 **지금 왕복 호가**가 `ENTRY_MAX_SPREAD_PERCENT` 를 넘어 보류 (`premium_depth` = 왕복 호가 %). 가격이 호가 단위 경계를 넘은 코인 |
 | `funding_block` | 김프는 됐는데 펀딩비가 불리해서 보류 |
 | `size_reject` | 주문 크기가 거래소 최소 미만 |
 | `depth_reject` | 수량만큼 호가가 없음 |

@@ -255,6 +255,40 @@ class EngineTest(unittest.TestCase):
         self.engine.step()
         self.assertEqual(len(self._positions()), 1)                     # 대기 중이라 다음 스캔에도 없음
 
+    def test_wide_spread_blocks_entry(self):
+        """김프는 기준을 넘었지만 지금 왕복 호가가 한도보다 넓으면 들어가지 않는다 (IRYS 100원 넘은 뒤 상황)"""
+        from kimp.db import Decision
+        from sqlalchemy import select
+        from kimp.premium import OrderBook, Quote
+        usdt, by = 1400.0, 1.0
+        mid = by * usdt * (1 - 0.01)                     # 김프 -1%
+        wide = Quote(coin="XRP",                           # 업비트 한 칸이 1% (매수 99.5 / 매도 100.5)
+                     upbit=OrderBook(bids=[(mid * 0.995, 1e9)], asks=[(mid * 1.005, 1e9)]),
+                     bybit=OrderBook(bids=[(by, 1e9)], asks=[(by * 1.0001, 1e9)]),
+                     usdt=OrderBook(bids=[(usdt, 1e9)], asks=[(usdt * 1.0001, 1e9)]))
+        engine, sf, _ = make_engine(make_settings(entry_max_spread_percent=0.8), self.market)
+        self.market.quotes = {"XRP": wide}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).count(), 0)
+            d = s.scalars(select(Decision)).one()
+        self.assertEqual(d.stage, "spread_block")
+        self.assertGreater(d.premium_depth, 0.8)
+        # 한도를 끄면(0) 들어간다
+        engine2, sf2, _ = make_engine(make_settings(entry_max_spread_percent=0.0), self.market)
+        engine2.step()
+        with sf2() as s:
+            self.assertEqual(s.query(Position).count(), 1)
+
+    def test_coin_not_in_settings_is_not_entered_after_adoption(self):
+        """설정 COINS 에 없는 코인은 (이어받은 포지션 때문에 목록에 있어도) 새로 들어가지 않는다"""
+        engine, sf, _ = make_engine(make_settings(coins=["XRP"]), self.market)
+        engine.coins.append("DOGE")                        # startup 이 '열린 포지션 때문에' 덧붙이는 경우
+        self.market.quotes = {"XRP": make_quote(-0.2), "DOGE": make_quote(-2.0, coin="DOGE")}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(s.query(Position).count(), 0)
+
     def test_no_entry_above_threshold(self):
         """김프 -0.2% 는 기준 -0.5% 보다 높으니 진입 안 함"""
         self.market.quotes = {"XRP": make_quote(-0.2)}

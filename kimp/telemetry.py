@@ -160,6 +160,7 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
     진입 판단 한 줄. stage 는 어디까지 갔다가 어떻게 됐는지:
 
         near           맨 앞 호가 김프가 기준 근처까지 왔지만 못 넘음 (아깝게 놓친 순간)
+        spread_block   김프는 됐는데 지금 왕복 호가가 ENTRY_MAX_SPREAD_PERCENT 를 넘어 보류 (premium_depth = 왕복 호가)
         funding_block  김프는 됐는데 펀딩비가 너무 불리해서 보류
         size_reject    주문 크기가 거래소 최소 미만
         depth_reject   수량만큼 호가를 소진하니 다 못 채움 (호가 부족)
