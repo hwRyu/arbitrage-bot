@@ -250,7 +250,7 @@ class LiveExecutor:
                 return got
             if time.monotonic() > deadline:
                 return self._cancel_and_get(ex, oid, symbol)
-            self._sleep(0.5)
+            self._sleep(0.25)   # 시장가는 보통 첫 조회에 끝난다. 대기는 짧게
 
     def _cancel_and_get(self, ex, oid, symbol: str) -> dict:
         """

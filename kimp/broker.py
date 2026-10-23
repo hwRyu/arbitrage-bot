@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -310,26 +311,78 @@ class HedgeBroker:
         결과를 모르면(OrderUnknown) SENT 그대로 둔다 → 다음 스캔(sync)에서 추적번호로 조회해서 채운다.
         expected_price 는 분석용: 판단 때 호가 소진 계산으로 예상한 평균가 (실제 avg_price 와 비교하려고 남긴다).
         """
-        exchange, cur = LEG_INFO[side]
-        cid = new_client_id()
-        row = Fill(position_id=pos.id, exchange=exchange, side=side, qty=0.0, avg_price=0.0, cost=0.0, fee=0.0,
-                   fee_currency=cur, slippage_percent=0.0, client_id=cid, state=FillState.SENT,
-                   expected_price=expected_price, created_at=self._now())
-        session.add(row)
-        session.commit()
+        row = self._sent_row(session, pos, side, expected_price)
         try:
-            f = call(cid)
+            f = call(row.client_id)
         except OrderUnknown:
             raise
         except OrderFailed:
-            row.state = FillState.VOID
-            row.done_at = self._now()
-            session.commit()
+            self._settle(session, row, failed=True)
             raise
-        self._fill_row(row, f)
+        self._settle(session, row, f)
+        return f
+
+    def _sent_row(self, session: Session, pos: Position, side: str, expected_price: Optional[float]) -> Fill:
+        """주문을 내기 전에 SENT 기록을 먼저 적는다 (추적번호 포함). 메인 스레드에서만 부른다"""
+        exchange, cur = LEG_INFO[side]
+        row = Fill(position_id=pos.id, exchange=exchange, side=side, qty=0.0, avg_price=0.0, cost=0.0, fee=0.0,
+                   fee_currency=cur, slippage_percent=0.0, client_id=new_client_id(), state=FillState.SENT,
+                   expected_price=expected_price, created_at=self._now())
+        session.add(row)
+        session.commit()
+        return row
+
+    def _settle(self, session: Session, row: Fill, f: Optional[LegFill] = None, failed: bool = False) -> None:
+        """SENT 기록에 결과를 채운다: 체결값이면 DONE, 안 들어갔으면 VOID. 메인 스레드에서만 부른다"""
+        if failed:
+            row.state = FillState.VOID
+        else:
+            self._fill_row(row, f)
         row.done_at = self._now()
         session.commit()
-        return f
+
+    def _legs_parallel(self, session: Session, pos: Position,
+                       specs: List[Tuple[str, Callable[[str], LegFill], Optional[float]]]) -> Dict[str, LegFill]:
+        """
+        서로 독립인 주문 여러 개를 **동시에** 낸다 (실거래). 페이퍼는 장부(DB)를 쓰므로 순차로
+
+        왜 동시인가: 청산의 '코인 매도' 와 '숏 닫기', 진입의 '숏 열기' 와 'USDT 매도' 는 서로 기다릴 이유가
+        없다. 순차로 내면 0.5~1초 사이 가격이 움직여 한쪽만 먼저 체결된 창이 생긴다 (IRYS #3: −1.6%).
+        DB 는 스레드에서 안 쓴다 — SENT 기록은 여기서 먼저, 스레드는 거래소 호출만, 결과 기록은 다시 여기서.
+        각 호출은 서로 다른 거래소 객체를 쓴다 (업비트 ∥ 바이비트) — 같은 ccxt 객체를 두 스레드가 쓰면 안 된다.
+
+        Args:
+            specs: [(단계 이름, 추적번호 → 체결값 함수, 예상가)]
+        Returns:
+            {단계 이름: 체결값} — 실패한 단계는 빠진다
+        Raises:
+            OrderUnknown: 어느 하나라도 결과를 모름 (그 기록은 SENT 로 남고, 나머지 결과는 이미 적혔다)
+            OrderFailed: 어느 하나가 안 들어감 (그 기록은 VOID, 나머지 결과는 이미 적혔다)
+        """
+        if self.ex.is_paper or len(specs) <= 1:
+            return {side: self._leg(session, pos, side, call, expected_price=exp) for side, call, exp in specs}
+        rows = [(side, self._sent_row(session, pos, side, exp), call) for side, call, exp in specs]
+        with ThreadPoolExecutor(max_workers=len(rows)) as pool:
+            futures = [(side, row, pool.submit(call, row.client_id)) for side, row, call in rows]
+            results: Dict[str, LegFill] = {}
+            unknown: Optional[Exception] = None
+            failed: Optional[Exception] = None
+            for side, row, fut in futures:
+                try:
+                    f = fut.result()
+                except OrderUnknown as exc:
+                    unknown = exc            # SENT 그대로 → 다음 스캔에 추적번호로 조회
+                except OrderFailed as exc:
+                    failed = exc
+                    self._settle(session, row, failed=True)
+                else:
+                    results[side] = f
+                    self._settle(session, row, f)
+        if unknown is not None:
+            raise unknown
+        if failed is not None:
+            raise failed
+        return results
 
     @staticmethod
     def _fill_row(row: Fill, f: LegFill) -> None:
@@ -436,12 +489,15 @@ class HedgeBroker:
 
         coin, ex = quote.coin, self.ex
         try:
-            short = self._leg(session, pos, "open_short",  # 1)
-                              lambda cid: ex.open_short(session, quote, coin, bybit_qty, client_id=cid),
-                              expected_price=plan.bybit.avg_price)
-            usdt = self._leg(session, pos, "sell_usdt",  # 2)
-                             lambda cid: ex.sell_usdt(session, quote, short.cost, client_id=cid),
-                             expected_price=plan.usdt.avg_price)
+            # 1)+2) 숏 열기와 USDT 매도는 서로 독립 → 동시에 낸다 (실거래). USDT 는 계획한 숏 금액만큼 팔고,
+            #       실제 숏 체결이 그와 다르면 4) 크기 맞추기가 잡는다 (1% 안쪽 차이는 그대로 둔다)
+            fills = self._legs_parallel(session, pos, [
+                ("open_short", lambda cid: ex.open_short(session, quote, coin, bybit_qty, client_id=cid),
+                 plan.bybit.avg_price),
+                ("sell_usdt", lambda cid: ex.sell_usdt(session, quote, plan.usdt_sold, client_id=cid),
+                 plan.usdt.avg_price),
+            ])
+            usdt = fills["sell_usdt"]
             krw_for_coin = (usdt.cost - usdt.fee) / (1 + rate)  # 3)
             self._leg(session, pos, "buy",
                       lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid),
@@ -720,17 +776,6 @@ class HedgeBroker:
                 left = min(left, self.balance(session, coin_key(pos.coin)))
                 coin_done = left <= pos.upbit_qty * 1e-9 or (coin_bid is not None and
                                                               left * coin_bid < self.ex.min_order_krw(pos.coin))
-                if not coin_done:  # 1)
-                    f = self._leg(session, pos, "sell",
-                                  lambda cid: self.ex.sell_coin(session, quote, pos.coin, left, client_id=cid),
-                                  expected_price=exp_sell)
-                    coin_done = f.qty <= 0
-                sums = self._sums(session, pos)
-                krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +
-                                                                           s("buy_usdt", sums).fee)
-                if krw_left >= self.ex.min_order_krw("USDT"):  # 2)
-                    self._leg(session, pos, "buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
-                        session, quote, krw_left / (1 + rate), client_id=cid), expected_price=exp_usdt)
                 short_left = pos.bybit_qty - s("close_short", sums).qty
                 if not liquidated and short_left > pos.bybit_qty * 1e-9 and self.ex.short_gone(session, pos.coin):
                     # 닫으려는데 거래소에 숏이 없다 (청산 도중 강제청산됐거나 누가 손으로 닫음).
@@ -740,27 +785,44 @@ class HedgeBroker:
                     session.commit()
                     logger.critical("[숏 사라짐] #%d %s 청산 중 거래소에 숏이 없습니다 (남은 %g개) → 강제청산으로 보고 "
                                     "증거금 손실로 기록해 마무리합니다", pos.id, pos.coin, short_left)
-                if liquidated:  # 3) 강제청산됨 (거래소가 이미 정리) — 남은 양만 기록한다
-                    if not s("liquidated", sums).qty and short_left > pos.bybit_qty * 1e-9:
-                        self.ex.mark_liquidated(session, pos.coin, short_left)
-                        row = Fill(position_id=pos.id, exchange="bybit", side="liquidated", fee_currency="USDT",
-                                   slippage_percent=0.0, client_id="liquidated", qty=0, avg_price=0, cost=0, fee=0)
-                        self._fill_row(row, LegFill(short_left, pos.liquidation_price,
-                                                    short_left * pos.liquidation_price, 0.0, "liquidated"))
-                        session.add(row)
-                        session.commit()
-                    short_done = True
-                else:  # 3) 숏 닫기 (남은 개수만)
-                    short_done = short_left <= pos.bybit_qty * 1e-9
-                    if not short_done:
-                        f = self._leg(session, pos, "close_short", lambda cid: self.ex.close_short(
-                            session, quote, pos.coin, short_left, pos.entry_bybit_price_usdt,
-                            pos.bybit_margin_usdt * short_left / pos.bybit_qty, client_id=cid),
-                            expected_price=exp_short)
-                        short_done = f.qty >= short_left * (1 - 1e-9) or f.qty <= 0
+                short_done = liquidated or short_left <= pos.bybit_qty * 1e-9
+
+                # 1)+3) 코인 매도와 숏 닫기는 서로 독립 → 동시에 낸다 (실거래). 두 다리가 같은 순간에 체결되어
+                #       급변 중 한쪽만 먼저 체결된 창이 줄어든다. 2) USDT 매수만 코인을 판 뒤에.
+                specs = []
+                if not coin_done:
+                    specs.append(("sell", lambda cid, q=left: self.ex.sell_coin(session, quote, pos.coin, q, client_id=cid),
+                                  exp_sell))
+                if not short_done:
+                    specs.append(("close_short", lambda cid, q=short_left: self.ex.close_short(
+                        session, quote, pos.coin, q, pos.entry_bybit_price_usdt,
+                        pos.bybit_margin_usdt * q / pos.bybit_qty, client_id=cid), exp_short))
+                fills = self._legs_parallel(session, pos, specs) if specs else {}
+                if "sell" in fills:
+                    coin_done = fills["sell"].qty <= 0
+                if "close_short" in fills:
+                    f = fills["close_short"]
+                    short_done = f.qty >= short_left * (1 - 1e-9) or f.qty <= 0
+
+                if liquidated and not s("liquidated", sums).qty and short_left > pos.bybit_qty * 1e-9:
+                    # 강제청산됨 (거래소가 이미 정리) — 남은 양만 기록한다
+                    self.ex.mark_liquidated(session, pos.coin, short_left)
+                    row = Fill(position_id=pos.id, exchange="bybit", side="liquidated", fee_currency="USDT",
+                               slippage_percent=0.0, client_id="liquidated", qty=0, avg_price=0, cost=0, fee=0)
+                    self._fill_row(row, LegFill(short_left, pos.liquidation_price,
+                                                short_left * pos.liquidation_price, 0.0, "liquidated"))
+                    session.add(row)
+                    session.commit()
+
                 sums = self._sums(session, pos)
                 krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +
                                                                            s("buy_usdt", sums).fee)
+                if krw_left >= self.ex.min_order_krw("USDT"):  # 2)
+                    self._leg(session, pos, "buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
+                        session, quote, krw_left / (1 + rate), client_id=cid), expected_price=exp_usdt)
+                    sums = self._sums(session, pos)
+                    krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +
+                                                                               s("buy_usdt", sums).fee)
                 if coin_done and short_done and krw_left < self.ex.min_order_krw("USDT"):
                     done = True
                     break

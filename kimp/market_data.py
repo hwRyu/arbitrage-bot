@@ -15,7 +15,9 @@ old 봇과 달라진 점
 from __future__ import annotations
 
 import logging
+import queue
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -53,6 +55,9 @@ def _log_recovered(key: str, what: str) -> None:
 
 # 업비트 USDT/KRW: 김프 계산 기준이자, 진입/청산 때 실제로 USDT 를 사고파는 마켓
 USDT_KRW_SYMBOL = "USDT/KRW"
+
+# 바이비트 호가를 코인별로 동시에 받을 때 쓰는 공개 연결 수 (ccxt 객체 하나를 두 스레드가 같이 쓰면 안 된다)
+BYBIT_PARALLEL = 4
 
 
 def upbit_symbol(coin: str) -> str:
@@ -113,6 +118,12 @@ class MarketData:
         self.upbit.load_markets()
         self.bybit.load_markets()
         logger.info("거래소 마켓 정보 받기 완료")
+        # 호가 동시 수신용 바이비트 공개 연결 묶음 (마켓 정보는 위에서 받은 것을 그대로 꽂아 다시 안 받는다)
+        self._bybit_pool: "queue.Queue" = queue.Queue()
+        for _ in range(BYBIT_PARALLEL):
+            ex = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+            ex.set_markets(self.bybit.markets)
+            self._bybit_pool.put(ex)
 
     # ------------------------------------------------------------------
     # 마켓 정보
@@ -184,13 +195,40 @@ class MarketData:
             업비트 USDT/KRW 호가가 없으면 김프를 계산할 수 없어서 이번 스캔은 비어 있는 결과를 돌려준다.
         """
         symbols = [upbit_symbol(c) for c in coins] + [USDT_KRW_SYMBOL]
-        try:
-            upbit_books = self.upbit.fetch_order_books(symbols, self.depth)
-        except Exception as exc:  # 네트워크 오류, 요청 제한, 거래소 점검 등
-            # 이게 안 되면 이번 스캔은 통째로 쉰다 (보유 포지션 관리도 못 한다) — 길어지면 5분마다 알림
-            _log_repeat("upbit-books", logging.ERROR,
-                        f"업비트 호가 조회 실패: {exc} (이 동안은 진입·청산·강제청산 확인을 못 합니다)")
-            return {}
+
+        # 업비트 묶음 조회와 바이비트 코인별 조회를 **동시에** 보낸다. 순차로 받으면 두 스냅샷이
+        # 0.3~0.5초 어긋나고, 급변 때 그 사이 가격 차이가 '김프' 로 보인다 (2026-10-23 IRYS #3).
+        # ccxt 객체는 스레드마다 따로 (업비트 1개, 바이비트는 pool 에서 하나씩 꺼내 쓰고 되돌린다).
+        def get_upbit():
+            books = self.upbit.fetch_order_books(symbols, self.depth)
+            return books, time.monotonic()
+
+        def get_bybit(coin):
+            ex = self._bybit_pool.get()
+            try:
+                return self._to_orderbook(ex.fetch_order_book(bybit_symbol(coin), self.depth)), time.monotonic()
+            finally:
+                self._bybit_pool.put(ex)
+
+        with ThreadPoolExecutor(max_workers=1 + min(len(coins), BYBIT_PARALLEL) or 1) as pool:
+            fut_up = pool.submit(get_upbit)
+            fut_by = {coin: pool.submit(get_bybit, coin) for coin in coins}
+            try:
+                upbit_books, t_up = fut_up.result()
+            except Exception as exc:  # 네트워크 오류, 요청 제한, 거래소 점검 등
+                # 이게 안 되면 이번 스캔은 통째로 쉰다 (보유 포지션 관리도 못 한다) — 길어지면 5분마다 알림
+                _log_repeat("upbit-books", logging.ERROR,
+                            f"업비트 호가 조회 실패: {exc} (이 동안은 진입·청산·강제청산 확인을 못 합니다)")
+                for f in fut_by.values():
+                    f.cancel()
+                return {}
+            bybit_books: Dict[str, tuple] = {}
+            for coin, f in fut_by.items():
+                try:
+                    bybit_books[coin] = f.result()
+                except Exception as exc:
+                    # 이 코인만 이번 스캔에서 빠진다 (들고 있으면 그동안 평가·청산을 못 한다)
+                    _log_repeat(f"bybit-{coin}", logging.WARNING, f"{coin} 바이비트 호가 조회 실패: {exc}")
         _log_recovered("upbit-books", "업비트 호가 조회")
 
         usdt_raw = upbit_books.get(USDT_KRW_SYMBOL)
@@ -206,22 +244,19 @@ class MarketData:
             if not up_raw:
                 _log_repeat(f"upbit-{coin}", logging.WARNING, f"{coin} 업비트 호가 없음")
                 continue
-            try:
-                by_raw = self.bybit.fetch_order_book(bybit_symbol(coin), self.depth)
-            except Exception as exc:
-                # 이 코인만 이번 스캔에서 빠진다 (들고 있으면 그동안 평가·청산을 못 한다)
-                _log_repeat(f"bybit-{coin}", logging.WARNING, f"{coin} 바이비트 호가 조회 실패: {exc}")
+            if coin not in bybit_books:
                 continue
             _log_recovered(f"bybit-{coin}", f"{coin} 바이비트 호가 조회")
 
             upbit_book = self._to_orderbook(up_raw)
-            bybit_book = self._to_orderbook(by_raw)
+            bybit_book, t_by = bybit_books[coin]
             if upbit_book.mid is None or bybit_book.mid is None:
                 _log_repeat(f"empty-{coin}", logging.WARNING, f"{coin} 호가가 비어 있어서 건너뜀")
                 continue
             _log_recovered(f"upbit-{coin}", f"{coin} 업비트 호가")
             _log_recovered(f"empty-{coin}", f"{coin} 호가")
-            quotes[coin] = Quote(coin=coin, upbit=upbit_book, bybit=bybit_book, usdt=usdt_book, fx_krw=fx_krw)
+            quotes[coin] = Quote(coin=coin, upbit=upbit_book, bybit=bybit_book, usdt=usdt_book, fx_krw=fx_krw,
+                                 skew_ms=int(abs(t_by - t_up) * 1000))
         return quotes
 
     def fetch_funding(self, coin: str) -> Optional[FundingInfo]:

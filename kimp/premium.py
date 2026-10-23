@@ -299,6 +299,7 @@ class Quote:
         usdt: 업비트 USDT/KRW 호가창 (원) ← 김프 계산과 업비트 매매에 쓰는 기준
         fx_krw: 달러 환율 (표시용: 사이트식 김프, 테더 프리미엄). 없을 수도 있음
         bybit_high: 강제청산 확인용 가격 (시뮬레이션에서 1분봉 고가). 평소엔 None → 매도 호가 사용
+        skew_ms: 업비트 호가와 바이비트 호가를 받은 시각 차이 (ms, 분석용). 클수록 '시차 김프' 가 섞일 수 있다
 
     금액 헷징이란?
         바이비트 숏 금액과 같은 개수의 USDT 를 업비트에서 팔아 그 원화로 코인을 산다.
@@ -312,6 +313,7 @@ class Quote:
     usdt: OrderBook
     fx_krw: Optional[float] = None
     bybit_high: Optional[float] = None
+    skew_ms: Optional[int] = None
 
     # ---------------- 화면 표시용 ----------------
     @property

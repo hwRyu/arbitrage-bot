@@ -206,8 +206,8 @@ def position_snapshot(session: Session, pos: Position, valuation, quote, now: da
 # ----------------------------------------------------------------------
 def engine_snapshot(session: Session, upbit_usdt: float, bybit_usdt: float, open_positions: int,
                     scan_ms: float, quote_ms: float, usdt_krw: Optional[float], fx_krw: Optional[float],
-                    now: datetime) -> None:
+                    now: datetime, quote_skew_ms: Optional[int] = None) -> None:
     """양쪽 자본(USDT 환산)과 스캔 소요 시간 한 줄. commit 은 부르는 쪽"""
     session.add(EngineSnapshot(upbit_usdt=upbit_usdt, bybit_usdt=bybit_usdt, open_positions=open_positions,
                                scan_ms=scan_ms, quote_ms=quote_ms, usdt_krw=usdt_krw, fx_krw=fx_krw,
-                               created_at=now))
+                               quote_skew_ms=quote_skew_ms, created_at=now))

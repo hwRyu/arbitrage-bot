@@ -300,6 +300,7 @@ class EngineSnapshot(Base):
     open_positions: Mapped[int] = mapped_column(Integer)
     scan_ms: Mapped[float] = mapped_column(Float)  # 이번 스캔에 걸린 시간 (현황 로그 시점까지)
     quote_ms: Mapped[float] = mapped_column(Float)  # 그중 시세 조회
+    quote_skew_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 업비트·바이비트 호가 수신 시각 차이 (코인 중 최대)
     usdt_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     fx_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)

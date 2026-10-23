@@ -271,6 +271,8 @@ FROM positions p WHERE p.status = 'CLOSED' ORDER BY p.id;
 ### 1-10. `engine_snapshots` — 자본 곡선과 스캔 소요
 1분에 1줄. `upbit_usdt + bybit_usdt` 가 **포지션과 무관한 총자본 곡선**이다 (손익 기록과 대조할 때 쓴다).
 `scan_ms` 가 평소(1~3초)보다 길게 이어지는 구간 = 거래소 응답이 느렸거나 통신 장애.
+`quote_skew_ms` = 업비트 호가와 바이비트 호가를 받은 시각 차이(코인 중 최대). 동시에 받아서 평소 수십 ms 이고,
+이게 크면 그 스캔의 김프에 '시차' 가 섞였을 수 있다.
 
 ### 1-11. `runs` — 실행 기록
 켤 때 `mode` · `coins` · `git_commit` · `settings_json`(비밀값 뺀 설정 전부) 을 적고, 끌 때 `ended_at` · `stop_reason`

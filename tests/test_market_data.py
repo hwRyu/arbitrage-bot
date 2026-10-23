@@ -7,10 +7,88 @@
 실행: python -m unittest discover -s tests -v
 """
 import logging
+import queue
+import threading
+import time
 import unittest
 from unittest import mock
 
 from kimp import market_data as md
+from kimp.market_data import MarketData
+
+
+class SlowUpbit:
+    """호가 묶음 조회에 0.2초 걸리는 가짜 업비트"""
+
+    def __init__(self, delay=0.2):
+        self.delay = delay
+
+    def fetch_order_books(self, symbols, depth):
+        time.sleep(self.delay)
+        return {s: {"bids": [[1400.0, 1e9]] if s == "USDT/KRW" else [[1386.0, 1e9]],
+                    "asks": [[1401.0, 1e9]] if s == "USDT/KRW" else [[1387.0, 1e9]], "timestamp": 1}
+                for s in symbols}
+
+
+class SlowBybit:
+    """코인 호가 하나에 0.2초 걸리는 가짜 바이비트. 같은 객체를 두 스레드가 동시에 쓰면 터뜨린다"""
+
+    def __init__(self, delay=0.2):
+        self.delay = delay
+        self._busy = threading.Lock()
+        self.calls = 0
+
+    def fetch_order_book(self, symbol, depth):
+        if not self._busy.acquire(blocking=False):
+            raise AssertionError("같은 ccxt 객체를 두 스레드가 동시에 썼다")
+        try:
+            self.calls += 1
+            time.sleep(self.delay)
+            return {"bids": [[1.0, 1e9]], "asks": [[1.0001, 1e9]], "timestamp": 1}
+        finally:
+            self._busy.release()
+
+
+def fake_market(coins_parallel=3):
+    """네트워크 없이 MarketData 를 만든다 (load_markets 를 건너뛰고 가짜 거래소를 꽂는다)"""
+    m = MarketData.__new__(MarketData)
+    m.depth = 5
+    m.upbit = SlowUpbit()
+    m.bybit = SlowBybit()
+    m._bybit_pool = queue.Queue()
+    for _ in range(coins_parallel):
+        m._bybit_pool.put(SlowBybit())
+    return m
+
+
+class ParallelQuotesTest(unittest.TestCase):
+    def test_upbit_and_bybit_are_fetched_concurrently(self):
+        """업비트 1번(0.2초) + 바이비트 3번(0.2초씩) 을 순차로 하면 0.8초, 동시에 하면 0.2초 남짓"""
+        m = fake_market()
+        t0 = time.monotonic()
+        quotes = m.fetch_quotes(["AAA", "BBB", "CCC"])
+        took = time.monotonic() - t0
+        self.assertEqual(set(quotes), {"AAA", "BBB", "CCC"})
+        self.assertLess(took, 0.5, f"{took:.2f}초 — 동시에 받지 않았다")
+        for q in quotes.values():
+            self.assertIsNotNone(q.skew_ms)
+            self.assertLess(q.skew_ms, 300)
+            self.assertAlmostEqual(q.mid_premium, -1.0, places=2)
+
+    def test_one_bybit_failure_drops_only_that_coin(self):
+        m = fake_market()
+        bad = SlowBybit()
+        bad.fetch_order_book = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("바이비트 안 됨"))
+        # 풀의 첫 객체를 고장 낸다 → 어느 코인 하나가 그걸 집어 간다
+        first = m._bybit_pool.get()
+        m._bybit_pool.put(bad)
+        quotes = m.fetch_quotes(["AAA", "BBB", "CCC"])
+        self.assertEqual(len(quotes), 2)
+
+    def test_upbit_failure_returns_nothing(self):
+        m = fake_market()
+        m.upbit.fetch_order_books = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("업비트 안 됨"))
+        self.assertEqual(m.fetch_quotes(["AAA"]), {})
 
 
 class RepeatLogTest(unittest.TestCase):

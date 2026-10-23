@@ -12,7 +12,7 @@ from datetime import timedelta
 
 from kimp.broker import EntryRejected, HedgeBroker, PaperBroker
 from kimp.config import FeeSettings, Settings
-from kimp.db import ExitReason, Position, PositionStatus, Transfer, TransferStatus, make_session_factory, utcnow
+from kimp.db import ExitReason, Fill, Position, PositionStatus, Transfer, TransferStatus, make_session_factory, utcnow
 from kimp.executor import BYBIT_USDT, UPBIT_USDT, OrderFailed
 from kimp.live_executor import DryRunExecutor, LiveExecutor
 from kimp.premium import OrderBook, Quote
@@ -336,15 +336,19 @@ class UnwindTest(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("ERROR", why)
 
-    def test_bybit_reject_means_nothing_happened(self):
+    def test_bybit_reject_unwinds_usdt_sold_in_parallel(self):
+        """숏 거절 → 동시에 나간 USDT 매도만 되돌린다 (수수료 왕복만 손해). 코인 매수는 안 간다
+        (전에는 숏 먼저·순차라 '아무 일도 없음' 이었는데, 2026-10-23 다리 겹치기로 바뀜)"""
         prices, up, by, broker, sf = make_live()
         by.fail.add("open_short")
         with sf() as s:
             with self.assertRaises(EntryRejected):
                 broker.open_hedge(s, prices.quote(), 50.0)
             self.assertEqual(s.query(Position).one().status, PositionStatus.ABORTED)
-            self.assertEqual(up.bal["USDT"], 500.0)
-            self.assertEqual(up.calls, [])
+            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.3)   # 수수료 2번만큼만
+            self.assertEqual(up.calls.count("sell USDT/KRW"), 1)
+            self.assertEqual(up.calls.count("buy USDT/KRW"), 1)
+            self.assertNotIn("buy XRP/KRW", up.calls)
 
     def test_consecutive_failures_block(self):
         prices, up, by, broker, sf = make_live(fail_safety=2)
@@ -733,6 +737,92 @@ class VanishedShortTest(unittest.TestCase):
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
             self.assertEqual(pos.status, PositionStatus.OPEN)
             self.assertEqual(by.short, 50.0)
+
+
+class ParallelLegsTest(unittest.TestCase):
+    """청산(코인 매도 ∥ 숏 닫기)·진입(숏 열기 ∥ USDT 매도) 을 동시에 낼 때 한쪽만 실패·결과 모름"""
+
+    def test_close_legs_run_at_the_same_time(self):
+        """코인 매도와 숏 닫기가 겹친다 (각 0.3초면 순차 0.6초, 동시 0.3초 남짓)"""
+        import time
+        prices, up, by, broker, sf = make_live()
+        slow_up, slow_by = up.create_order, by.create_order
+        up.create_order = lambda *a, **k: (time.sleep(0.3), slow_up(*a, **k))[1]
+        by.create_order = lambda *a, **k: (time.sleep(0.3), slow_by(*a, **k))[1]
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            val = broker.value_exit(pos, prices.quote())
+            t0 = time.monotonic()
+            pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+            took = time.monotonic() - t0
+            self.assertIsNotNone(pnl)
+            self.assertEqual(pos.status, PositionStatus.CLOSED)
+            self.assertLess(took, 0.95, f"{took:.2f}초 — 코인 매도·숏 닫기·USDT 매수가 전부 순차였다")
+
+    def test_close_coin_sell_fails_short_close_succeeds(self):
+        """동시에 냈는데 코인 매도만 거절 → 숏은 닫힌 채 CLOSING → 다음 스캔에 코인만 다시 (숏 주문 중복 없음)"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            up.fail.add("sell XRP/KRW")
+            val = broker.value_exit(pos, prices.quote())
+            self.assertIsNone(broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT))
+            self.assertEqual(pos.status, PositionStatus.CLOSING)
+            self.assertEqual(by.short, 0.0)                       # 숏은 이미 닫힘
+            self.assertGreater(up.bal["XRP"], 0)                  # 코인은 아직
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            self.assertEqual(pos.status, PositionStatus.CLOSED)
+            self.assertAlmostEqual(up.bal["XRP"], 0.0, places=6)
+            self.assertEqual(by.calls.count("close_short"), 1)    # 숏 닫기는 한 번만
+            self.assertEqual(up.calls.count("sell XRP/KRW"), 2)   # 코인 매도만 다시
+
+    def test_close_short_unknown_coin_sold(self):
+        """동시에 냈는데 숏 닫기 결과를 모름 → 코인 매도는 기록되고 SENT 는 남음 → 조회되면 CLOSED, 중복 없음"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            by.lost.add("close_short")
+            by.lookup_down = True
+            val = broker.value_exit(pos, prices.quote())
+            self.assertIsNone(broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT))
+            self.assertEqual(pos.status, PositionStatus.CLOSING)
+            self.assertFalse(broker.entries_allowed(s)[0])
+            sides = {(f.side, f.state) for f in s.query(Fill).filter(Fill.position_id == pos.id)}
+            self.assertIn(("sell", "DONE"), sides)
+            self.assertIn(("close_short", "SENT"), sides)
+            by.lookup_down = False
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            self.assertEqual(pos.status, PositionStatus.CLOSED)
+            self.assertEqual(by.calls.count("close_short"), 1)
+            self.assertEqual(by.short, 0.0)
+
+    def test_entry_legs_run_at_the_same_time_and_short_reject_unwinds_usdt(self):
+        """숏 열기 ∥ USDT 매도. 숏이 거절되면 이미 판 USDT 를 되사서 ABORTED (중복 없음)"""
+        prices, up, by, broker, sf = make_live()
+        by.fail.add("open_short")
+        with sf() as s:
+            with self.assertRaises(EntryRejected):
+                broker.open_hedge(s, prices.quote(), 50.0)
+            pos = s.query(Position).one()
+            self.assertEqual(pos.status, PositionStatus.ABORTED)
+            self.assertEqual(by.short, 0.0)
+            self.assertEqual(up.calls.count("sell USDT/KRW"), 1)
+            self.assertEqual(up.calls.count("buy USDT/KRW"), 1)      # 되사기
+            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.5)  # 수수료만큼만 빠짐
+
+    def test_entry_partial_short_is_balanced_by_trim(self):
+        """숏이 80% 만 체결 (느린 주문 취소) → USDT 는 계획대로 팔렸으니 코인이 많다 → 크기 맞추기가 코인을 판다"""
+        prices, up, by, broker, sf = make_live()
+        by.partial["open_short"] = 0.8
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertAlmostEqual(pos.bybit_qty, 40.0)
+            usdt_mid = (prices.usdt_bid + prices.usdt_ask) / 2
+            coin_usdt = pos.upbit_qty * prices.coin_bid / usdt_mid
+            short_usdt = by.short * prices.perp_bid
+            self.assertLess(abs(short_usdt - coin_usdt) / short_usdt, 0.011)
+            self.assertAlmostEqual(up.bal["XRP"], pos.upbit_qty, places=6)
 
 
 class MinOrderTest(unittest.TestCase):

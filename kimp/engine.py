@@ -863,15 +863,18 @@ class Engine:
         total = upbit + bybit
         target = self.s.upbit_target_share()
         scan_ms = (time.monotonic() - self._step_started) * 1000 if self._step_started else 0.0
+        skews = [q.skew_ms for q in quotes.values() if q.skew_ms is not None]
+        skew_ms = max(skews) if skews else None
         logger.info(
             "[현황] %s | %s | 포지션 %d/%d | 자본 업비트 %s / 바이비트 %s USDT (%.1f:%.1f, 목표 %.1f:%.1f) | "
-            "스캔 %.1f초 (시세 %.1f초)",
+            "스캔 %.1f초 (시세 %.1f초, 두 거래소 어긋남 %s)",
             head, ", ".join(parts), len(open_positions), self.s.max_open_positions,
             f"{upbit:,.2f}", f"{bybit:,.2f}",
             upbit / total * 100 if total else 0, bybit / total * 100 if total else 0,
             target * 100, (1 - target) * 100, scan_ms / 1000, self._quote_ms / 1000,
+            "-" if skew_ms is None else f"{skew_ms}ms",
         )
         # 분석용: 자본 곡선과 스캔 소요 시간 (느려진 구간·통신 장애를 나중에 찾으려고)
         telemetry.engine_snapshot(session, upbit, bybit, len(open_positions), scan_ms, self._quote_ms,
-                                  q0.usdt_krw, q0.fx_krw, self._now_utc())
+                                  q0.usdt_krw, q0.fx_krw, self._now_utc(), quote_skew_ms=skew_ms)
         session.commit()
