@@ -119,7 +119,7 @@
   <h1>김프 봇 도구</h1>
   <span class="muted" id="head">불러오는 중…</span>
   <span style="flex:1"></span>
-  <label class="muted"><input type="checkbox" id="auto"> 10초마다 새로고침</label>
+  <label class="muted"><input type="checkbox" id="auto"> 10초마다 새로고침 <span class="muted">(보고 있는 탭)</span></label>
   <button class="act" onclick="reload()">새로고침</button>
 </header>
 
@@ -667,9 +667,20 @@ $("liveScope").onchange = loadLive;
 $("liveSort").onchange = loadLive;
 $("spMode").onchange = loadLive;
 $("chartHours").onchange = loadChart;
+// 지금 열려 있는 탭만 다시 불러온다.
+// 안 보는 탭까지 갱신하면 거래소 조회(지금 김프)와 DB 읽기를 헛되이 반복한다.
+function refreshActiveTab() {
+  const on = document.querySelector("main section.on");
+  if (!on) return;
+  ({
+    dash: loadDash, live: loadLive, chart: loadChart, screen: loadScreen,
+    sim: loadSims, bot: loadBot, data: loadData,
+  }[on.id] || (() => {}))();
+}
+
 $("auto").onchange = (e) => {
   clearInterval(TIMER);
-  if (e.target.checked) TIMER = setInterval(() => { loadLive(); if ($("chart").classList.contains("on")) loadChart(); }, 10000);
+  if (e.target.checked) TIMER = setInterval(refreshActiveTab, 10000);
 };
 
 

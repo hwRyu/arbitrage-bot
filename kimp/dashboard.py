@@ -246,6 +246,9 @@ def load_open(settings: Settings, source: str) -> List[Dict[str, Any]]:
             {"id": p.id, "coin": p.coin, "status": p.status, "opened_ms": _ms(p.opened_at),
              "entry_premium": p.entry_premium, "notional_usdt": p.usdt_sold,
              "funding_usdt": p.funding_usdt, "last_net_percent": p.last_net_percent,
+             # 익절까지 남은 거리(%p). 순손익과 청산 김프는 1:1 이라 '목표 − 지금 순손익' 이면 된다
+             "to_target_percent": ((p.target_net_profit_percent or 0.0) - (p.last_net_percent or 0.0))
+                                   if p.last_net_percent is not None else None,
              "last_exit_premium": p.last_exit_premium, "target": p.target_net_profit_percent,
              "stop": p.stop_loss_percent, "liquidation_price": p.liquidation_price}
             for p in session.scalars(select(Position).where(Position.status.in_(OPEN_STATES))

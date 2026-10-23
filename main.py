@@ -22,7 +22,7 @@ import logging
 import signal
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 from kimp.broker import HedgeBroker, PaperBroker, broker_kwargs
 from kimp.carry import CarryBroker, CarryEngine, LiveCarryMarket
@@ -30,7 +30,7 @@ from sqlalchemy import select
 
 from kimp.config import Settings, load_settings
 from kimp.db import make_session_factory
-from kimp.engine import Engine
+from kimp.engine import Engine, _as_utc
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.fx import FxProvider
 from kimp.logging_setup import setup_logging
@@ -91,7 +91,18 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory) -> str
         positions = broker.open_positions(session)
         lines.append(f"포지션 {len(positions)}/{settings.max_open_positions}")
         for p in positions:
-            lines.append(f"  #{p.id} {p.coin} 진입 김프 {p.entry_premium:+.2f}% → 지금 순손익 {p.last_net_percent or 0:+.2f}%")
+            # 남은 거리: 순손익과 청산 김프는 1:1 로 움직이므로 '목표 − 지금 순손익' 이 곧 필요한 상승폭(%p)
+            net = p.last_net_percent or 0.0
+            target = p.target_net_profit_percent or 0.0
+            stop = p.stop_loss_percent or 0.0
+            held_h = (datetime.now(timezone.utc) - _as_utc(p.opened_at)).total_seconds() / 3600
+            limit = f"/{settings.one_shot_max_hours:g}h" if (settings.one_shot and settings.one_shot_max_hours) else ""
+            lines.append(
+                f"  #{p.id} {p.coin} 진입 {p.entry_premium:+.2f}% | 순손익 {net:+.2f}% → 목표 {target:.2f}% "
+                f"({target - net:+.2f}%p 더 올라야)")
+            lines.append(
+                f"     손절 {stop:.2f}% 까지 {net - stop:+.2f}%p 여유 · 보유 {held_h:.1f}h{limit} · "
+                f"펀딩 {p.funding_usdt:+.3f} USDT")
         for p in broker.unfinished_positions(session):
             lines.append(f"  ⚠️ #{p.id} {p.coin} {p.status}")
         for t in broker.pending_transfers(session):
