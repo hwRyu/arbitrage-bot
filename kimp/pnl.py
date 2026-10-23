@@ -198,6 +198,22 @@ def liquidation_price(entry_price_usdt: float, leverage: float, mmr: float) -> f
     return entry_price_usdt * (1 + 1 / leverage - mmr)
 
 
+def liquidation_price_from_margin(entry_price_usdt: float, qty: float, margin_usdt: float, mmr: float) -> float:
+    """
+    증거금을 더 넣은 뒤의 숏 강제청산 가격 (격리, 대략)
+
+        강제청산 가격 ≈ 진입가 × (1 + 증거금/숏금액 − 유지증거금률)
+
+    liquidation_price(진입가, 레버리지, mmr) 와 같은 식이다 — 증거금/숏금액 = 1/레버리지 이므로.
+    예) 1.35 USDT × 740개 = 999 USDT 숏, 증거금 999 (1배) → 1.35 × 1.995 ≈ 2.69
+        증거금 1,998 로 올리면 → 1.35 × 2.995 ≈ 4.04
+    """
+    notional = entry_price_usdt * qty
+    if notional <= 0:
+        return entry_price_usdt
+    return entry_price_usdt * (1 + margin_usdt / notional - mmr)
+
+
 def margin_to_add_usdt(entry_price: float, current_price: float, qty: float, margin_usdt: float,
                        target_distance_percent: float, mmr: float) -> float:
     """

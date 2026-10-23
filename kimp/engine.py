@@ -48,10 +48,14 @@ logger = logging.getLogger(__name__)
 # 같은 경고를 너무 자주 찍지 않으려고 두는 간격 (초)
 LOG_COOLDOWN_SEC = 60.0
 
+# 강제청산 가드가 한 번에 넣는 증거금의 최소 (USDT). 이보다 작으면 넣어도 의미가 없다 → 정리로
+MIN_TOPUP_USDT = 0.5
+
 # 청산 사유 → 알림에 쓰는 한글 (DB 에는 영문 코드가 그대로 남는다)
 EXIT_LABEL = {
     ExitReason.TAKE_PROFIT: "익절", ExitReason.STOP_LOSS: "손절", ExitReason.LIQUIDATION: "강제청산",
     ExitReason.TIMEOUT: "시간 초과", ExitReason.MANUAL: "수동", ExitReason.FUNDING_COST: "펀딩비 한도",
+    ExitReason.LIQ_GUARD: "강제청산 회피",
 }
 
 
@@ -452,40 +456,114 @@ class Engine:
 
     def _check_liquidation(self, session: Session, pos: Position, quote: Quote) -> bool:
         """
-        바이비트 숏 강제청산 확인
+        바이비트 숏 강제청산 확인 + 가드
 
-        - 바이비트 가격이 강제청산 가격 이상이면: 숏은 강제청산된 것으로 보고(증거금 잃음),
-          업비트 코인도 즉시 팔아 USDT 로 되돌린다 → True
-        - 강제청산까지 남은 상승폭이 LIQUIDATION_WARN_PERCENT 보다 작으면: 증거금 추가 긴급 경고
+        1) 강제청산가는 거래소 값을 우선 쓴다 (봇 계산값보다 거래소가 먼저 자른다)
+        2) 바이비트 가격이 강제청산가 이상이면: 숏은 강제청산된 것으로 보고(증거금 잃음), 업비트 코인도 즉시 정리 → True
+        3) 남은 상승폭이 LIQ_GUARD_PERCENT 안이면 봇이 판단한다 (_liq_guard): 증거금 추가 또는 정리
+        4) 그 밖에 LIQUIDATION_WARN_PERCENT 안이면 사람에게 경고만
 
-        예) 강제청산 가격 1.793, 지금 1.60 → 남은 상승폭 12% → 경고 (기준 15%)
+        예) 강제청산가 1.793, 지금 1.60 → 남은 상승폭 12% → 경고(15%). 1.64 → 9.3% → 가드(10%)
         """
         price = quote.liquidation_check_price
         if not price:
             return False
-        if price >= pos.liquidation_price:
+        try:
+            ex_liq = self.broker.ex.position_liq_price(session, pos.coin)
+        except Exception as exc:
+            self._log_throttled(f"liq-read-{pos.coin}", logging.WARNING,
+                                f"[강제청산가 조회 실패] #{pos.id} {pos.coin} | {exc} | 봇 계산값으로 봅니다")
+            ex_liq = None
+        if ex_liq and ex_liq > 0:
+            pos.liquidation_price = ex_liq   # 거래소 값이 진실
+        liq = pos.liquidation_price
+        if price >= liq:
             valuation = self.broker.value_liquidation(pos, quote)
             if valuation is None:
                 self._log_throttled(f"liq-thin-{pos.coin}", logging.CRITICAL,
                                     f"[강제청산] #{pos.id} {pos.coin} | 강제청산가 도달 | 업비트 호가가 모자라 정리 못 함 | 다음 스캔에 다시")
                 return False
             logger.critical("[강제청산] #%d %s | 바이비트 %.6f ≥ 강제청산가 %.6f | 증거금 %.2f USDT 손실 | 업비트 코인 즉시 정리",
-                            pos.id, pos.coin, price, pos.liquidation_price, pos.bybit_margin_usdt)
+                            pos.id, pos.coin, price, liq, pos.bybit_margin_usdt)
             self._close(session, pos, valuation, ExitReason.LIQUIDATION, liquidated=True)
             return True
 
-        distance = (pos.liquidation_price / price - 1) * 100
+        distance = (liq / price - 1) * 100
         pos.last_liq_distance_percent = distance
+        if distance < self.s.liq_guard_percent:
+            return self._liq_guard(session, pos, quote, price, distance)
         if distance < self.s.liquidation_warn_percent:
             add = margin_to_add_usdt(pos.entry_bybit_price_usdt, price, pos.bybit_qty, pos.bybit_margin_usdt,
                                      self.s.liquidation_warn_percent * 2, self.s.bybit_mmr)
             self._log_throttled(
                 f"liq-warn-{pos.coin}", logging.WARNING,
-                f"[긴급 · 증거금] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% (지금 {price:.6f} / 강제청산가 "
-                f"{pos.liquidation_price:.6f}) | 바이비트 포지션에 증거금 약 {add:,.2f} USDT 추가하세요 | "
-                f"격리 마진이라 계좌 잔고는 자동으로 안 들어갑니다",
+                f"[긴급 · 증거금] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% (지금 {price:.6f} / 강제청산가 {liq:.6f}) | "
+                f"증거금 약 {add:,.2f} USDT 를 넣으면 30% 로 돌아갑니다 | {self.s.liq_guard_percent:.0f}% 안으로 오면 "
+                f"봇이 증거금 추가 또는 정리를 스스로 합니다",
             )
         return False
+
+    def _liq_guard(self, session: Session, pos: Position, quote: Quote, price: float, distance: float) -> bool:
+        """
+        강제청산가의 90% 지점: 증거금을 더 넣고 들고 갈지, 지금 정리할지
+
+            목표까지 ≤ LIQ_GUARD_NEAR_TARGET_PERCENT → 증거금 추가 (곧 익절)
+            순손익 ≤ LIQ_GUARD_HOLD_BELOW_PERCENT    → 증거금 추가 (역프 깊음 — 지금 정리하면 손실 확정, 돌아올 때까지)
+            그 외                                     → 정리 (LIQ_GUARD). 청산당하는 것과 돈 차이는 거의 없지만 시점을 우리가 고른다
+            누적 추가가 원래 증거금 × MARGIN_TOPUP_MAX_MULTIPLE 를 넘거나 여유 USDT 가 없으면 → 정리
+
+        Returns:
+            정리했으면 True
+        """
+        valuation = self.broker.value_exit(pos, quote)
+        net = valuation.pnl.net_percent if valuation else None
+        target, _stop = self._exit_rules(pos)
+        added = pos.margin_added_usdt or 0.0
+        initial = pos.bybit_margin_usdt - added
+        cap_left = max(0.0, initial * self.s.margin_topup_max_multiple - added)
+        if cap_left < MIN_TOPUP_USDT:
+            cap_left = 0.0   # 부동소수 찌꺼기(0.000…1 USDT)를 '남은 상한' 으로 보지 않는다
+
+        why_hold = None
+        if net is not None and target - net <= self.s.liq_guard_near_target_percent:
+            why_hold = f"목표까지 {target - net:.2f}%p 뿐"
+        elif net is not None and net <= self.s.liq_guard_hold_below_percent:
+            why_hold = f"역프 깊음 (순손익 {net:+.2f}%, 지금 정리하면 손실 확정)"
+
+        if why_hold and cap_left > 0:
+            want = margin_to_add_usdt(pos.entry_bybit_price_usdt, price, pos.bybit_qty, pos.bybit_margin_usdt,
+                                      self.s.liquidation_warn_percent * 2, self.s.bybit_mmr)
+            free = self.broker.balance(session, BYBIT_USDT)
+            # 다른 자리 몫은 남긴다: 남은 자리마다 이 포지션만 한 증거금을 빼 두고, 그 위에서만 넣는다.
+            # 안 그러면 한 포지션이 여유 USDT 를 다 먹어 다음 진입이 잔고 부족으로 막힌다
+            slots_free = max(0, self.s.max_open_positions - len(self.broker.open_positions(session)))
+            reserve = slots_free * initial
+            add = min(want, cap_left, max(0.0, free - reserve))
+            if add >= MIN_TOPUP_USDT:
+                try:
+                    self.broker.add_margin(session, pos, add)
+                except Exception as exc:
+                    logger.critical("[증거금 추가 실패] #%d %s | %s | 정리로 넘어갑니다", pos.id, pos.coin, exc)
+                else:
+                    logger.warning("[증거금 추가] #%d %s | 강제청산까지 %.1f%% 였음 | +%.2f USDT (누적 %.2f / 상한 %.2f) | "
+                                   "새 강제청산가 %.6f | 이유: %s",
+                                   pos.id, pos.coin, distance, add, pos.margin_added_usdt,
+                                   initial * self.s.margin_topup_max_multiple, pos.liquidation_price, why_hold)
+                    return False
+            else:
+                logger.warning("[증거금 추가 불가] #%d %s | 바이비트 여유 %.2f USDT 중 다른 자리 몫 %.2f 를 빼면 남는 게 없음 | "
+                               "정리로 넘어갑니다", pos.id, pos.coin, free, reserve)
+
+        if valuation is None:
+            self._log_throttled(f"guard-thin-{pos.coin}", logging.CRITICAL,
+                                f"[강제청산 회피] #{pos.id} {pos.coin} | 정리하려는데 호가가 모자람 | 다음 스캔에 다시")
+            return False
+        reason_text = (f"추가 상한 소진 (누적 {added:.2f})" if why_hold else
+                       f"목표까지 {target - (net or 0):.2f}%p 남고 손실도 {net or 0:+.2f}% 라 작음")
+        logger.warning("[강제청산 회피] #%d %s | 강제청산까지 %.1f%% | %s | 지금 시세에 정리합니다 (순손익 %+.2f%%)",
+                       pos.id, pos.coin, distance, reason_text, net or 0.0)
+        self._close(session, pos, valuation, ExitReason.LIQ_GUARD)
+        return True
 
     def _exit_rules(self, pos: Position) -> tuple[float, float]:
         """이 포지션의 (목표, 손절). 진입 때 저장한 값을 쓰고, 없으면(옛날 포지션) 지금 설정"""

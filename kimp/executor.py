@@ -257,6 +257,15 @@ class PaperExecutor:
         """바이비트가 숏을 강제청산함: 증거금은 이미 빠져 있으니 숏 개수만 0으로"""
         self._add(session, short_key(coin), -qty)
 
+    def position_liq_price(self, session: Session, coin: str) -> Optional[float]:
+        """거래소가 알려주는 강제청산가. 페이퍼 거래소는 없다 → None (봇 계산값을 쓴다)"""
+        return None
+
+    def add_margin(self, session: Session, coin: str, usdt: float) -> float:
+        """숏 포지션 증거금에 USDT 를 더 넣는다 (계좌 여유 → 포지션 주머니). 페이퍼는 장부에서 뺀다"""
+        self._add(session, BYBIT_USDT, -usdt)
+        return usdt
+
     # ---- 업비트 네 동작. 진입은 USDT→원화→코인, 청산은 코인→원화→USDT 로 되돌아온다 ----
     # '개수 주문' 은 bids(파는 쪽), '금액 주문' 은 asks(사는 쪽) 를 소진한다. 항상 불리한 쪽이다.
     def sell_usdt(self, session: Session, quote: Quote, amount_usdt: float, client_id: str = "") -> LegFill:

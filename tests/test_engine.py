@@ -385,7 +385,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
             self.assertAlmostEqual(broker.balance(s, coin_key("XRP")), 0)
 
     def test_liquidation_warning(self):
-        """강제청산까지 15% 안쪽이면 증거금 추가 경고"""
+        """강제청산까지 15% 안쪽(가드 10% 밖)이면 증거금 추가 경고만"""
         market = FakeMarket()
         engine, sf, _ = make_engine(make_settings(bybit_leverage=3), market)
         market.quotes = {"XRP": make_quote(-1.0)}
@@ -394,6 +394,116 @@ class LeverageAndRebalanceTest(unittest.TestCase):
             market.quotes = {"XRP": make_quote(-1.0, bybit_price=1.20)}  # 강제청산(약 1.328)까지 약 10.6%
             engine.step()
         self.assertTrue(any("증거금 약" in m for m in logs.output))
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        self.assertFalse(pos.margin_added_usdt)                      # 경고만, 아직 안 넣음
+
+    def _guard_setup(self, **kw):
+        """3배 포지션을 잡고, 강제청산가의 ~92% 지점(남은 8.8%)으로 가격을 올린 상태를 만든다"""
+        market = FakeMarket()
+        engine, sf, broker = make_engine(make_settings(bybit_leverage=3, **kw), market)
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            pos = s.query(Position).one()
+        return market, engine, sf, broker, pos
+
+    def test_liq_guard_adds_margin_when_near_target(self):
+        """가드 구간인데 목표(1%)까지 0.3%p 이내 → 증거금을 넣고 들고 간다"""
+        market, engine, sf, broker, pos = self._guard_setup()
+        liq0, margin0 = pos.liquidation_price, pos.bybit_margin_usdt
+        quote = make_quote(0.15, bybit_price=1.22)      # 순손익 ≈ +0.85% (목표 1% 코앞), 강제청산까지 8.8%
+        with sf() as s:
+            net = broker.value_exit(pos, quote).pnl.net_percent
+        self.assertTrue(1.0 - 0.3 <= net < 1.0, net)
+        market.quotes = {"XRP": quote}
+        with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
+            engine.step()
+        self.assertTrue(any("[증거금 추가]" in m for m in logs.output))
+        with sf() as s:
+            pos = s.query(Position).one()
+            free = broker.balance(s, BYBIT_USDT)
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        self.assertGreater(pos.margin_added_usdt, 0)
+        self.assertGreater(pos.bybit_margin_usdt, margin0)
+        self.assertGreater(pos.liquidation_price, liq0 * 1.1)        # 청산가가 멀어짐
+        self.assertAlmostEqual(pos.liquidation_price / 1.22 - 1, 0.30, delta=0.02)   # 30% 거리로 되돌림
+
+    def test_liq_guard_adds_margin_when_premium_deeply_negative(self):
+        """가드 구간인데 역프가 깊어 순손익 ≤ -2% → 지금 정리하면 손실 확정이니 증거금을 넣고 기다린다"""
+        market, engine, sf, broker, pos = self._guard_setup()
+        quote = make_quote(-3.0, bybit_price=1.22)
+        with sf() as s:
+            self.assertLessEqual(broker.value_exit(pos, quote).pnl.net_percent, -2.0)
+        market.quotes = {"XRP": quote}
+        engine.step()
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        self.assertGreater(pos.margin_added_usdt, 0)
+
+    def test_liq_guard_closes_when_far_from_target_and_small_loss(self):
+        """가드 구간인데 목표도 멀고 손실도 작으면 → 미리 정리 (LIQ_GUARD)"""
+        market, engine, sf, broker, pos = self._guard_setup()
+        quote = make_quote(-1.0, bybit_price=1.22)      # 순손익 ≈ -0.55%
+        with sf() as s:
+            net = broker.value_exit(pos, quote).pnl.net_percent
+        self.assertTrue(-2.0 < net < 0.7, net)
+        market.quotes = {"XRP": quote}
+        with self.assertLogs("kimp.engine", level=logging.INFO) as logs:
+            engine.step()
+        self.assertTrue(any("[강제청산 회피]" in m for m in logs.output))
+        self.assertTrue(any("[청산 · 강제청산 회피]" in m for m in logs.output))
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.status, PositionStatus.CLOSED)
+        self.assertEqual(pos.exit_reason, ExitReason.LIQ_GUARD)
+        self.assertFalse(pos.margin_added_usdt)
+
+    def test_liq_guard_closes_when_topup_cap_is_zero(self):
+        """추가 상한 0 이면 목표가 코앞이어도 정리"""
+        market, engine, sf, broker, pos = self._guard_setup(margin_topup_max_multiple=0.0)
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        engine.step()
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.exit_reason, ExitReason.LIQ_GUARD)
+
+    def test_liq_guard_keeps_reserve_for_other_slots(self):
+        """바이비트 여유가 '다른 자리 몫' 뿐이면 넣지 않고 정리한다 (한 포지션이 다음 진입 돈을 먹지 않게)"""
+        market, engine, sf, broker, pos = self._guard_setup(max_open_positions=3)
+        with sf() as s:
+            # 여유 USDT 를 '남은 자리 2개 × 증거금' 만큼만 남긴다
+            from kimp.db import PaperBalance
+            row = s.get(PaperBalance, BYBIT_USDT)
+            row.amount = pos.bybit_margin_usdt * 2
+            s.commit()
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
+            engine.step()
+        self.assertTrue(any("[증거금 추가 불가]" in m for m in logs.output))
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.exit_reason, ExitReason.LIQ_GUARD)
+
+    def test_liq_guard_cap_is_cumulative(self):
+        """여러 번 넣어도 누적이 원래 증거금 × 상한을 넘지 않고, 넘으면 정리"""
+        market, engine, sf, broker, pos = self._guard_setup(margin_topup_max_multiple=0.5)
+        initial = pos.bybit_margin_usdt
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        engine.step()                                     # 1차: 상한(0.5배)까지만
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        self.assertLessEqual(pos.margin_added_usdt, initial * 0.5 + 1e-6)
+        # 가격이 더 올라 또 가드 구간 → 상한 소진 → 정리
+        liq = pos.liquidation_price
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=liq / 1.08)}
+        engine.step()
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.exit_reason, ExitReason.LIQ_GUARD)
 
     def test_rebalance_alert_at_start(self):
         """(자동 송금 끔) 시작할 때 업비트에만 USDT 가 있으면 바이비트로 옮기라고 알리기만 한다"""

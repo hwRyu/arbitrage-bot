@@ -224,7 +224,19 @@ class FakeBybit(FakeExchange):
         return {"result": {"list": []}}
 
     def fetch_positions(self, symbols=None):
-        return [{"side": "short", "contracts": self.short}] if self.short > 0 else []
+        if self.short <= 0:
+            return []
+        # 거래소가 주는 강제청산가 흉내: 진입가 × (1 + 증거금/숏금액 − 0.005)
+        liq = self.entry * (1 + self.margin / (self.entry * self.short) - 0.005) if self.entry else None
+        return [{"side": "short", "contracts": self.short, "liquidationPrice": liq}]
+
+    def add_margin(self, symbol, amount, params=None):
+        self.calls.append(("add_margin", amount))
+        if amount > self.free_usdt:
+            raise RuntimeError("insufficient available balance")
+        self.free_usdt -= amount
+        self.margin += amount
+        return {"info": {}}
 
     def fetch_balance(self):
         return {"USDT": {"free": self.free_usdt, "total": self.free_usdt + self.margin}}
@@ -830,6 +842,26 @@ class ParallelLegsTest(unittest.TestCase):
             short_usdt = by.short * prices.perp_bid
             self.assertLess(abs(short_usdt - coin_usdt) / short_usdt, 0.011)
             self.assertAlmostEqual(up.bal["XRP"], pos.upbit_qty, places=6)
+
+
+class LiqGuardLiveTest(unittest.TestCase):
+    """실거래 실행기: 거래소 강제청산가 읽기 + 증거금 추가"""
+
+    def test_exchange_liq_price_and_add_margin(self):
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            broker.ex.refresh()
+            liq = broker.ex.position_liq_price(s, "XRP")
+            self.assertAlmostEqual(liq, pos.entry_bybit_price_usdt * (1 + 1 - 0.005), places=6)   # 1배 ≈ 2배 가격
+            free_before = by.free_usdt
+            broker.add_margin(s, pos, 50.0)
+            self.assertAlmostEqual(by.free_usdt, free_before - 50.0)
+            self.assertAlmostEqual(pos.margin_added_usdt, 50.0)
+            self.assertAlmostEqual(pos.bybit_margin_usdt, 150.0, delta=0.5)      # 100 + 50
+            broker.ex.refresh()
+            self.assertGreater(broker.ex.position_liq_price(s, "XRP"), liq)       # 청산가가 멀어졌다
+            self.assertEqual(by.calls.count(("add_margin", 50.0)), 1)
 
 
 class MinOrderTest(unittest.TestCase):

@@ -118,6 +118,7 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 | `max_net_percent` · `max_net_at` | 보유 중 순손익 **최고**와 그 시각 — "목표에 얼마나 가까웠다가 놓쳤나" |
 | `min_net_percent` · `min_net_at` | 보유 중 순손익 **최저**와 그 시각 — 손절선에 얼마나 다가갔나 |
 | `run_id` | 어느 실행(`runs.id`)에서 잡았나 → 그때 설정·코드 버전 |
+| `margin_added_usdt` | 강제청산 가드가 더 넣은 증거금 누적 (USDT). `bybit_margin_usdt` 에 이미 포함되어 있다 |
 
 **청산할 때 / 확정 손익**
 
@@ -127,7 +128,7 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 | `exit_usdt_price_krw` · `exit_usdt_fee_krw` · `usdt_bought` | USDT 되산 평균가·수수료·**되산 개수** |
 | `exit_bybit_price_usdt` · `exit_bybit_fee_usdt` | 숏 닫은 평균가·수수료 |
 | `exit_premium` | 청산 김프 (코인 몫, %) |
-| `exit_reason` | `TAKE_PROFIT`(목표 달성) / `STOP_LOSS`(손절) / `LIQUIDATION`(강제청산) / `TIMEOUT`(한 번만 돌리기에서 시간 초과) |
+| `exit_reason` | `TAKE_PROFIT`(목표 달성) / `STOP_LOSS`(손절) / `LIQUIDATION`(강제청산) / `LIQ_GUARD`(강제청산 회피 — 청산가 90% 지점에서 목표도 멀고 손실도 작아 미리 정리) / `TIMEOUT`(시간 초과) / `MANUAL`(수동) / `FUNDING_COST`(펀딩비 한도) |
 | `upbit_leg_usdt` | 업비트 몫 손익 = `usdt_bought − usdt_sold` |
 | `bybit_leg_usdt` | 바이비트 몫 손익 = 숏 개수 × (진입가 − 청산가) |
 | `gross_pnl_usdt` | 비용 빼기 전 손익 |

@@ -65,7 +65,7 @@ class ExitReason:
     STOP_LOSS = "STOP_LOSS"  # 손실 한도 도달 (손절)
     LIQUIDATION = "LIQUIDATION"  # 바이비트 숏 강제청산 → 업비트도 즉시 정리
     FUNDING_DROP = "FUNDING_DROP"  # (펀딩비 전략) 펀딩비가 기준 아래로 떨어져서 정리
-    LIQ_GUARD = "LIQ_GUARD"  # (펀딩비 전략) 강제청산이 가까워서 미리 양쪽 정리
+    LIQ_GUARD = "LIQ_GUARD"  # 강제청산이 가까운데 목표도 멀고 손실도 작아서 미리 양쪽 정리 (펀딩비 전략도 같은 이름)
     TIMEOUT = "TIMEOUT"  # 한 번만 돌리기(ONE_SHOT)에서 ONE_SHOT_MAX_HOURS 를 넘겨 시장가로 정리
     MANUAL = "MANUAL"  # 사람이 지시해서 정리 (텔레그램 /close)
     FUNDING_COST = "FUNDING_COST"  # 펀딩비로 낸 돈이 MAX_FUNDING_COST_PERCENT 를 넘어서 정리
@@ -130,6 +130,7 @@ class Position(Base):
     min_net_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 보유 중 순손익 최저
     min_net_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 어느 실행(runs.id)에서 잡았나
+    margin_added_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 강제청산 가드가 더 넣은 증거금 누적 (bybit_margin_usdt 에 포함)
 
     # ---------------- 청산할 때 ----------------
     exit_upbit_price_krw: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

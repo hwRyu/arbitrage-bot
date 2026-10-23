@@ -85,7 +85,7 @@ from kimp.executor import (
     coin_key,
     new_client_id,
 )
-from kimp.pnl import EntryLegs, ExitLegs, PnLBreakdown, compute_pnl, liquidation_price
+from kimp.pnl import EntryLegs, ExitLegs, PnLBreakdown, compute_pnl, liquidation_price, liquidation_price_from_margin
 from kimp.premium import ExitPlan, Quote, premium_percent
 from kimp.safety import Safety, kst_midnight_utc
 
@@ -880,6 +880,23 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     # 펀딩비 / 조회
     # ------------------------------------------------------------------
+    def add_margin(self, session: Session, pos: Position, usdt: float) -> float:
+        """
+        포지션 증거금을 더 넣고 기록한다 (강제청산 가드). 계좌 안 이동이라 손익 변화는 없다
+
+        bybit_margin_usdt 에 더하고(청산 때 증거금 손실 계산에 쓴다), 누적은 margin_added_usdt 에,
+        강제청산가는 새 증거금으로 다시 계산한다 (실거래는 다음 스캔에 거래소 값으로 덮인다).
+        Raises:
+            OrderFailed: 거래소가 거절
+        """
+        done = self.ex.add_margin(session, pos.coin, usdt)
+        pos.bybit_margin_usdt += done
+        pos.margin_added_usdt = (pos.margin_added_usdt or 0.0) + done
+        pos.liquidation_price = liquidation_price_from_margin(pos.entry_bybit_price_usdt, pos.bybit_qty,
+                                                              pos.bybit_margin_usdt, self.mmr)
+        session.commit()
+        return done
+
     def apply_funding(self, session: Session, pos: Position, rate: float, mark_price: float,
                       funding_time_ms: int) -> float:
         """

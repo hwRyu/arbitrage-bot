@@ -73,6 +73,7 @@ class LiveExecutor:
         self._up_bal: Optional[dict] = None
         self._by_bal: Optional[dict] = None
         self._shorts: Dict[str, float] = {}
+        self._liq: Dict[str, Optional[float]] = {}   # 코인 → 거래소 강제청산가 (스캔당 한 번 받아 둔다)
         self._min_krw: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
@@ -140,6 +141,7 @@ class LiveExecutor:
         self._up_bal = None
         self._by_bal = None
         self._shorts = {}
+        self._liq = {}
 
     def _balances(self):
         """
@@ -202,12 +204,46 @@ class LiveExecutor:
     def short_qty(self, session: Session, coin: str) -> float:
         """바이비트 실제 숏 개수 (없으면 0)"""
         if coin not in self._shorts:
-            qty = 0.0
-            for p in self.by.fetch_positions([bybit_symbol(coin)]):
-                if p.get("side") == "short":
-                    qty += abs(float(p.get("contracts") or 0.0))
-            self._shorts[coin] = qty
+            self._load_short(coin)
         return self._shorts[coin]
+
+    def _load_short(self, coin: str) -> None:
+        """숏 개수와 거래소 강제청산가를 한 번에 받아 둔다 (스캔당 한 번)"""
+        qty, liq = 0.0, None
+        for p in self.by.fetch_positions([bybit_symbol(coin)]):
+            if p.get("side") == "short":
+                qty += abs(float(p.get("contracts") or 0.0))
+                try:
+                    liq = float(p.get("liquidationPrice") or 0) or None
+                except (TypeError, ValueError):
+                    liq = None
+        self._shorts[coin] = qty
+        self._liq[coin] = liq
+
+    def position_liq_price(self, session: Session, coin: str) -> Optional[float]:
+        """
+        거래소가 알려주는 강제청산가 (없으면 None)
+
+        봇 계산값(진입가 × (1 + 1/레버리지 − mmr))보다 **거래소가 먼저** 자른다 — 수수료·유지증거금 구간 때문.
+        IRYS 2026-10-24: 봇 0.0572 (12.8% 남음 경고) vs 거래소 0.0559 (실제 6.3%). 그래서 이 값을 우선 쓴다.
+        """
+        if coin not in self._liq:
+            self._load_short(coin)
+        return self._liq.get(coin)
+
+    def add_margin(self, session: Session, coin: str, usdt: float) -> float:
+        """
+        격리 숏 포지션에 증거금 추가 (계좌 여유 USDT → 그 포지션 주머니). 주문이 아니라 계좌 안 이동이라 수수료 없음
+
+        Raises:
+            OrderFailed: 거래소가 거절 (여유 부족 등)
+        """
+        try:
+            self.by.add_margin(bybit_symbol(coin), float(f"{usdt:.4f}"), {"positionIdx": 0})
+        except Exception as exc:
+            raise OrderFailed(f"증거금 추가 실패: {exc}") from exc
+        self.refresh()
+        return usdt
 
     def short_liquidated(self, session: Session, coin: str) -> bool:
         """
