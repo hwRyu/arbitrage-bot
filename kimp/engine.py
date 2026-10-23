@@ -503,6 +503,18 @@ class Engine:
             )
         return False
 
+    def _topup_pool_usdt(self, session: Session, quote: Quote, open_positions: List[Position]) -> float:
+        """
+        증거금 추가 풀 = 자리 수 × 자리당 증거금 × 여유분%
+
+        자본 비율을 정할 때(upbit_target_share) 바이비트에 증거금 외로 더 두기로 한 '여유분' 이 바로 이 돈이다.
+        자리당 증거금은 지금 설정대로 계산한 포지션 크기(자동 또는 고정) ÷ 레버리지.
+        예) 자리 4 × 포지션 196 USDT, 1배, 여유분 30% → 4 × 196 × 0.3 = 235 USDT
+        """
+        size = self._position_size_usdt(session, quote.coin, open_positions, {quote.coin: quote})
+        per_slot_margin = size / max(self.s.bybit_leverage, 1e-9)
+        return self.s.max_open_positions * per_slot_margin * self.s.bybit_margin_buffer_percent / 100
+
     def _liq_guard(self, session: Session, pos: Position, quote: Quote, price: float, distance: float) -> bool:
         """
         강제청산가의 90% 지점: 증거금을 더 넣고 들고 갈지, 지금 정리할지
@@ -510,7 +522,11 @@ class Engine:
             목표까지 ≤ LIQ_GUARD_NEAR_TARGET_PERCENT → 증거금 추가 (곧 익절)
             순손익 ≤ LIQ_GUARD_HOLD_BELOW_PERCENT    → 증거금 추가 (역프 깊음 — 지금 정리하면 손실 확정, 돌아올 때까지)
             그 외                                     → 정리 (LIQ_GUARD). 청산당하는 것과 돈 차이는 거의 없지만 시점을 우리가 고른다
-            누적 추가가 원래 증거금 × MARGIN_TOPUP_MAX_MULTIPLE 를 넘거나 여유 USDT 가 없으면 → 정리
+
+        넣는 돈의 출처와 양 (_topup_pool_usdt):
+            한 번에 그 포지션의 원래 증거금 1단위 (1배면 청산가 2배 → 3배), 포지션당 최대 MARGIN_TOPUP_MAX_ROUNDS 회.
+            전체 포지션이 넣은 합이 '여유분 풀' 을 넘지 못한다 → 자리 몫(다음 진입 돈)은 절대 건드리지 않는다.
+            풀이 비었거나 회차를 다 썼으면 정리.
 
         Returns:
             정리했으면 True
@@ -520,9 +536,7 @@ class Engine:
         target, _stop = self._exit_rules(pos)
         added = pos.margin_added_usdt or 0.0
         initial = pos.bybit_margin_usdt - added
-        cap_left = max(0.0, initial * self.s.margin_topup_max_multiple - added)
-        if cap_left < MIN_TOPUP_USDT:
-            cap_left = 0.0   # 부동소수 찌꺼기(0.000…1 USDT)를 '남은 상한' 으로 보지 않는다
+        rounds_used = int(round(added / initial)) if initial > 0 else 0
 
         why_hold = None
         if net is not None and target - net <= self.s.liq_guard_near_target_percent:
@@ -530,36 +544,37 @@ class Engine:
         elif net is not None and net <= self.s.liq_guard_hold_below_percent:
             why_hold = f"역프 깊음 (순손익 {net:+.2f}%, 지금 정리하면 손실 확정)"
 
-        if why_hold and cap_left > 0:
-            want = margin_to_add_usdt(pos.entry_bybit_price_usdt, price, pos.bybit_qty, pos.bybit_margin_usdt,
-                                      self.s.liquidation_warn_percent * 2, self.s.bybit_mmr)
-            free = self.broker.balance(session, BYBIT_USDT)
-            # 다른 자리 몫은 남긴다: 남은 자리마다 이 포지션만 한 증거금을 빼 두고, 그 위에서만 넣는다.
-            # 안 그러면 한 포지션이 여유 USDT 를 다 먹어 다음 진입이 잔고 부족으로 막힌다
-            slots_free = max(0, self.s.max_open_positions - len(self.broker.open_positions(session)))
-            reserve = slots_free * initial
-            add = min(want, cap_left, max(0.0, free - reserve))
-            if add >= MIN_TOPUP_USDT:
-                try:
-                    self.broker.add_margin(session, pos, add)
-                except Exception as exc:
-                    logger.critical("[증거금 추가 실패] #%d %s | %s | 정리로 넘어갑니다", pos.id, pos.coin, exc)
-                else:
-                    logger.warning("[증거금 추가] #%d %s | 강제청산까지 %.1f%% 였음 | +%.2f USDT (누적 %.2f / 상한 %.2f) | "
-                                   "새 강제청산가 %.6f | 이유: %s",
-                                   pos.id, pos.coin, distance, add, pos.margin_added_usdt,
-                                   initial * self.s.margin_topup_max_multiple, pos.liquidation_price, why_hold)
-                    return False
+        blocked = None   # 넣고 싶은데 못 넣는 이유
+        if why_hold:
+            if rounds_used >= self.s.margin_topup_max_rounds:
+                blocked = f"이미 {rounds_used}회 넣음 (최대 {self.s.margin_topup_max_rounds}회)"
             else:
-                logger.warning("[증거금 추가 불가] #%d %s | 바이비트 여유 %.2f USDT 중 다른 자리 몫 %.2f 를 빼면 남는 게 없음 | "
-                               "정리로 넘어갑니다", pos.id, pos.coin, free, reserve)
+                open_positions = self.broker.open_positions(session)
+                pool = self._topup_pool_usdt(session, quote, open_positions)
+                used = sum(p.margin_added_usdt or 0.0 for p in open_positions)
+                free = self.broker.balance(session, BYBIT_USDT)
+                add = min(initial, max(0.0, pool - used), max(0.0, free))
+                if add < MIN_TOPUP_USDT:
+                    blocked = f"여유분 풀 {pool:.2f} USDT 중 {used:.2f} 사용, 남은 {max(0.0, pool - used):.2f} (바이비트 여유 {free:.2f})"
+                else:
+                    try:
+                        self.broker.add_margin(session, pos, add)
+                    except Exception as exc:
+                        blocked = f"거래소 거절: {exc}"
+                        logger.critical("[증거금 추가 실패] #%d %s | %s", pos.id, pos.coin, exc)
+                    else:
+                        logger.warning("[증거금 추가] #%d %s | 강제청산까지 %.1f%% 였음 | +%.2f USDT (%d/%d회, 풀 %.2f 중 %.2f 사용) | "
+                                       "새 강제청산가 %.6f | 이유: %s",
+                                       pos.id, pos.coin, distance, add, rounds_used + 1, self.s.margin_topup_max_rounds,
+                                       pool, used + add, pos.liquidation_price, why_hold)
+                        return False
+            logger.warning("[증거금 추가 불가] #%d %s | %s | 정리로 넘어갑니다", pos.id, pos.coin, blocked)
 
         if valuation is None:
             self._log_throttled(f"guard-thin-{pos.coin}", logging.CRITICAL,
                                 f"[강제청산 회피] #{pos.id} {pos.coin} | 정리하려는데 호가가 모자람 | 다음 스캔에 다시")
             return False
-        reason_text = (f"추가 상한 소진 (누적 {added:.2f})" if why_hold else
-                       f"목표까지 {target - (net or 0):.2f}%p 남고 손실도 {net or 0:+.2f}% 라 작음")
+        reason_text = blocked if why_hold else f"목표까지 {target - (net or 0):.2f}%p 남고 손실도 {net or 0:+.2f}% 라 작음"
         logger.warning("[강제청산 회피] #%d %s | 강제청산까지 %.1f%% | %s | 지금 시세에 정리합니다 (순손익 %+.2f%%)",
                        pos.id, pos.coin, distance, reason_text, net or 0.0)
         self._close(session, pos, valuation, ExitReason.LIQ_GUARD)

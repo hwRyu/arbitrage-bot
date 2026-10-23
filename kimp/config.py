@@ -269,13 +269,16 @@ class Settings:
     #                                                      급등 때 역프는 수 분 만에 돌아온다 — IRYS 2026-10-24)
     #     그 외                                            → 정리 (사유 LIQ_GUARD). 1배 헷지라 청산당하는 것과
     #                                                      돈 차이는 유지증거금 수준이지만, 시점을 우리가 고른다
-    #   추가 상한: 누적 추가 ≤ 원래 증거금 × margin_topup_max_multiple. 넘으면 정리 (0 이면 추가 안 함).
+    #   재원과 한도: 추가 풀 = 자리 수 × 자리당 증거금 × 여유분(bybit_margin_buffer_percent). 자본 비율을 정할 때
+    #   바이비트에 증거금 외로 더 두기로 한 바로 그 돈만 쓴다 → 아무리 넣어도 자리 몫(다음 진입 돈)은 그대로다.
+    #   한 번 넣는 양 = 그 포지션의 원래 증거금 1단위 (풀에 남은 만큼만), 포지션당 최대 margin_topup_max_rounds 회.
+    #   1배면 1회에 청산가 2배 → 3배, 2회면 4배. 풀이 비었으면 정리 (0 이면 추가 없이 정리만).
     #   왜 교차 마진이 아닌가: 격리는 코인 하나의 손실 상한이 증거금이다. IRYS 가 하루에 21배 갈 때 교차였다면
     #   20 USDT 포지션이 계좌 400 USDT 를 끌어다 쓰며 다른 포지션까지 위험해진다. 헷지에서 청산은 거의 본전이다.
     liq_guard_percent: float = 10.0
     liq_guard_near_target_percent: float = 0.3
     liq_guard_hold_below_percent: float = -2.0
-    margin_topup_max_multiple: float = 2.0
+    margin_topup_max_rounds: int = 2
 
     # 양쪽 자본 비율이 목표에서 이 %p 넘게 벗어나면 리밸런싱 알림 (청산 직후 확인)
     rebalance_threshold_percent: float = 10.0
@@ -592,7 +595,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         liq_guard_percent=_env_float("LIQ_GUARD_PERCENT", d.liq_guard_percent),
         liq_guard_near_target_percent=_env_float("LIQ_GUARD_NEAR_TARGET_PERCENT", d.liq_guard_near_target_percent),
         liq_guard_hold_below_percent=_env_float("LIQ_GUARD_HOLD_BELOW_PERCENT", d.liq_guard_hold_below_percent),
-        margin_topup_max_multiple=_env_float("MARGIN_TOPUP_MAX_MULTIPLE", d.margin_topup_max_multiple),
+        margin_topup_max_rounds=_env_int("MARGIN_TOPUP_MAX_ROUNDS", d.margin_topup_max_rounds),
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
         hedge_tolerance_percent=_env_float("HEDGE_TOLERANCE_PERCENT", d.hedge_tolerance_percent),
         upbit_min_order_krw=_env_float("UPBIT_MIN_ORDER_KRW", d.upbit_min_order_krw),
@@ -734,8 +737,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("LIQUIDATION_WARN_PERCENT 는 0 보다 커야 합니다")
     if not 0 < s.liq_guard_percent <= s.liquidation_warn_percent:
         errors.append("LIQ_GUARD_PERCENT 는 0 보다 크고 LIQUIDATION_WARN_PERCENT 이하여야 합니다 (경고가 먼저, 가드가 뒤)")
-    if s.margin_topup_max_multiple < 0:
-        errors.append("MARGIN_TOPUP_MAX_MULTIPLE 는 0 이상이어야 합니다 (0 = 증거금 추가 안 함)")
+    if s.margin_topup_max_rounds < 0:
+        errors.append("MARGIN_TOPUP_MAX_ROUNDS 는 0 이상이어야 합니다 (0 = 증거금 추가 안 함)")
     if s.transfer_fee_upbit_to_bybit_usdt < 0 or s.transfer_fee_bybit_to_upbit_usdt < 0:
         errors.append("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT / TRANSFER_FEE_BYBIT_TO_UPBIT_USDT 는 0 이상이어야 합니다")
     if s.rebalance_threshold_percent <= 0:
