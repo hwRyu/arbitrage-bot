@@ -28,6 +28,8 @@ USDT 를 되산다. 그래서 "1 USDT 는 몇 원인가" 의 답은 환율이 �
 1) 정해진 간격(FX_REFRESH_SEC)마다 yfinance 에서 최신 환율을 받아온다.
 2) 실패하면 마지막으로 성공한 값을 그대로 쓴다. (환율은 몇 분 사이에 거의 안 움직인다)
    값이 얼마나 묵었는지는 따로 재지 않는다 — 표시용이라 낡아도 매매에 영향이 없다.
+   yfinance 는 간헐적으로 빈 데이터를 준다 → 한두 번 실패는 조용히(DEBUG), ALERT_AFTER_FAILURES 번
+   **연속** 실패해야 WARNING(텔레그램) 한 번, 그 뒤로는 ALERT_EVERY_FAILURES 번마다. 복구되면 한 번 알린다.
 3) 한 번도 성공하지 못했으면(봇 시작 직후 실패) None 을 돌려준다. 이때도 매매는 그대로 돈다.
 4) FIXED_USD_KRW 를 설정하면 조회하지 않고 그 숫자를 계속 쓴다.
 """
@@ -38,6 +40,10 @@ import time
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# 연속 몇 번 실패해야 알리나 (60초 간격이면 3번 = 3분). 그 뒤로는 몇 번마다 다시 알리나
+ALERT_AFTER_FAILURES = 3
+ALERT_EVERY_FAILURES = 30   # 30분마다
 
 
 def fetch_usd_krw_from_yfinance() -> float:
@@ -92,6 +98,7 @@ class FxProvider:
 
         self._rate: Optional[float] = None  # 마지막으로 성공한 환율 (실패해도 덮어쓰지 않는다)
         self._last_try_at: Optional[float] = None  # 마지막으로 시도한 시각 (실패 포함)
+        self.failures = 0  # 연속 실패 횟수 (성공하면 0)
 
     def get(self) -> Optional[float]:
         """
@@ -111,12 +118,19 @@ class FxProvider:
                 rate = self._fetcher()
                 if self._rate is None:
                     logger.info("달러 환율 첫 조회 성공: %.2f원", rate)
+                if self.failures >= ALERT_AFTER_FAILURES:
+                    logger.warning("달러 환율 조회 복구 (연속 %d번 실패 뒤): %.2f원", self.failures, rate)
                 self._rate = rate
+                self.failures = 0
             except Exception as exc:
                 # 실패해도 멈추지 않는다. 이전 값이 있으면 그걸 쓴다.
-                if self._rate is None:
-                    logger.error("달러 환율 조회 실패 (아직 쓸 값 없음): %s", exc)
+                # 간헐적 실패는 조용히, 연속으로 이어질 때만 알린다 (표시용 값이라 급하지 않다)
+                self.failures += 1
+                tail = "(아직 쓸 값 없음)" if self._rate is None else f"(이전 값 {self._rate:.2f}원 사용)"
+                if self.failures == ALERT_AFTER_FAILURES or (
+                        self.failures > ALERT_AFTER_FAILURES and self.failures % ALERT_EVERY_FAILURES == 0):
+                    logger.warning("달러 환율 조회가 %d번 연속 실패 %s: %s", self.failures, tail, exc)
                 else:
-                    logger.warning("달러 환율 조회 실패, 이전 값 %.2f원 사용: %s", self._rate, exc)
+                    logger.debug("달러 환율 조회 실패 %d번째 %s: %s", self.failures, tail, exc)
 
         return self._rate

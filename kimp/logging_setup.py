@@ -49,5 +49,8 @@ def setup_logging(level: str = "INFO", log_dir: str = "logs") -> None:
     root.addHandler(file_handler)
 
     # 라이브러리 내부 로그는 너무 많아서 경고 이상만 남긴다
-    for noisy in ("ccxt", "urllib3", "yfinance", "peewee"):
+    for noisy in ("ccxt", "urllib3", "peewee"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # yfinance 는 빈 데이터를 받을 때마다 자기 로거로 ERROR("possibly delisted")를 찍는다.
+    # 실패는 kimp.fx 가 연속 횟수를 세어 알리므로, 여기 것은 텔레그램까지 가지 않게 끈다
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)

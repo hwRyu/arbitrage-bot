@@ -53,6 +53,58 @@ class FxProviderTest(unittest.TestCase):
             now[0] = t
             self.assertEqual(fx.get(), 1325.0)
 
+    def test_alert_only_after_consecutive_failures(self):
+        """간헐적 실패는 조용히(DEBUG), 3번 연속이면 WARNING 한 번, 복구되면 한 번"""
+        import logging
+        from kimp.fx import ALERT_AFTER_FAILURES
+        now = [0.0]
+        ok = [True]
+
+        def fetcher():
+            if not ok[0]:
+                raise RuntimeError("yfinance 가 빈 환율 데이터를 돌려줬습니다")
+            return 1325.0
+
+        fx = FxProvider(refresh_sec=1, fetcher=fetcher, clock=lambda: now[0])
+        fx.get()
+        ok[0] = False
+        with self.assertLogs("kimp.fx", level=logging.DEBUG) as logs:
+            for i in range(ALERT_AFTER_FAILURES - 1):      # 한두 번 → 조용히
+                now[0] += 1
+                fx.get()
+        self.assertFalse(any(m.startswith("WARNING") for m in logs.output))
+        with self.assertLogs("kimp.fx", level=logging.WARNING) as logs:
+            now[0] += 1
+            fx.get()                                        # 3번째 연속 → 알림
+        self.assertIn("3번 연속 실패", logs.output[0])
+        with self.assertNoLogs("kimp.fx", level=logging.WARNING):
+            now[0] += 1
+            fx.get()                                        # 4번째 → 다시 조용히
+        ok[0] = True
+        with self.assertLogs("kimp.fx", level=logging.WARNING) as logs:
+            now[0] += 1
+            self.assertEqual(fx.get(), 1325.0)              # 복구 → 한 번 알림
+        self.assertIn("복구", logs.output[0])
+        self.assertEqual(fx.failures, 0)
+
+    def test_single_failure_then_recovery_is_quiet(self):
+        """한 번 실패하고 바로 되면 아무 알림도 없다"""
+        import logging
+        now = [0.0]
+        ok = [False]
+
+        def fetcher():
+            if not ok[0]:
+                raise RuntimeError("실패")
+            return 1330.0
+
+        fx = FxProvider(refresh_sec=1, fetcher=fetcher, clock=lambda: now[0])
+        with self.assertNoLogs("kimp.fx", level=logging.WARNING):
+            fx.get()
+            ok[0] = True
+            now[0] += 1
+            fx.get()
+
     def test_none_before_first_success(self):
         """한 번도 성공 못 하면 None (봇 시작 직후 실패한 경우)"""
         def fail():
