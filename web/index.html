@@ -50,6 +50,30 @@
   .card b { display: block; color: var(--dim); font-size: 12px; font-weight: 600; margin-bottom: 4px; }
   .card span { font-size: 17px; }
   .note { color: var(--dim); font-size: 12px; margin: 10px 0 0; white-space: pre-wrap; }
+  /* ---- 대시보드 ---- */
+  .dh { font-size: 14px; font-weight: 700; margin: 18px 0 8px; }
+  /* 제일 중요한 숫자 두 개는 크게 */
+  .hero { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .hcard { background: #0d1117; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .hcard b { display: block; color: var(--dim); font-size: 12px; font-weight: 600; }
+  .hcard span { font-size: 28px; font-weight: 700; line-height: 1.35; }
+  .hcard span small { font-size: 13px; font-weight: 400; color: var(--dim); }
+  .hcard i { display: block; color: var(--dim); font-size: 12px; font-style: normal; }
+  /* 짧은 표 둘을 나란히 (좁은 화면에서는 한 줄씩) */
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 1100px) { .two { grid-template-columns: 1fr; } }
+  /* 보유 포지션 카드 */
+  .poscards { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 10px; }
+  .pos { background: #0d1117; border: 1px solid var(--accent); border-radius: 8px; padding: 12px 14px; }
+  .prow { display: flex; gap: 8px; align-items: center; }
+  .pcoin { font-size: 17px; }
+  .pnet { font-size: 21px; font-weight: 700; }
+  /* 손절선 ↔ 목표선 사이에서 지금 순손익이 어디쯤인지 */
+  .bar { position: relative; height: 9px; background: #11161d; border: 1px solid var(--line);
+         border-radius: 5px; margin: 10px 0 7px; }
+  .bar u { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px 0 0 5px;
+           background: currentColor; opacity: .5; }
+  .bar i { position: absolute; top: -3px; width: 2px; height: 13px; background: var(--text); }
   pre { background: #0d1117; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
         overflow-x: auto; font-size: 12px; margin: 10px 0 0; }
   .err { color: var(--down); }
@@ -136,8 +160,9 @@
 
 <main>
   <section id="dash" class="on">
+    <!-- 1) 무엇을, 언제 -->
     <div class="panel">
-      <div class="row">
+      <div class="row" style="margin-bottom:0">
         <label>기록 <select id="dbSrc" style="min-width:320px"></select></label>
         <label>시작 <input id="dbFrom" type="date"></label>
         <label>종료 <input id="dbTo" type="date"></label>
@@ -150,35 +175,53 @@
         <span style="flex:1"></span>
         <span class="muted" id="dbInfo"></span>
       </div>
-      <div class="row"><span class="muted">기간은 <b>청산 시각</b> 기준입니다 (손익이 확정된 날에 잡습니다).
-실거래·페이퍼 기록이 비어 있으면 <b>시뮬레이션 결과</b>를 골라 같은 화면으로 볼 수 있습니다.</span></div>
     </div>
+
+    <!-- 2) 지금 돈이 걸려 있는 것부터 (없으면 통째로 감춘다) -->
+    <div id="dbOpenWrap" hidden>
+      <h3 class="dh">지금 들고 있는 포지션 <span class="muted" id="dbOpenCount" style="font-weight:400"></span></h3>
+      <div id="dbOpen" class="poscards"></div>
+    </div>
+
+    <!-- 3) 기간 성과 — 큰 숫자 둘 + 나머지 카드 -->
+    <h3 class="dh">기간 성과 <span class="muted" id="dbRangeLabel" style="font-weight:400"></span></h3>
+    <div class="hero" id="dbHero"></div>
     <div class="cards" id="dbCards"></div>
 
-    <h3 style="font-size:14px;margin:18px 0 8px">누적 순손익 (USDT) <span class="muted" style="font-weight:400">— 점에 마우스를 올리면 그 거래 (코인·손익·누적)</span></h3>
-    <svg class="chart" id="dbEquity" viewBox="0 0 900 260" preserveAspectRatio="none" style="height:260px"></svg>
+    <!-- 4) 흐름 (가로로 긴 차트라 한 줄씩) -->
+    <h3 class="dh">누적 순손익 (USDT)
+      <span class="muted" style="font-weight:400">— 점에 마우스를 올리면 그 거래 (코인·손익·누적)</span></h3>
+    <svg class="chart" id="dbEquity" viewBox="0 0 900 230" preserveAspectRatio="none" style="height:230px"></svg>
 
-    <h3 style="font-size:14px;margin:18px 0 8px">일별 손익 (한국 시간)
+    <h3 class="dh">일별 손익 (한국 시간)
       <span class="muted" style="font-weight:400">— 막대에 마우스를 올리면 그 날</span></h3>
-    <svg class="chart" id="dbDaily" viewBox="0 0 900 200" preserveAspectRatio="none" style="height:200px"></svg>
+    <svg class="chart" id="dbDaily" viewBox="0 0 900 180" preserveAspectRatio="none" style="height:180px"></svg>
 
-    <h3 style="font-size:14px;margin:18px 0 8px">코인별 성과</h3>
-    <div class="wrap"><table id="dbCoin"></table></div>
+    <!-- 5) 쪼개 보기 — 둘 다 짧은 표라 나란히 -->
+    <div class="two">
+      <div>
+        <h3 class="dh">코인별 성과</h3>
+        <div class="wrap"><table id="dbCoin"></table></div>
+      </div>
+      <div>
+        <h3 class="dh">청산 사유별</h3>
+        <div class="wrap"><table id="dbReason"></table></div>
+      </div>
+    </div>
 
-    <h3 style="font-size:14px;margin:18px 0 8px">청산 사유별</h3>
-    <div class="wrap"><table id="dbReason"></table></div>
+    <!-- 6) 원장 — 길어서 접어 둔다 -->
+    <details id="dbHistory">
+      <summary>거래 이력 · 송금 이력 펼치기</summary>
+      <h3 class="dh">거래 이력 <span class="muted" style="font-weight:400">— 포지션 하나당 한 줄</span></h3>
+      <div class="wrap"><table id="dbTrades"></table></div>
+      <h3 class="dh">송금 이력 <span class="muted" style="font-weight:400">— 거래소 간 USDT 이동 (리밸런싱)</span></h3>
+      <div class="wrap"><table id="dbTransfers"></table></div>
+    </details>
 
-    <h3 style="font-size:14px;margin:18px 0 8px">열려 있는 포지션</h3>
-    <div class="wrap"><table id="dbOpen"></table></div>
-
-    <h3 style="font-size:14px;margin:18px 0 8px">거래 이력 <span class="muted" style="font-weight:400">— 포지션 하나당 한 줄</span></h3>
-    <div class="wrap"><table id="dbTrades"></table></div>
-
-    <h3 style="font-size:14px;margin:18px 0 8px">송금 이력 <span class="muted" style="font-weight:400">— 거래소 간 USDT 이동 (리밸런싱)</span></h3>
-    <div class="wrap"><table id="dbTransfers"></table></div>
-    <p class="note">순손익 = 김프 몫 + 펀딩비 − 비용(수수료·전송비). 모두 USDT 기준입니다 — 테더 프리미엄·환율은 양쪽 다리에서 상쇄되므로 들어가지 않습니다.</p>
+    <p class="note">기간은 <b>청산 시각</b> 기준입니다 (손익이 확정된 날에 잡습니다).
+순손익 = 김프 몫 + 펀딩비 − 비용(수수료·전송비). 모두 USDT 기준이라 테더 프리미엄·환율은 양쪽 다리에서 상쇄되어 들어가지 않습니다.
+실거래·페이퍼 기록이 비어 있으면 <b>시뮬레이션 결과</b>를 골라 같은 화면으로 볼 수 있습니다.</p>
   </section>
-
   <section id="live">
     <details>
       <summary>용어 설명 (김프가 왜 세 개인가?)</summary>
@@ -532,8 +575,6 @@ const TIP = {
   reason: "청산 사유" + NL + "TAKE_PROFIT 목표 달성 / STOP_LOSS 손절 / LIQUIDATION 강제청산 / TIMEOUT 한 번만 돌리기 시간 초과",
   status: "포지션 상태" + NL + "OPENING 진입 중 / OPEN 보유 / CLOSING 청산 중 / CLOSED 끝 / ABORTED 되돌림 / ERROR 사람이 정리 필요",
   // ---- 대시보드 ----
-  dbTrades: "이 기간에 청산까지 끝난 거래 수" + NL +
-            "기간은 청산 시각 기준이다. 진입만 하고 아직 들고 있는 것은 '열려 있는 포지션' 에 따로 나온다.",
   dbAvgPercent: "거래별 손익률의 평균 (%)" + NL +
                 "손익률 = 순손익 ÷ 포지션 금액. 포지션 크기가 달라도 비교할 수 있다." + NL +
                 "목표(기본 1%) 근처면 익절로 끝난 거래가 많다는 뜻.",
@@ -1531,7 +1572,7 @@ async function loadDash() {
     // 날짜를 비워 뒀으면 서버가 맞춘 기간(기록 전체)을 칸에 채워 보여준다
     if (!$("dbFrom").value) $("dbFrom").value = d.range.start;
     if (!$("dbTo").value) $("dbTo").value = d.range.end;
-    dashCards(d.summary);
+    dashCards(d.summary, d);
     drawEquity(d.equity);
     drawDaily(d.daily);
     dashTables(d);
@@ -1551,30 +1592,81 @@ function dashSources(d) {
   sel.value = d.source;
 }
 
-function dashCards(s) {
+// 기간 성과 — 제일 중요한 두 개(순손익·승률)는 크게, 나머지는 작은 카드로
+function dashCards(s, d) {
   const amount = (v, dg) => (v === null || v === undefined) ? "-" : (v >= 0 ? "+" : "") + Number(v).toFixed(dg === undefined ? 2 : dg);
   const color = (v, text) => `<span class="${cls(v)}">${text}</span>`;
+
+  $("dbHero").innerHTML = `
+    <div class="hcard">
+      <b class="hint" data-tip="${tipAttr(TIP.netPnl)}">기간 순손익</b>
+      <span class="${cls(s.net_usdt)}">${amount(s.net_usdt)}<small> USDT</small></span>
+      <i>${s.trades}건 · ${s.days >= 1 ? fmt(s.days, 1) + "일간" : "하루 안쪽"}</i>
+    </div>
+    <div class="hcard">
+      <b>승률</b>
+      <span>${s.win_rate === null ? "-" : fmt(s.win_rate, 1) + "<small> %</small>"}</span>
+      <i>${s.wins}승 ${s.losses}패 · 건당 평균 ${amount(s.avg_net_usdt, 3)} USDT</i>
+    </div>`;
+
   const cards = [
-    ["순손익", color(s.net_usdt, amount(s.net_usdt) + " USDT"), TIP.netPnl],
-    ["거래 수", `${s.trades}건 <span class="muted">/ ${s.days}일</span>`, TIP.dbTrades],
-    ["승률", s.win_rate === null ? "-" : `${fmt(s.win_rate, 1)}% <span class="muted">(${s.wins}승 ${s.losses}패)</span>`],
     ["평균 손익률", color(s.avg_net_percent, sign(s.avg_net_percent) + "%"), TIP.dbAvgPercent],
-    ["건당 평균", color(s.avg_net_usdt, amount(s.avg_net_usdt, 3) + " USDT")],
     ["거래 규모 대비", color(s.return_on_turnover, sign(s.return_on_turnover, 3) + "%"), TIP.dbTurnover],
+    ["평균 보유", s.avg_hold_hours === null ? "-" : fmt(s.avg_hold_hours, 1) + "시간", TIP.dbHold],
+    ["최대 낙폭", color(s.max_drawdown_usdt, amount(s.max_drawdown_usdt)), TIP.dbDrawdown],
     ["김프 몫", color(s.gross_usdt, amount(s.gross_usdt)), TIP.dbGross],
     ["펀딩비", color(s.funding_usdt, amount(s.funding_usdt, 3)), TIP.dbFunding],
     ["비용 (수수료·전송)", `<span class="minus">-${fmt(s.cost_usdt, 3)}</span>`, TIP.dbCost],
-    ["평균 보유", s.avg_hold_hours === null ? "-" : fmt(s.avg_hold_hours, 1) + "시간", TIP.dbHold],
-    ["최대 낙폭", color(s.max_drawdown_usdt, amount(s.max_drawdown_usdt)), TIP.dbDrawdown],
     ["월 환산", color(s.net_per_month, amount(s.net_per_month) + " USDT"), TIP.dbMonth],
   ];
   $("dbCards").innerHTML = cards.map(([k, v, tip]) =>
     `<div class="card"><b${tip ? ` class="hint" data-tip="${tipAttr(tip)}"` : ""}>${k}</b><span>${v}</span></div>`).join("");
+  $("dbRangeLabel").textContent = d.range ? `${d.range.start} ~ ${d.range.end}` : "";
+}
+
+// 들고 있는 포지션 — 표보다 카드가 한눈에 들어온다.
+// 막대는 손절선 ↔ 목표선 사이에서 지금 순손익이 어디쯤인지 (오른쪽 끝에 닿으면 익절)
+function dashOpen(rows) {
+  rows = rows || [];
+  $("dbOpenWrap").hidden = rows.length === 0;
+  $("dbOpenCount").textContent = rows.length ? `${rows.length}개` : "";
+  if (!rows.length) return;
+  $("dbOpen").innerHTML = rows.map((r) => {
+    const net = r.last_net_percent, target = r.target || 0, stop = r.stop || 0;
+    const left = r.to_target_percent;
+    const span = target - stop;
+    const at = (net === null || net === undefined || span <= 0) ? 0
+      : Math.max(0, Math.min(100, (net - stop) / span * 100));
+    const held = r.opened_ms ? (Date.now() - r.opened_ms) / 3600000 : null;
+    const goal = (left === null || left === undefined) ? "손익 계산 대기 중"
+      : (left <= 0 ? `<b class="plus">목표 도달</b>`
+                   : `목표까지 <b>${fmt(left, 2)}%p</b> 더 올라야`);
+    return `<div class="pos">
+      <div class="prow">
+        <b class="pcoin">${r.coin}</b>
+        <span class="chip">${r.status}</span>
+        <span class="muted">#${r.id} · ${fmt(r.notional_usdt)} USDT</span>
+        <span style="flex:1"></span>
+        <span class="pnet ${cls(net)}">${sign(net)}%</span>
+      </div>
+      <div class="bar"><u class="${cls(net)}" style="width:${at.toFixed(1)}%"></u><i style="left:${at.toFixed(1)}%"></i></div>
+      <div class="prow" style="font-size:12px">
+        <span class="muted">손절 ${fmt(stop)}%</span>
+        <span style="flex:1;text-align:center">${goal}</span>
+        <span class="muted">목표 +${fmt(target)}%</span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:8px;line-height:1.7">
+        진입 ${r.opened_ms ? kst(r.opened_ms).slice(5, 16) : "-"} (${held === null ? "-" : fmt(held, 1) + "시간 보유"})<br>
+        진입 김프 ${sign(r.entry_premium, 3)} → 지금 청산 김프 ${sign(r.last_exit_premium, 3)}<br>
+        펀딩비 ${sign(r.funding_usdt, 3)} USDT · 강제청산가 ${fmt(r.liquidation_price, 6)}
+      </div>
+    </div>`;
+  }).join("");
 }
 
 // 누적 순손익 선 (가로축 = 청산 시각, 세로축 = USDT). 점 하나가 거래 한 건
 function drawEquity(points) {
-  const svg = $("dbEquity"), W = 900, H = 260, L = 62, R = 18, T = 14, B = 26;
+  const svg = $("dbEquity"), W = 900, H = 230, L = 62, R = 18, T = 14, B = 26;
   if (!points || !points.length) {
     svg.innerHTML = `<text x="20" y="34" fill="${DB_COLORS.dim}">이 기간에 닫은 거래가 없습니다</text>`;
     return;
@@ -1611,7 +1703,7 @@ function drawEquity(points) {
 
 // 일별 손익 막대 (거래가 있던 날만 그린다)
 function drawDaily(days) {
-  const svg = $("dbDaily"), W = 900, H = 200, L = 62, R = 18, T = 12, B = 30;
+  const svg = $("dbDaily"), W = 900, H = 180, L = 62, R = 18, T = 12, B = 30;
   if (!days || !days.length) {
     svg.innerHTML = `<text x="20" y="34" fill="${DB_COLORS.dim}">이 기간에 닫은 거래가 없습니다</text>`;
     return;
@@ -1725,6 +1817,8 @@ function dashTables(d) {
   const hours = (v) => (v === null || v === undefined) ? "-" : (v < 1 ? fmt(v * 60, 0) + "분" : fmt(v, 1) + "시간");
   const when = (ms) => ms ? kst(ms).slice(0, 19) : "-";
 
+  dashOpen(d.open);
+
   table($("dbCoin"), [
     { t: "코인", v: (r) => r.coin },
     { t: "거래", v: (r) => r.trades + "건" },
@@ -1732,8 +1826,7 @@ function dashTables(d) {
     { t: "승률", v: (r) => `${fmt(r.win_rate, 0)}% (${r.wins}/${r.trades})` },
     { t: "평균 손익률", tip: TIP.dbAvgPercent, v: (r) => sign(r.avg_net_percent) + "%", cls: (r) => cls(r.avg_net_percent) },
     { t: "평균 보유", tip: TIP.dbHold, v: (r) => hours(r.avg_hold_hours) },
-    { t: "평균 진입 김프", tip: TIP.entry, v: (r) => sign(r.avg_entry_premium, 3) },
-    { t: "평균 청산 김프", tip: TIP.exit, v: (r) => sign(r.avg_exit_premium, 3) },
+    { t: "진입→청산 김프", tip: TIP.entry, v: (r) => `${sign(r.avg_entry_premium, 2)} → ${sign(r.avg_exit_premium, 2)}` },
     { t: "펀딩비", tip: TIP.dbFunding, v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
     { t: "비용", tip: TIP.dbCost, v: (r) => fmt(r.cost_usdt, 3) },
     { t: "최고/최저", v: (r) => `${sign(r.best_usdt, 2)} / ${sign(r.worst_usdt, 2)}` },
@@ -1746,20 +1839,6 @@ function dashTables(d) {
     { t: "평균 손익률", v: (r) => sign(r.avg_net_percent) + "%", cls: (r) => cls(r.avg_net_percent) },
     { t: "평균 보유", v: (r) => hours(r.avg_hold_hours) },
   ], d.by_reason);
-
-  if (!d.open.length) $("dbOpen").innerHTML = `<tr><td class="muted">열려 있는 포지션이 없습니다</td></tr>`;
-  else table($("dbOpen"), [
-    { t: "코인", v: (r) => r.coin },
-    { t: "상태", tip: TIP.status, v: (r) => r.status },
-    { t: "진입 시각", v: (r) => when(r.opened_ms) },
-    { t: "진입 김프", tip: TIP.entry, v: (r) => sign(r.entry_premium, 3) },
-    { t: "포지션", v: (r) => fmt(r.notional_usdt) + " USDT" },
-    { t: "지금 손익률", v: (r) => sign(r.last_net_percent) + "%", cls: (r) => cls(r.last_net_percent) },
-    { t: "지금 청산 김프", tip: TIP.exit, v: (r) => sign(r.last_exit_premium, 3) },
-    { t: "펀딩비", v: (r) => sign(r.funding_usdt, 3), cls: (r) => cls(r.funding_usdt) },
-    { t: "목표/손절", v: (r) => `+${fmt(r.target)}% / ${fmt(r.stop)}%` },
-    { t: "강제청산가", tip: TIP.liq, v: (r) => fmt(r.liquidation_price, 6) },
-  ], d.open);
 
   if (!d.trades.length) $("dbTrades").innerHTML = `<tr><td class="muted">이 기간에 닫은 거래가 없습니다</td></tr>`;
   else table($("dbTrades"), [
