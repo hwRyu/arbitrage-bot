@@ -1033,6 +1033,44 @@ class TelegramTest(unittest.TestCase):
         self.assertEqual(cmds.handle({"message": {"chat": {"id": 42}, "text": "/status"}}), "OK")
         self.assertIsNone(cmds.handle({"message": {"chat": {"id": 7}, "text": "/status"}}))  # 남의 채팅 무시
 
+    def test_pretty_splits_pipes_and_bolds_head(self):
+        """한 줄 로그 → 머리 굵게 + 항목마다 줄바꿈 + HTML 특수문자 처리"""
+        from kimp.notify import plain, pretty
+        msg = ("[청산 TAKE_PROFIT] #3 IRYS | 김프 -0.268% → -0.605% | 업비트 USDT 19.74개 → 21.53개 (+1.79) | "
+               "바이비트 -1.91 | 펀딩 +0.00 - 비용 0.09 = 순손익 -0.16 USDT (-0.817%)")
+        out = pretty(msg, "🚨 ")
+        lines = out.split("\n")
+        self.assertEqual(lines[0], "🚨 <b>[청산 TAKE_PROFIT]</b> <b>#3 IRYS</b>")
+        self.assertEqual(lines[1], "김프 -0.268% → -0.605%")
+        self.assertEqual(len(lines), 5)
+        # 긴 항목은 ' / ' 에서 한 번 더
+        entry = ("[진입] #4 IRYS | 업비트 USDT 19.78개 매도(1335.0원) → 690.707개 매수(38.20원) / 바이비트 690개 숏(0.028647, 1배, "
+                 "강제청산 0.057151) | 진입 김프 -0.114% (판단 -0.204%, 기준 -0.13%) → 목표 0.20% 되려면 김프 약 +0.52%")
+        e = pretty(entry).split("\n")
+        self.assertEqual(e[0], "<b>[진입]</b> <b>#4 IRYS</b>")
+        self.assertTrue(e[2].startswith("바이비트 690개 숏"))
+        # 태그 없는 문장과 HTML 특수문자
+        self.assertEqual(pretty("a < b & c", "⚠️ "), "⚠️ a &lt; b &amp; c")
+        self.assertEqual(plain(pretty("[태그] x < y")), "[태그]
+x < y")   # 번호·코인이 없으면 몸통은 다음 줄
+
+    def test_worker_falls_back_to_plain_text_when_html_rejected(self):
+        """HTML 전송이 거절되면 평문으로 한 번 더 보낸다 (알림을 잃지 않게)"""
+        from kimp.notify import TelegramNotifier
+        sent = []
+
+        def post(url, data, timeout=10.0):
+            sent.append(dict(data))
+            if data.get("parse_mode") == "HTML":
+                raise RuntimeError("400 can't parse entities")
+            return {"ok": True}
+
+        n = TelegramNotifier("T", "42", post=post)
+        n.send("<b>[진입]</b> <b>#1 XRP</b>\n김프 -1%")
+        self.assertTrue(n.flush(timeout=5))
+        self.assertEqual([d.get("parse_mode") for d in sent], ["HTML", None])
+        self.assertEqual(sent[1]["text"], "[진입] #1 XRP\n김프 -1%")
+
     def test_flush_sends_queued_before_exit(self):
         """
         종료 직전 flush() 가 큐에 남은 알림을 다 보낸다 (실거래에서 겪은 버그)

@@ -22,9 +22,11 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import queue
+import re
 import threading
 import time
 import urllib.parse
@@ -32,6 +34,49 @@ import urllib.request
 from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# 로그 한 줄의 모양: "[태그] #번호 코인 | 항목 | 항목 ..." — 텔레그램에서는 한 줄로 길게 오면 눈에 안 들어온다
+_TAG_RE = re.compile(r"^(\[[^\]]+\])\s*(.*)$", re.S)
+_POS_RE = re.compile(r"(#\d+ [A-Z0-9]+)")
+_LONG_LINE = 70
+
+
+def pretty(text: str, icon: str = "") -> str:
+    """
+    로그 한 줄 → 텔레그램 HTML (읽기 좋게)
+
+        🚨 <b>[청산 TAKE_PROFIT]</b> <b>#3 IRYS</b>
+        김프 -0.268% → -0.605%
+        업비트 USDT 19.74개 → 21.53개 (+1.79)
+        ...
+
+    - 맨 앞 [태그] 와 '#번호 코인' 은 굵게, 첫 줄에
+    - ' | ' 로 이어 붙인 항목은 줄마다 하나씩. 그래도 긴 줄은 ' / ' 에서 한 번 더 나눈다
+    - 태그가 없는 문장은 그대로 (HTML 특수문자만 피한다)
+    """
+    m = _TAG_RE.match(text)
+    if not m:
+        return icon + html.escape(text)
+    tag, body = m.group(1), m.group(2)
+    parts = [p.strip() for p in body.split(" | ") if p.strip()]
+    first = f"{icon}<b>{html.escape(tag)}</b>"
+    if parts:
+        pm = _POS_RE.match(parts[0])
+        if pm:
+            first += f" <b>{html.escape(pm.group(1))}</b>{html.escape(parts[0][pm.end():])}"
+            parts = parts[1:]
+    lines = [first]
+    for p in parts:
+        if len(p) > _LONG_LINE and " / " in p:
+            lines.extend(html.escape(x.strip()) for x in p.split(" / "))
+        else:
+            lines.append(html.escape(p))
+    return "\n".join(lines)
+
+
+def plain(text: str) -> str:
+    """HTML 을 못 보낼 때 쓰는 평문 (굵게 표시만 벗기고 특수문자는 되돌린다)"""
+    return html.unescape(re.sub(r"</?b>", "", text))
 
 # INFO 로그 중에서도 보낼 것 (메시지가 이걸로 시작하면)
 INFO_TAGS = ("[진입]", "[청산", "[송금", "[펀딩비 진입]", "[펀딩비 청산]", "[복구]", "[신규 진입 재개]", "[하루 요약]")
@@ -70,7 +115,7 @@ class TelegramNotifier:
         """
         self.token = token
         self.chat_id = str(chat_id)
-        self.prefix = prefix
+        self.prefix = html.escape(prefix)   # 메시지는 HTML 로 보내므로 접두어도 피한다
         self._post = post
         self._q: "queue.Queue[str]" = queue.Queue(maxsize=200)
         self._sent_at: Dict[str, float] = {}
@@ -109,9 +154,13 @@ class TelegramNotifier:
         while True:
             text = self._q.get()
             try:
-                self._post(self.url("sendMessage"), {"chat_id": self.chat_id, "text": text})
-            except Exception as exc:  # 알림 실패로 매매를 멈추지 않는다
-                logging.getLogger("kimp.notify.quiet").debug("텔레그램 보내기 실패: %s", exc)
+                self._post(self.url("sendMessage"), {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"})
+            except Exception as exc:
+                # HTML 이 깨져서 거절됐을 수 있다 → 평문으로 한 번 더 (알림을 잃는 것보다 낫다)
+                try:
+                    self._post(self.url("sendMessage"), {"chat_id": self.chat_id, "text": plain(text)})
+                except Exception as exc2:  # 알림 실패로 매매를 멈추지 않는다
+                    logging.getLogger("kimp.notify.quiet").debug("텔레그램 보내기 실패: %s / %s", exc, exc2)
 
     def flush(self, timeout: float = 10.0) -> bool:
         """
@@ -139,7 +188,8 @@ class TelegramNotifier:
     def send_now(self, text: str) -> bool:
         """바로 보내고 성공 여부 (live_check 테스트 메시지용)"""
         try:
-            r = self._post(self.url("sendMessage"), {"chat_id": self.chat_id, "text": f"{self.prefix}{text}"})
+            r = self._post(self.url("sendMessage"),
+                           {"chat_id": self.chat_id, "text": f"{self.prefix}{html.escape(text)}", "parse_mode": "HTML"})
             return bool(r.get("ok"))
         except Exception as exc:
             logger.warning("텔레그램 보내기 실패: %s", exc)
@@ -175,7 +225,7 @@ class TelegramLogHandler(logging.Handler):
             return
         if record.levelno >= logging.WARNING or msg.startswith(INFO_TAGS):
             icon = "🚨 " if record.levelno >= logging.CRITICAL else ("⚠️ " if record.levelno >= logging.WARNING else "")
-            self.notifier.send(icon + msg)
+            self.notifier.send(pretty(msg, icon))
 
 
 class TelegramCommands:
