@@ -31,6 +31,12 @@ def setup_logging(level: str = "INFO", log_dir: str = "logs") -> None:
     root.setLevel(level)
     root.handlers.clear()  # 중복 호출 시 핸들러가 쌓이지 않도록
 
+    # Windows 에서 stdout 을 파일로 돌리면 cp949 로 쓰여서 '—' 같은 글자마다 'Logging error' 가 난다.
+    # 콘솔도 파일 로그와 같이 UTF-8 로 고정한다 (못 바꾸는 환경이면 그대로 둔다)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     root.addHandler(console)
