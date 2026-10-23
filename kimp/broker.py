@@ -233,10 +233,25 @@ class HedgeBroker:
         self.reconcile_interval_sec = reconcile_interval_sec
         self.hedge_tolerance_percent = hedge_tolerance_percent
         self._last_reconcile = -1e18
+        self._last_repeat: Dict[str, float] = {}   # 반복 알림 억제용 {키: 마지막으로 알린 시각}
 
     @property
     def is_paper(self) -> bool:
         return self.ex.is_paper
+
+    def _log_repeat(self, key: str, level: int, message: str, cooldown_sec: float = 300.0) -> None:
+        """
+        매 스캔 되풀이되는 같은 문제는 처음 한 번만 그 레벨로, 그 뒤 cooldown 동안은 DEBUG 로
+
+        청산이 막힌 포지션은 10초마다 다시 시도하는데, 그때마다 CRITICAL 을 찍으면 텔레그램이
+        도배되어 정작 새로운 문제를 놓친다. 문제가 풀리면(성공) 키를 지워서 다음 번엔 다시 알린다.
+        """
+        now = self._now().timestamp()
+        if now - self._last_repeat.get(key, -1e18) >= cooldown_sec:
+            self._last_repeat[key] = now
+            logger.log(level, message)
+        else:
+            logger.debug("(반복, 알림 생략) %s", message)
 
     # ------------------------------------------------------------------
     # 잔고
@@ -335,8 +350,10 @@ class HedgeBroker:
             try:
                 f = self.ex.lookup(session, row.side, pos.coin, row.client_id)
             except Exception as exc:
-                logger.warning("#%d %s 주문 %s 결과 조회 실패 (다음에 다시): %s", pos.id, pos.coin, row.client_id, exc)
+                self._log_repeat(f"lookup-{pos.id}", logging.WARNING,
+                                 f"#{pos.id} {pos.coin} 주문 {row.client_id} 결과 조회 실패 (다음에 다시): {exc}")
                 return False
+            self._last_repeat.pop(f"lookup-{pos.id}", None)
             if f is None or f.qty <= 0:
                 row.state = FillState.VOID
             else:
@@ -417,13 +434,28 @@ class HedgeBroker:
             raise EntryRejected(f"주문 결과 모름 → 다음 스캔에 조회: {exc}") from exc
         except OrderFailed as exc:
             self.safety.record_failure(f"{coin} 진입: {exc}")
-            self._unwind_entry(session, pos, quote, str(exc))
+            if not self._unwind_entry(session, pos, quote, str(exc)):
+                raise EntryRejected(f"주문 실패 → 되돌리는 중 결과 모름, 다음 스캔에 이어서: {exc}") from exc
             raise EntryRejected(f"주문 실패 → 되돌림: {exc}") from exc
 
-        self._balance_hedge(session, pos, quote)
-        self._return_leftover_krw(session, pos, quote)
+        # 4) 크기 맞추기 + 남은 원화 되돌리기. 여기서 주문 결과를 모르면 OPEN 으로 끝내면 안 된다 —
+        #    OPEN 포지션의 SENT 기록은 아무도 다시 조회하지 않아서 DB 숏 개수가 실제와 어긋난 채 굳는다.
+        #    OPENING 으로 두고 멈추면 다음 스캔 sync 가 추적번호로 채운 뒤 이 단계부터 이어서 한다.
+        try:
+            self._balance_hedge(session, pos, quote)
+            self._return_leftover_krw(session, pos, quote)
+        except OrderUnknown as exc:
+            self._order_unknown(session, pos, exc)
+            raise EntryRejected(f"크기 맞추기 결과 모름 → 다음 스캔에 조회해서 이어서: {exc}") from exc
         self._finish_entry(session, pos)
         self.safety.record_success()
+        # 주문 세 개를 순서대로 내는 사이(보통 1~3초)에 가격이 움직이면 실제 진입 김프가 판단 때보다 나빠진다.
+        # 포지션은 양쪽 다 들어간 정상 헷지라 되돌리지 않지만, 목표까지 그만큼 더 올라야 하므로 알린다.
+        drift = pos.entry_premium - plan.premium
+        if drift > self.max_slippage_percent:
+            logger.warning("[진입 김프 밀림] #%d %s 판단 %+.3f%% → 실제 %+.3f%% (%+.3f%%p 불리) — 주문 사이에 "
+                           "가격이 움직였습니다. 헷지는 정상이고, 목표까지 그만큼 더 올라야 합니다",
+                           pos.id, coin, plan.premium, pos.entry_premium, drift)
         return pos
 
     def _balance_hedge(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
@@ -466,6 +498,8 @@ class HedgeBroker:
                     return  # 업비트 최소 주문보다 작아서 못 팖 (그대로 둠)
                 self._leg(session, pos, "trim_coin",
                           lambda cid: self.ex.sell_coin(session, quote, pos.coin, qty, client_id=cid))
+        except OrderUnknown:
+            raise  # 결과를 모르면 추측하지 않는다 → 부르는 쪽이 OPENING 으로 두고 다음 스캔에 조회
         except OrderFailed as exc:
             self.safety.record_failure(f"{pos.coin} 크기 맞추기: {exc}")
             logger.critical("[크기 맞추기 실패] #%d %s 양쪽 차이 %.2f USDT 그대로 관리합니다 (청산은 정상): %s",
@@ -490,6 +524,8 @@ class HedgeBroker:
         try:
             self._leg(session, pos, "trim_buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
                 session, quote, left / (1 + rate), client_id=cid))
+        except OrderUnknown:
+            raise  # 위와 같다 — 추측해서 OPEN 으로 끝내지 않는다
         except OrderFailed as exc:
             self.safety.record_failure(f"{pos.coin} 남은 원화 되돌리기: {exc}")
             logger.critical("[남은 원화 되돌리기 실패] #%d %s 원화 %s 원이 업비트에 남아 있습니다: %s",
@@ -517,13 +553,19 @@ class HedgeBroker:
         pos.status = PositionStatus.OPEN
         session.commit()
 
-    def _unwind_entry(self, session: Session, pos: Position, quote: Optional[Quote], why: str) -> None:
+    def _unwind_entry(self, session: Session, pos: Position, quote: Optional[Quote], why: str) -> bool:
         """
         진입 중 실패: 끝난 단계를 거꾸로 되돌린다 → ABORTED (되돌리기도 실패하면 ERROR)
 
         남은 것을 계산해서 그만큼만 되돌린다 (일부 체결·크기 맞추기까지 포함)
           코인이 남았으면 팔고 → 남은 원화로 USDT 되사고 → 남은 숏 닫기
         예) 숏 100개 + USDT 50개 판 뒤 코인 매수 실패 → 받은 원화로 USDT 되사기 → 숏 100개 닫기
+
+        되돌리는 주문의 **결과를 모르면** ERROR 로 끝내지 않는다. OPENING 그대로 두면 다음 스캔 sync 가
+        추적번호로 조회해 채운 뒤 이 함수를 다시 불러 남은 것만 되돌린다 (남은 양은 체결 합계로 다시 센다).
+
+        Returns:
+            끝났으면 True (ABORTED 또는 ERROR). 결과를 몰라 멈췄으면 False (OPENING 유지)
         """
         rate = self.fees.upbit_trade_fee_rate
         s = lambda k, sums: sums.get(k, LegSum())  # noqa: E731
@@ -545,6 +587,9 @@ class HedgeBroker:
             if short_left > o.qty * 1e-9:
                 self._leg(session, pos, "unwind_close_short", lambda cid: self.ex.close_short(
                     session, quote, pos.coin, short_left, o.avg, short_left * o.avg / self.leverage, client_id=cid))
+        except OrderUnknown as exc:
+            self._order_unknown(session, pos, exc)
+            return False
         except OrderFailed as exc:
             pos.status = PositionStatus.ERROR
             pos.exit_reason = "UNWIND_FAILED"
@@ -552,7 +597,7 @@ class HedgeBroker:
             self.safety.record_failure(f"{pos.coin} 되돌리기: {exc}")
             logger.critical("[되돌리기 실패] #%d %s 진입 실패(%s) 후 되돌리기도 실패: %s → 거래소에서 직접 확인·정리하세요 "
                             "(신규 진입 중단)", pos.id, pos.coin, why, exc)
-            return
+            return True
 
         # 되돌림 손익 (수수료·호가 간격 정도 손해)
         sums = self._sums(session, pos)
@@ -567,6 +612,7 @@ class HedgeBroker:
         pos.net_pnl_usdt = net
         session.commit()
         logger.error("[진입 되돌림] #%d %s %s → 끝난 단계를 되돌렸습니다 (손익 %+.4f USDT)", pos.id, pos.coin, why, net)
+        return True
 
     # ------------------------------------------------------------------
     # 평가 / 청산
@@ -691,14 +737,18 @@ class HedgeBroker:
             return None
         except OrderFailed as exc:
             self.safety.record_failure(f"{pos.coin} 청산: {exc}")
-            logger.critical("[청산 실패] #%d %s 청산 중 실패: %s → CLOSING 으로 두고 다음 스캔에서 남은 양만 이어서",
-                            pos.id, pos.coin, exc)
+            # 거래소 점검처럼 한참 막히면 10초마다 여기로 온다 → 5분에 한 번만 알린다
+            self._log_repeat(f"close-{pos.id}", logging.CRITICAL,
+                             f"[청산 실패] #{pos.id} {pos.coin} 청산 중 실패: {exc} → CLOSING 으로 두고 "
+                             f"다음 스캔에서 남은 양만 이어서 (같은 문제가 이어지면 5분마다 알립니다)")
             return None
         if not done:
             self.safety.record_failure(f"{pos.coin} 청산: {MAX_LEG_RETRIES}번 해도 다 안 끝남")
-            logger.critical("[청산 덜 끝남] #%d %s %d번 다시 주문해도 남음 → 다음 스캔에서 이어서",
-                            pos.id, pos.coin, MAX_LEG_RETRIES)
+            self._log_repeat(f"close-{pos.id}", logging.CRITICAL,
+                             f"[청산 덜 끝남] #{pos.id} {pos.coin} {MAX_LEG_RETRIES}번 다시 주문해도 남음 → "
+                             f"다음 스캔에서 이어서 (같은 문제가 이어지면 5분마다 알립니다)")
             return None
+        self._last_repeat.pop(f"close-{pos.id}", None)   # 끝났으니 다음에 또 막히면 바로 알린다
 
         sums = self._sums(session, pos)
         sold, bought = s("sell", sums), s("buy_usdt", sums)
@@ -782,9 +832,14 @@ class HedgeBroker:
             if pos.status == PositionStatus.OPENING:
                 sums = self._sums(session, pos)
                 if {"open_short", "sell_usdt", "buy"} <= sums.keys():
-                    # 세 단계는 끝났는데 기록 직전에 꺼졌던 경우 → 크기 맞추고 OPEN
-                    self._balance_hedge(session, pos, quote)
-                    self._return_leftover_krw(session, pos, quote)
+                    # 세 단계는 끝났는데 그 뒤(크기 맞추기·기록)에서 멈췄던 경우 → 크기 맞추고 OPEN.
+                    # 크기 맞추기 주문의 결과를 또 모르면 그대로 OPENING 에 두고 다음 스캔에 다시 조회한다.
+                    try:
+                        self._balance_hedge(session, pos, quote)
+                        self._return_leftover_krw(session, pos, quote)
+                    except OrderUnknown as exc:
+                        self._order_unknown(session, pos, exc)
+                        continue
                     self._finish_entry(session, pos)
                     logger.warning("[복구] #%d %s 진입이 끝나 있어서 OPEN 으로", pos.id, pos.coin)
                 else:
@@ -907,9 +962,10 @@ class HedgeBroker:
         for t in self.pending_transfers(session):
             try:
                 arrived = self.ex.transfer_arrived(session, t)
-            except Exception as exc:  # 조회 실패는 다음에 다시
-                logger.warning("송금 #%d 확인 실패 (다음에 다시): %s", t.id, exc)
+            except Exception as exc:  # 조회 실패는 다음에 다시 (거래소가 한참 안 되면 5분에 한 번만 알림)
+                self._log_repeat(f"transfer-{t.id}", logging.WARNING, f"송금 #{t.id} 확인 실패 (다음에 다시): {exc}")
                 continue
+            self._last_repeat.pop(f"transfer-{t.id}", None)
             if arrived:
                 t.status, t.confirmed_at = TransferStatus.CONFIRMED, self._now()
                 logger.warning("[송금 도착] #%d %s USDT %s 개", t.id, t.direction, f"{t.amount_usdt - t.fee_usdt:,.2f}")

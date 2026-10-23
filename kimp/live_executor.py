@@ -148,11 +148,14 @@ class LiveExecutor:
         한 스캔에서 free() 를 여러 번 부르는데 매번 조회하면 요청 제한에 걸린다.
         주문·출금 뒤에는 잔고가 바뀌므로 refresh() 로 비워서 다시 받게 한다.
         """
-        if self._up_bal is None:
-            self._up_bal = self.up.fetch_balance()
-        if self._by_bal is None:
-            self._by_bal = self.by.fetch_balance()
-        return self._up_bal, self._by_bal
+        # 지역 변수로 한 번만 읽는다. 텔레그램 스레드(/status)가 refresh() 로 캐시를 비우는 순간과
+        # 겹치면, 필드를 두 번 읽는 코드는 (None, …) 을 돌려줘 잔고 계산이 터진다.
+        up, by = self._up_bal, self._by_bal
+        if up is None:
+            up = self._up_bal = self.up.fetch_balance()
+        if by is None:
+            by = self._by_bal = self.by.fetch_balance()
+        return up, by
 
     @staticmethod
     def _amount(bal: dict, cur: str, kind: str) -> float:

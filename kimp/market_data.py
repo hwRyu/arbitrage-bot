@@ -25,6 +25,32 @@ from kimp.premium import OrderBook, Quote
 
 logger = logging.getLogger(__name__)
 
+# 같은 조회 실패를 매 스캔(10초)마다 찍으면 거래소 점검 한 번에 텔레그램이 수백 통 온다.
+# 처음 한 번만 그 레벨로 알리고, 그 뒤 이 시간 동안은 DEBUG 로 낮춘다. 성공하면 '복구' 를 한 번 알린다.
+REPEAT_COOLDOWN_SEC = 300.0
+_fail_since: Dict[str, float] = {}   # 키 → 처음 실패한 시각 (monotonic)
+_last_told: Dict[str, float] = {}    # 키 → 마지막으로 알린 시각
+
+
+def _log_repeat(key: str, level: int, message: str) -> None:
+    """되풀이되는 조회 실패를 REPEAT_COOLDOWN_SEC 에 한 번만 알린다"""
+    now = time.monotonic()
+    _fail_since.setdefault(key, now)
+    if now - _last_told.get(key, -1e18) >= REPEAT_COOLDOWN_SEC:
+        _last_told[key] = now
+        logger.log(level, message)
+    else:
+        logger.debug("(반복, 알림 생략) %s", message)
+
+
+def _log_recovered(key: str, what: str) -> None:
+    """막혔던 조회가 다시 되면 얼마나 막혔었는지 한 번 알린다 (알렸던 적이 있을 때만)"""
+    since = _fail_since.pop(key, None)
+    _last_told.pop(key, None)
+    if since is not None:
+        logger.warning("%s 복구 (%.0f초 동안 안 됐음)", what, time.monotonic() - since)
+
+
 # 업비트 USDT/KRW: 김프 계산 기준이자, 진입/청산 때 실제로 USDT 를 사고파는 마켓
 USDT_KRW_SYMBOL = "USDT/KRW"
 
@@ -160,33 +186,41 @@ class MarketData:
         symbols = [upbit_symbol(c) for c in coins] + [USDT_KRW_SYMBOL]
         try:
             upbit_books = self.upbit.fetch_order_books(symbols, self.depth)
-        except Exception as exc:  # 네트워크 오류, 요청 제한 등
-            logger.error("업비트 호가 조회 실패: %s", exc)
+        except Exception as exc:  # 네트워크 오류, 요청 제한, 거래소 점검 등
+            # 이게 안 되면 이번 스캔은 통째로 쉰다 (보유 포지션 관리도 못 한다) — 길어지면 5분마다 알림
+            _log_repeat("upbit-books", logging.ERROR,
+                        f"업비트 호가 조회 실패: {exc} (이 동안은 진입·청산·강제청산 확인을 못 합니다)")
             return {}
+        _log_recovered("upbit-books", "업비트 호가 조회")
 
         usdt_raw = upbit_books.get(USDT_KRW_SYMBOL)
         usdt_book = self._to_orderbook(usdt_raw) if usdt_raw else None
         if usdt_book is None or usdt_book.mid is None:
-            logger.error("업비트 USDT/KRW 호가가 없어서 이번 스캔은 건너뜁니다")
+            _log_repeat("usdt-book", logging.ERROR, "업비트 USDT/KRW 호가가 없어서 이번 스캔은 건너뜁니다")
             return {}
+        _log_recovered("usdt-book", "업비트 USDT/KRW 호가")
 
         quotes: Dict[str, Quote] = {}
         for coin in coins:
             up_raw = upbit_books.get(upbit_symbol(coin))
             if not up_raw:
-                logger.warning("%s 업비트 호가 없음", coin)
+                _log_repeat(f"upbit-{coin}", logging.WARNING, f"{coin} 업비트 호가 없음")
                 continue
             try:
                 by_raw = self.bybit.fetch_order_book(bybit_symbol(coin), self.depth)
             except Exception as exc:
-                logger.warning("%s 바이비트 호가 조회 실패: %s", coin, exc)
+                # 이 코인만 이번 스캔에서 빠진다 (들고 있으면 그동안 평가·청산을 못 한다)
+                _log_repeat(f"bybit-{coin}", logging.WARNING, f"{coin} 바이비트 호가 조회 실패: {exc}")
                 continue
+            _log_recovered(f"bybit-{coin}", f"{coin} 바이비트 호가 조회")
 
             upbit_book = self._to_orderbook(up_raw)
             bybit_book = self._to_orderbook(by_raw)
             if upbit_book.mid is None or bybit_book.mid is None:
-                logger.warning("%s 호가가 비어 있어서 건너뜀", coin)
+                _log_repeat(f"empty-{coin}", logging.WARNING, f"{coin} 호가가 비어 있어서 건너뜀")
                 continue
+            _log_recovered(f"upbit-{coin}", f"{coin} 업비트 호가")
+            _log_recovered(f"empty-{coin}", f"{coin} 호가")
             quotes[coin] = Quote(coin=coin, upbit=upbit_book, bybit=bybit_book, usdt=usdt_book, fx_krw=fx_krw)
         return quotes
 
@@ -200,8 +234,9 @@ class MarketData:
         try:
             raw = self.bybit.fetch_funding_rate(bybit_symbol(coin))
         except Exception as exc:
-            logger.warning("%s 펀딩비 조회 실패: %s", coin, exc)
+            _log_repeat(f"funding-{coin}", logging.WARNING, f"{coin} 펀딩비 조회 실패: {exc}")
             return None
+        _log_recovered(f"funding-{coin}", f"{coin} 펀딩비 조회")
 
         rate = raw.get("fundingRate")
         # ccxt 바이비트는 '다음 정산 시각' 을 fundingTimestamp 에 넣어준다

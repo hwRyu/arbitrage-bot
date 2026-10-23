@@ -157,7 +157,8 @@ class Engine:
             quote = quotes.get(coin)
             valuation = self.broker.value_exit(pos, quote) if quote else None
             if valuation is None:
-                logger.warning("[강제 청산] %s 호가가 모자라서 이번 스캔에는 못 했습니다 (다시 시도합니다)", coin)
+                self._log_throttled(f"manual-thin-{coin}", logging.WARNING,
+                                    f"[강제 청산] {coin} 호가가 모자라서 이번 스캔에는 못 했습니다 (다시 시도합니다)")
                 continue
             logger.warning("[강제 청산] #%d %s 사람이 지시 → 지금 시세로 정리 (순손익 %+.3f%%)",
                            pos.id, coin, valuation.pnl.net_percent)

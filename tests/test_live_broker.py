@@ -540,6 +540,116 @@ class LegRiskTest(unittest.TestCase):
             self.assertAlmostEqual(total - 1000, pnl.net_usdt, delta=0.01)
 
 
+class JumpyBybit(FakeBybit):
+    """숏이 체결되는 순간 업비트 코인 가격이 뛴다 — REST 로 주문 세 개를 순서대로 내는 사이의 시간을 흉내"""
+
+    jump = 1.01
+
+    def create_order(self, symbol, type_, side, amount, price=None, params=None):
+        r = super().create_order(symbol, type_, side, amount, price, params)
+        if side == "sell":
+            self.p.coin_bid *= self.jump
+            self.p.coin_ask *= self.jump
+        return r
+
+
+class HedgeGapTest(unittest.TestCase):
+    """
+    실거래 전 검증에서 찾은 구멍들 (2026-10-23)
+
+    - 크기 맞추기(trim) 주문의 결과를 모르면 OPEN 으로 끝내 버려 DB 숏 ≠ 실제 숏 이 굳던 문제
+    - 되돌리기 중 결과를 모르면 바로 ERROR(사람 호출) 로 끝내던 문제
+    - 주문 사이에 가격이 움직여 진입 김프가 나빠져도 아무 말이 없던 문제
+    - 청산이 막히면 10초마다 CRITICAL 을 찍어 텔레그램을 도배하던 문제
+    """
+
+    def test_trim_unknown_keeps_opening_until_resolved(self):
+        """크기 맞추기(trim_short) 결과를 모름 → OPEN 으로 끝내지 않는다 → 조회되면 실제 숏 개수로 OPEN"""
+        prices, up, by, broker, sf = make_live()
+        up.partial["buy XRP/KRW"] = 0.8          # 코인 80% 만 사짐 → 숏 20% 를 줄여야 함
+        by.lost.add("close_short")               # 그 trim 주문: 들어갔는데 응답 끊김
+        by.lookup_down = True                    # 추적번호 조회도 안 됨
+        with sf() as s:
+            with self.assertRaises(EntryRejected):
+                broker.open_hedge(s, prices.quote(), 50.0)
+            pos = s.query(Position).one()
+            self.assertEqual(pos.status, PositionStatus.OPENING)     # OPEN 이 아니라 멈춤
+            self.assertFalse(broker.entries_allowed(s)[0])            # 그동안 신규 진입 막힘
+            by.lookup_down = False
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            s.refresh(pos)
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertAlmostEqual(pos.bybit_qty, by.short, places=6)  # DB = 실제 (전에는 50 vs 39.93)
+            self.assertEqual(by.calls.count("close_short"), 1)        # 중복 trim 없음
+            self.assertTrue(broker.entries_allowed(s)[0])
+            self.assertEqual(broker.reconcile(s, ["XRP"]), [])
+
+    def test_unwind_unknown_waits_instead_of_error(self):
+        """되돌리기 주문의 결과를 모름 → ERROR 가 아니라 OPENING 유지 → 조회되면 ABORTED 로 마무리"""
+        prices, up, by, broker, sf = make_live()
+        up.fail.add("buy XRP/KRW")               # 3단계 실패 → 되돌리기 시작
+        by.lost.add("close_short")               # 되돌리는 숏 닫기: 들어갔는데 결과 모름
+        by.lookup_down = True
+        with sf() as s:
+            with self.assertRaises(EntryRejected):
+                broker.open_hedge(s, prices.quote(), 50.0)
+            pos = s.query(Position).one()
+            self.assertEqual(pos.status, PositionStatus.OPENING)     # ERROR(사람 호출) 가 아니다
+            by.lookup_down = False
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            s.refresh(pos)
+            self.assertEqual(pos.status, PositionStatus.ABORTED)
+            self.assertEqual(by.short, 0.0)
+            self.assertEqual(by.calls.count("close_short"), 1)        # 중복 주문 없음
+            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.5)  # USDT 로 되돌아옴
+
+    def test_entry_premium_drift_is_warned(self):
+        """주문 사이에 가격이 움직여 실제 진입 김프가 판단보다 MAX_SLIPPAGE 넘게 나빠지면 경고 (헷지는 유지)"""
+        prices = Prices()
+        up, by = FakeUpbit(prices), JumpyBybit(prices)
+        ex = LiveExecutor(up, by, settings(), sleep=lambda _x: None, order_timeout_sec=0.01)
+        broker = HedgeBroker(ex, FEES, 0.3, leverage=1.0, safety=Safety(3), auto_transfer=True, network="TRX")
+        sf = make_session_factory(":memory:")
+        with sf() as s:
+            q = prices.quote()
+            judged = q.entry_plan(50.0, FEES.upbit_trade_fee_rate).premium
+            with self.assertLogs("kimp.broker", level=logging.WARNING) as logs:
+                pos = broker.open_hedge(s, q, 50.0)
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertGreater(pos.entry_premium - judged, 0.9)        # 약 1%p 불리하게 기록됨
+            self.assertTrue(any("진입 김프 밀림" in m for m in logs.output), logs.output)
+
+    def test_small_drift_is_quiet(self):
+        """0.3% 안쪽으로만 움직이면 경고하지 않는다"""
+        prices = Prices()
+        up, by = FakeUpbit(prices), JumpyBybit(prices)
+        by.jump = 1.001
+        ex = LiveExecutor(up, by, settings(), sleep=lambda _x: None, order_timeout_sec=0.01)
+        broker = HedgeBroker(ex, FEES, 0.3, leverage=1.0, safety=Safety(3), auto_transfer=True, network="TRX")
+        sf = make_session_factory(":memory:")
+        with sf() as s:
+            with self.assertNoLogs("kimp.broker", level=logging.WARNING):
+                broker.open_hedge(s, prices.quote(), 50.0)
+
+    def test_close_failure_alert_is_not_repeated_every_scan(self):
+        """청산이 계속 막혀도 CRITICAL 은 5분에 한 번 (텔레그램 도배 방지). 풀리면 정상 완료"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            val = broker.value_exit(pos, prices.quote())
+            up.fail.add("sell XRP/KRW")
+            with self.assertLogs("kimp.broker", level=logging.CRITICAL) as first:
+                broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+            self.assertEqual(sum("[청산 실패]" in m for m in first.output), 1)
+            up.fail.add("sell XRP/KRW")              # 다음 스캔에도 막힘
+            with self.assertNoLogs("kimp.broker", level=logging.CRITICAL):
+                broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            self.assertEqual(pos.status, PositionStatus.CLOSING)
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])   # 이제 됨
+            self.assertEqual(pos.status, PositionStatus.CLOSED)
+            self.assertEqual(by.short, 0.0)
+
+
 class MinOrderTest(unittest.TestCase):
     """최소 주문 금액: 하드코딩 아님 (실거래는 거래소 값, 없으면 설정값)"""
 
