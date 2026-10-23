@@ -19,6 +19,18 @@
 
 준비: 텔레그램 @BotFather 에서 봇을 만들어 토큰 받기 → 봇에게 아무 말이나 보낸 뒤
       https://api.telegram.org/bot<토큰>/getUpdates 에서 chat.id 확인 → .env 에 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+메시지 형식 규칙 (알림과 명령 답장 모두, pretty() 가 이 모양으로 만든다)
+------------------------------------------------------------------
+    🚨 [청산 · 강제청산] #4 IRYS      ← 첫 줄 굵게. 태그·사유는 한글, '#번호 코인' 은 그대로
+    • 순손익 +0.58 USDT (+2.94%)      ← 항목마다 한 줄, 앞에 '•' (폰에서 너비 때문에 접힌 줄과 구분)
+    • 김프 진입 -0.114% → 청산 +1.818%
+    ...
+  - 로그 한 줄에서는 항목을 ' | ' 로 이어 붙인다 (파일 로그는 한 줄이 grep 하기 좋다). 긴 항목은 ' / ' 로 한 번 더
+  - 거래소는 업비트 / 바이비트 (한글), 방향은 '업비트 → 바이비트'
+  - 금액 12.34 USDT · 26,412원 · 690.7개 / 가격 0.028647 USDT · 38.20원 / 김프·손익률 -0.29% / 차이 0.12%p
+  - 청산 요약 순서: 순손익 → 김프 진입→청산 → 업비트 몫 → 바이비트 몫 → 펀딩·비용 → 보유 시간
+  - 명령 답장(/status /premium …)도 "[현황] …" 처럼 태그로 시작해 같은 모양이 된다
 """
 from __future__ import annotations
 
@@ -37,8 +49,9 @@ logger = logging.getLogger(__name__)
 
 # 로그 한 줄의 모양: "[태그] #번호 코인 | 항목 | 항목 ..." — 텔레그램에서는 한 줄로 길게 오면 눈에 안 들어온다
 _TAG_RE = re.compile(r"^(\[[^\]]+\])\s*(.*)$", re.S)
-_POS_RE = re.compile(r"(#\d+ [A-Z0-9]+)")
+_POS_RE = re.compile(r"(#\d+(?: [A-Z0-9]+)?)")   # '#4 IRYS' 또는 '#9' (송금 번호)
 _LONG_LINE = 70
+_BOLD_ITEMS = ("순손익",)   # 이 라벨로 시작하는 항목은 굵게 (결과가 먼저 눈에 들어오게)
 
 
 def pretty(text: str, icon: str = "") -> str:
@@ -58,7 +71,8 @@ def pretty(text: str, icon: str = "") -> str:
     if not m:
         return icon + html.escape(text)
     tag, body = m.group(1), m.group(2)
-    parts = [p.strip() for p in body.split(" | ") if p.strip()]
+    # ' | ' 로 이어 붙인 항목도, 줄바꿈으로 나뉜 항목(명령 답장)도 모두 한 줄씩
+    parts = [p.strip() for chunk in body.split(" | ") for p in chunk.split("\n") if p.strip()]
     first = f"{icon}<b>{html.escape(tag)}</b>"
     if parts:
         pm = _POS_RE.match(parts[0])
@@ -66,11 +80,17 @@ def pretty(text: str, icon: str = "") -> str:
             first += f" <b>{html.escape(pm.group(1))}</b>{html.escape(parts[0][pm.end():])}"
             parts = parts[1:]
     lines = [first]
+
+    def item(x: str) -> str:
+        x = x.strip()
+        bold = x.startswith(_BOLD_ITEMS)
+        return "• " + (f"<b>{html.escape(x)}</b>" if bold else html.escape(x))
+
     for p in parts:
         if len(p) > _LONG_LINE and " / " in p:
-            lines.extend("• " + html.escape(x.strip()) for x in p.split(" / "))
+            lines.extend(item(x) for x in p.split(" / "))
         else:
-            lines.append("• " + html.escape(p))
+            lines.append(item(p))
     return "\n".join(lines)
 
 
@@ -283,7 +303,12 @@ class TelegramCommands:
                     self._offset = max(self._offset, int(upd.get("update_id", 0)) + 1)
                     reply = self.handle(upd)
                     if reply:
-                        self._post(self.n.url("sendMessage"), {"chat_id": self.n.chat_id, "text": reply[:4000]})
+                        text = pretty(reply)[:4000]
+                        try:
+                            self._post(self.n.url("sendMessage"),
+                                       {"chat_id": self.n.chat_id, "text": text, "parse_mode": "HTML"})
+                        except Exception:
+                            self._post(self.n.url("sendMessage"), {"chat_id": self.n.chat_id, "text": plain(text)})
             except Exception as exc:
                 logging.getLogger("kimp.notify.quiet").debug("텔레그램 명령 받기 실패: %s", exc)
                 stop_event.wait(5)

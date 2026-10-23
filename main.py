@@ -84,34 +84,34 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory) -> str
     with session_factory() as session:
         broker.ex.refresh()
         ok, why = broker.entries_allowed(session)
-        lines = [f"[{MODE_LABEL[settings.mode]}] {datetime.now(KST):%m-%d %H:%M}",
-                 f"잔고: 업비트 USDT {broker.balance(session, UPBIT_USDT):,.2f} / 바이비트 USDT "
-                 f"{broker.balance(session, BYBIT_USDT):,.2f} (남은 것, 포지션 제외)",
-                 f"오늘 확정 손익: {broker.safety.daily_loss_usdt(session):+,.2f} USDT",
-                 "신규 진입: " + ("가능" if ok else f"중단 — {why}")]
+        from kimp.broker import dir_label
         positions = broker.open_positions(session)
-        lines.append(f"포지션 {len(positions)}/{settings.max_open_positions}")
+        lines = [f"[현황] {MODE_LABEL[settings.mode]} · {datetime.now(KST):%m-%d %H:%M}",
+                 f"잔고 업비트 {broker.balance(session, UPBIT_USDT):,.2f} / 바이비트 "
+                 f"{broker.balance(session, BYBIT_USDT):,.2f} USDT (포지션 제외)",
+                 f"오늘 확정 손익 {broker.safety.daily_loss_usdt(session):+,.2f} USDT",
+                 "신규 진입 " + ("가능" if ok else f"중단 — {why}"),
+                 f"포지션 {len(positions)} / {settings.max_open_positions}"]
         for p in positions:
             # 남은 거리: 순손익과 청산 김프는 1:1 로 움직이므로 '목표 − 지금 순손익' 이 곧 필요한 상승폭(%p)
             net = p.last_net_percent or 0.0
             target = p.target_net_profit_percent or 0.0
             stop = p.stop_loss_percent or 0.0
             held_h = (datetime.now(timezone.utc) - _as_utc(p.opened_at)).total_seconds() / 3600
-            limit = f"/{settings.one_shot_max_hours:g}h" if (settings.one_shot and settings.one_shot_max_hours) else ""
+            limit = f" / {settings.one_shot_max_hours:g}시간" if (settings.one_shot and settings.one_shot_max_hours) else ""
             lines.append(
-                f"  #{p.id} {p.coin} 진입 {p.entry_premium:+.2f}% | 순손익 {net:+.2f}% → 목표 {target:.2f}% "
-                f"({target - net:+.2f}%p 더 올라야)")
-            lines.append(
-                f"     손절 {stop:.2f}% 까지 {net - stop:+.2f}%p 여유 · 보유 {held_h:.1f}h{limit} · "
-                f"펀딩 {p.funding_usdt:+.3f} USDT")
+                f"#{p.id} {p.coin} 진입 {p.entry_premium:+.2f}% · 순손익 {net:+.2f}% → 목표 {target:+.2f}% "
+                f"({target - net:+.2f}%p 더) · 손절 {stop:.0f}% 까지 {net - stop:+.2f}%p · "
+                f"보유 {held_h:.1f}시간{limit} · 펀딩 {p.funding_usdt:+.3f} USDT")
         for p in broker.unfinished_positions(session):
-            lines.append(f"  ⚠️ #{p.id} {p.coin} {p.status}")
+            lines.append(f"⚠️ #{p.id} {p.coin} {p.status} — 다음 스캔에 이어서 처리")
         for t in broker.pending_transfers(session):
-            lines.append(f"  송금 중 #{t.id} {t.direction} {t.amount_usdt:,.2f} USDT")
+            lines.append(f"송금 중 #{t.id} {dir_label(t.direction)} {t.amount_usdt:,.2f} USDT")
     return "\n".join(lines)
 
 
 HELP_TEXT = (
+    "[명령어]" + LF +
     "/status   잔고·포지션·진입 가능 여부" + LF +
     "/premium  지금 김프 (가운데·진입·청산, 기준까지 얼마 남았나)" + LF +
     "/close    강제 청산 + 신규 진입 중단 (예: /close 또는 /close CAP,SEI → 재개는 /resume)" + LF +
@@ -135,19 +135,18 @@ def premium_text(settings: Settings, market) -> str:
     tops = fetch_tops(market, list(settings.coins))
     if not tops:
         return "시세를 못 받았습니다"
-    lines = [f"[김프] {datetime.now(KST):%m-%d %H:%M}"]
+    lines = [f"[김프] {datetime.now(KST):%m-%d %H:%M} · USDT {next(iter(tops.values())).usdt_mid:,.1f}원"]
     for coin in settings.coins:
         t = tops.get(coin)
         if t is None:
-            lines.append(f"  {coin}: 시세 없음")
+            lines.append(f"{coin} 시세 없음")
             continue
         threshold = settings.params_for(coin).entry_premium_threshold_percent
         need = t.entry_premium_top - threshold  # + 면 이만큼 더 떨어져야 진입
         lines.append(
-            f"  {coin} 가운데 {t.mid_premium:+.3f}% | 진입 {t.entry_premium_top:+.3f}% "
-            f"(기준 {threshold:+.2f}%, {need:+.3f}%p) | 청산 {t.exit_premium_top:+.3f}% "
-            f"| 호가 {t.coin_spread_percent:.3f}% | 펀딩 {t.funding_8h_percent() or 0:+.4f}%")
-    lines.append(f"  USDT {next(iter(tops.values())).usdt_mid:,.1f}원")
+            f"{coin} 진입 {t.entry_premium_top:+.3f}% (기준 {threshold:+.2f}%, {need:+.2f}%p 남음) · "
+            f"청산 {t.exit_premium_top:+.3f}% · 가운데 {t.mid_premium:+.3f}% · "
+            f"왕복 호가 {t.entry_premium_top - t.exit_premium_top:.2f}% · 펀딩 {t.funding_8h_percent() or 0:+.4f}%/8h")
     return LF.join(lines)
 
 
@@ -255,7 +254,8 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
                     logger.exception("하루 요약 실패")
 
     threading.Thread(target=daily, name="daily-summary", daemon=True).start()
-    notifier.send(f"봇 시작 ({MODE_LABEL[settings.mode]}, 코인 {', '.join(settings.coins)})")
+    from kimp.notify import pretty
+    notifier.send(pretty(f"[봇 시작] {MODE_LABEL[settings.mode]} | 코인 {', '.join(settings.coins)}"))
     return notifier   # 종료할 때 큐를 비우려고 (notifier.flush)
 
 
@@ -359,9 +359,9 @@ def main() -> int:
     logger.info("김프 헷지 봇 시작 [%s] — 업비트·바이비트 모두 USDT 자본, 김프는 업비트 USDT 가격 기준(코인 몫), "
                 "손익은 USDT 기준 (DB %s)", MODE_LABEL[settings.mode], settings.active_db_path)
     if settings.mode == "live":
-        logger.warning("실거래 모드: 실제 주문이 나갑니다. 포지션 최대 %s USDT, 하루 손실 한도 %s USDT, 자동 송금 %s",
+        logger.warning("[실거래 시작] 실제 주문이 나갑니다 | 포지션 최대 %s USDT | 하루 손실 한도 %s USDT | 자동 송금 %s",
                        f"{settings.max_position_usdt:,.0f}", f"{settings.daily_loss_limit_usdt:,.0f}",
-                       "켜짐" if settings.auto_transfer_enabled else "꺼짐(알림만)")
+                       "켜짐" if settings.auto_transfer_enabled else "꺼짐 (알림만)")
     elif settings.mode == "dry_run":
         logger.info("드라이런 모드: 실제 잔고·호가로 돌지만 주문은 내지 않습니다 ('[드라이런] 실제였다면 …' 로그 확인)")
     logger.info("공통값: 진입 김프 ≤ %+.2f%% | 목표 순이익 %.2f%% | 손절 %.2f%% | 포지션 크기 %s | 최대 %d개",

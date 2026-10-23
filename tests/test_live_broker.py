@@ -1036,13 +1036,19 @@ class TelegramTest(unittest.TestCase):
     def test_pretty_splits_pipes_and_bolds_head(self):
         """한 줄 로그 → 머리 굵게 + 항목마다 줄바꿈 + HTML 특수문자 처리"""
         from kimp.notify import plain, pretty
-        msg = ("[청산 TAKE_PROFIT] #3 IRYS | 김프 -0.268% → -0.605% | 업비트 USDT 19.74개 → 21.53개 (+1.79) | "
-               "바이비트 -1.91 | 펀딩 +0.00 - 비용 0.09 = 순손익 -0.16 USDT (-0.817%)")
+        msg = ("[청산 · 익절] #3 IRYS | 순손익 -0.16 USDT (-0.82%) | 김프 진입 -0.268% → 청산 -0.605% | "
+               "업비트 USDT 19.74 → 21.53 (+1.79) | 바이비트 -1.91 USDT | 펀딩 +0.00 · 비용 0.09 | 보유 5.0시간")
         out = pretty(msg, "🚨 ")
         lines = out.split("\n")
-        self.assertEqual(lines[0], "🚨 <b>[청산 TAKE_PROFIT]</b> <b>#3 IRYS</b>")
-        self.assertEqual(lines[1], "• 김프 -0.268% → -0.605%")
-        self.assertEqual(len(lines), 5)
+        self.assertEqual(lines[0], "🚨 <b>[청산 · 익절]</b> <b>#3 IRYS</b>")
+        self.assertEqual(lines[1], "• <b>순손익 -0.16 USDT (-0.82%)</b>")   # 결과는 굵게
+        self.assertEqual(lines[2], "• 김프 진입 -0.268% → 청산 -0.605%")
+        self.assertEqual(len(lines), 7)
+        # 송금 번호만 있는 머리 / 명령 답장(줄바꿈 항목)도 같은 모양
+        t = pretty("[송금 도착] #8 업비트 → 바이비트 | 받은 금액 130.36 USDT | 걸린 시간 3분").split("\n")
+        self.assertEqual(t[0], "<b>[송금 도착]</b> <b>#8</b> 업비트 → 바이비트")
+        s = pretty("[현황] 실거래 · 10-24 01:40\n잔고 업비트 627.10 / 바이비트 803.29 USDT\n포지션 0 / 3").split("\n")
+        self.assertEqual(s, ["<b>[현황]</b>", "• 실거래 · 10-24 01:40", "• 잔고 업비트 627.10 / 바이비트 803.29 USDT", "• 포지션 0 / 3"])
         # 긴 항목은 ' / ' 에서 한 번 더
         entry = ("[진입] #4 IRYS | 업비트 USDT 19.78개 매도(1335.0원) → 690.707개 매수(38.20원) / 바이비트 690개 숏(0.028647, 1배, "
                  "강제청산 0.057151) | 진입 김프 -0.114% (판단 -0.204%, 기준 -0.13%) → 목표 0.20% 되려면 김프 약 +0.52%")

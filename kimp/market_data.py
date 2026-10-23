@@ -50,7 +50,7 @@ def _log_recovered(key: str, what: str) -> None:
     since = _fail_since.pop(key, None)
     _last_told.pop(key, None)
     if since is not None:
-        logger.warning("%s 복구 (%.0f초 동안 안 됐음)", what, time.monotonic() - since)
+        logger.warning("[%s 복구] %.0f초 동안 안 됐음", what, time.monotonic() - since)
 
 
 # 업비트 USDT/KRW: 김프 계산 기준이자, 진입/청산 때 실제로 USDT 를 사고파는 마켓
@@ -218,7 +218,7 @@ class MarketData:
             except Exception as exc:  # 네트워크 오류, 요청 제한, 거래소 점검 등
                 # 이게 안 되면 이번 스캔은 통째로 쉰다 (보유 포지션 관리도 못 한다) — 길어지면 5분마다 알림
                 _log_repeat("upbit-books", logging.ERROR,
-                            f"업비트 호가 조회 실패: {exc} (이 동안은 진입·청산·강제청산 확인을 못 합니다)")
+                            f"[업비트 호가 조회 실패] {exc} | 이 동안은 진입·청산·강제청산 확인을 못 합니다")
                 for f in fut_by.values():
                     f.cancel()
                 return {}
@@ -228,13 +228,13 @@ class MarketData:
                     bybit_books[coin] = f.result()
                 except Exception as exc:
                     # 이 코인만 이번 스캔에서 빠진다 (들고 있으면 그동안 평가·청산을 못 한다)
-                    _log_repeat(f"bybit-{coin}", logging.WARNING, f"{coin} 바이비트 호가 조회 실패: {exc}")
+                    _log_repeat(f"bybit-{coin}", logging.WARNING, f"[바이비트 호가 조회 실패] {coin} | {exc}")
         _log_recovered("upbit-books", "업비트 호가 조회")
 
         usdt_raw = upbit_books.get(USDT_KRW_SYMBOL)
         usdt_book = self._to_orderbook(usdt_raw) if usdt_raw else None
         if usdt_book is None or usdt_book.mid is None:
-            _log_repeat("usdt-book", logging.ERROR, "업비트 USDT/KRW 호가가 없어서 이번 스캔은 건너뜁니다")
+            _log_repeat("usdt-book", logging.ERROR, "[업비트 USDT/KRW 호가 없음] 이번 스캔은 건너뜁니다")
             return {}
         _log_recovered("usdt-book", "업비트 USDT/KRW 호가")
 
@@ -269,7 +269,7 @@ class MarketData:
         try:
             raw = self.bybit.fetch_funding_rate(bybit_symbol(coin))
         except Exception as exc:
-            _log_repeat(f"funding-{coin}", logging.WARNING, f"{coin} 펀딩비 조회 실패: {exc}")
+            _log_repeat(f"funding-{coin}", logging.WARNING, f"[펀딩비 조회 실패] {coin} | {exc}")
             return None
         _log_recovered(f"funding-{coin}", f"{coin} 펀딩비 조회")
 

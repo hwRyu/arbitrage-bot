@@ -248,7 +248,7 @@ class EngineTest(unittest.TestCase):
         with self.assertLogs("kimp.engine", level=logging.CRITICAL) as logs:
             self.engine.step()                                          # 김프는 여전히 -1.0 → 조건상 재진입감
         self.assertTrue(any("숏 사라짐" in m for m in logs.output))
-        self.assertTrue(any("[청산 LIQUIDATION]" in m for m in logs.output))   # 요약 로그가 나간다
+        self.assertTrue(any("[청산 · 강제청산]" in m for m in logs.output))   # 요약 로그가 나간다
         positions = self._positions()
         self.assertEqual([p.status for p in positions], [PositionStatus.CLOSED])   # 같은 스캔에 재진입 없음
         self.assertEqual(positions[0].exit_reason, ExitReason.LIQUIDATION)

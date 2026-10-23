@@ -108,6 +108,11 @@ POLICY_REJECT_WORDS = ("출금지연", "출금 가능한 수량", "한도를 초
 POLICY_RETRY_SEC = 600.0
 
 
+def dir_label(direction: str) -> str:
+    """송금 방향 코드 → 알림용 한글. 'upbit->bybit' → '업비트 → 바이비트'"""
+    return "업비트 → 바이비트" if direction == "upbit->bybit" else "바이비트 → 업비트"
+
+
 def is_policy_reject(message: str) -> bool:
     """거래소 규정 때문에 거절된 것인가 (우리 코드·잔고 문제가 아닌 것)"""
     return any(word in message for word in POLICY_REJECT_WORDS)
@@ -425,7 +430,7 @@ class HedgeBroker:
                 row.state = FillState.VOID
             else:
                 self._fill_row(row, f)
-                logger.warning("[복구] #%d %s %s 주문 결과를 조회로 찾음: %g개 평균 %.8g",
+                logger.warning("[복구] #%d %s | %s 주문 결과를 조회로 찾음 | %g개 평균 %.8g",
                                pos.id, pos.coin, row.side, f.qty, f.avg_price)
             row.done_at = self._now()
             session.commit()
@@ -436,7 +441,7 @@ class HedgeBroker:
         """주문 결과를 모름: 포지션은 그대로(OPENING/CLOSING) 두고 막아둔 뒤, 다음 스캔에 조회해서 이어서"""
         self.safety.record_failure(f"{pos.coin}: {exc}")
         self.safety.block(f"unknown-{pos.id}", f"#{pos.id} {pos.coin} 주문 결과를 모름 — 추적번호로 계속 조회 중")
-        logger.critical("[주문 결과 모름] #%d %s %s → 추측해서 진행하지 않고, 다음 스캔에 추적번호로 조회해서 이어서 처리",
+        logger.critical("[주문 결과 모름] #%d %s | %s | 추측하지 않고 다음 스캔에 추적번호로 조회해 이어서",
                         pos.id, pos.coin, exc)
 
     # ------------------------------------------------------------------
@@ -528,8 +533,8 @@ class HedgeBroker:
         # 포지션은 양쪽 다 들어간 정상 헷지라 되돌리지 않지만, 목표까지 그만큼 더 올라야 하므로 알린다.
         drift = pos.entry_premium - plan.premium
         if drift > self.max_slippage_percent:
-            logger.warning("[진입 김프 밀림] #%d %s 판단 %+.3f%% → 실제 %+.3f%% (%+.3f%%p 불리) — 주문 사이에 "
-                           "가격이 움직였습니다. 헷지는 정상이고, 목표까지 그만큼 더 올라야 합니다",
+            logger.warning("[진입 김프 밀림] #%d %s | 판단 %+.3f%% → 실제 %+.3f%% (%+.3f%%p 불리) | 주문 사이에 가격이 움직임 | "
+                           "헷지는 정상, 목표까지 그만큼 더 올라야 합니다",
                            pos.id, coin, plan.premium, pos.entry_premium, drift)
         return pos
 
@@ -560,7 +565,7 @@ class HedgeBroker:
         diff = short_usdt - coin_usdt
         if abs(diff) <= short_usdt * self.hedge_tolerance_percent / 100:
             return
-        logger.warning("#%d %s 양쪽 크기 차이 %.2f%% (숏 %.2f / 코인 %.2f USDT) → 큰 쪽을 줄여 맞춤",
+        logger.warning("[크기 맞추기] #%d %s | 차이 %.2f%% (숏 %.2f / 코인 %.2f USDT) | 큰 쪽을 줄입니다",
                        pos.id, pos.coin, abs(diff) / short_usdt * 100, short_usdt, coin_usdt)
         try:
             if diff > 0:
@@ -577,7 +582,7 @@ class HedgeBroker:
             raise  # 결과를 모르면 추측하지 않는다 → 부르는 쪽이 OPENING 으로 두고 다음 스캔에 조회
         except OrderFailed as exc:
             self.safety.record_failure(f"{pos.coin} 크기 맞추기: {exc}")
-            logger.critical("[크기 맞추기 실패] #%d %s 양쪽 차이 %.2f USDT 그대로 관리합니다 (청산은 정상): %s",
+            logger.critical("[크기 맞추기 실패] #%d %s | 차이 %.2f USDT 그대로 관리 (청산은 정상) | %s",
                             pos.id, pos.coin, diff, exc)
 
     def _return_leftover_krw(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
@@ -603,7 +608,7 @@ class HedgeBroker:
             raise  # 위와 같다 — 추측해서 OPEN 으로 끝내지 않는다
         except OrderFailed as exc:
             self.safety.record_failure(f"{pos.coin} 남은 원화 되돌리기: {exc}")
-            logger.critical("[남은 원화 되돌리기 실패] #%d %s 원화 %s 원이 업비트에 남아 있습니다: %s",
+            logger.critical("[남은 원화 되돌리기 실패] #%d %s | 업비트에 %s원 남음 | %s",
                             pos.id, pos.coin, f"{left:,.0f}", exc)
 
     def _finish_entry(self, session: Session, pos: Position) -> None:
@@ -670,8 +675,8 @@ class HedgeBroker:
             pos.exit_reason = "UNWIND_FAILED"
             session.commit()
             self.safety.record_failure(f"{pos.coin} 되돌리기: {exc}")
-            logger.critical("[되돌리기 실패] #%d %s 진입 실패(%s) 후 되돌리기도 실패: %s → 거래소에서 직접 확인·정리하세요 "
-                            "(신규 진입 중단)", pos.id, pos.coin, why, exc)
+            logger.critical("[되돌리기 실패] #%d %s | 진입 실패: %s | 되돌리기도 실패: %s | 거래소에서 직접 확인·정리하세요 | "
+                            "신규 진입 중단", pos.id, pos.coin, why, exc)
             return True
 
         # 되돌림 손익 (수수료·호가 간격 정도 손해)
@@ -686,7 +691,7 @@ class HedgeBroker:
         pos.status, pos.closed_at, pos.exit_reason = PositionStatus.ABORTED, self._now(), "ENTRY_FAILED"
         pos.net_pnl_usdt = net
         session.commit()
-        logger.error("[진입 되돌림] #%d %s %s → 끝난 단계를 되돌렸습니다 (손익 %+.4f USDT)", pos.id, pos.coin, why, net)
+        logger.error("[진입 되돌림] #%d %s | %s | 끝난 단계를 되돌림 | 손익 %+.4f USDT", pos.id, pos.coin, why, net)
         return True
 
     # ------------------------------------------------------------------
@@ -760,7 +765,7 @@ class HedgeBroker:
             # 봇 계산으로는 강제청산 가격인데 거래소에서는 아직 숏이 살아 있음 (실거래) → 시장가로 바로 닫는다
             liquidated = False
             pos.exit_reason = ExitReason.STOP_LOSS
-            logger.critical("#%d %s 강제청산 가격 도달했지만 숏이 아직 열려 있어서 바로 정리합니다", pos.id, pos.coin)
+            logger.critical("[강제청산가 도달] #%d %s | 바이비트에 숏이 아직 있음 | 시장가로 바로 정리합니다", pos.id, pos.coin)
         # 단계별 체결 합계를 짧게 꺼내 쓰는 도우미 (없는 단계는 0 으로)
         s = lambda k, sums: sums.get(k, LegSum())  # noqa: E731
         coin_bid = quote.upbit.best_bid if quote else None
@@ -785,8 +790,8 @@ class HedgeBroker:
                     liquidated = True
                     pos.exit_reason = ExitReason.LIQUIDATION
                     session.commit()
-                    logger.critical("[숏 사라짐] #%d %s 청산 중 거래소에 숏이 없습니다 (남은 %g개) → 강제청산으로 보고 "
-                                    "증거금 손실로 기록해 마무리합니다", pos.id, pos.coin, short_left)
+                    logger.critical("[숏 사라짐] #%d %s | 청산 중 바이비트에 숏이 없음 (남은 %g개) | 강제청산으로 보고 "
+                                    "증거금 손실로 마무리", pos.id, pos.coin, short_left)
                 short_done = liquidated or short_left <= pos.bybit_qty * 1e-9
 
                 # 1)+3) 코인 매도와 숏 닫기는 서로 독립 → 동시에 낸다 (실거래). 두 다리가 같은 순간에 체결되어
@@ -835,14 +840,14 @@ class HedgeBroker:
             self.safety.record_failure(f"{pos.coin} 청산: {exc}")
             # 거래소 점검처럼 한참 막히면 10초마다 여기로 온다 → 5분에 한 번만 알린다
             self._log_repeat(f"close-{pos.id}", logging.CRITICAL,
-                             f"[청산 실패] #{pos.id} {pos.coin} 청산 중 실패: {exc} → CLOSING 으로 두고 "
-                             f"다음 스캔에서 남은 양만 이어서 (같은 문제가 이어지면 5분마다 알립니다)")
+                             f"[청산 실패] #{pos.id} {pos.coin} | {exc} | CLOSING 으로 두고 다음 스캔에 남은 양만 이어서 | "
+                             f"같은 문제면 5분마다 알림")
             return None
         if not done:
             self.safety.record_failure(f"{pos.coin} 청산: {MAX_LEG_RETRIES}번 해도 다 안 끝남")
             self._log_repeat(f"close-{pos.id}", logging.CRITICAL,
-                             f"[청산 덜 끝남] #{pos.id} {pos.coin} {MAX_LEG_RETRIES}번 다시 주문해도 남음 → "
-                             f"다음 스캔에서 이어서 (같은 문제가 이어지면 5분마다 알립니다)")
+                             f"[청산 덜 끝남] #{pos.id} {pos.coin} | {MAX_LEG_RETRIES}번 다시 주문해도 남음 | "
+                             f"다음 스캔에 이어서 | 같은 문제면 5분마다 알림")
             return None
         self._last_repeat.pop(f"close-{pos.id}", None)   # 끝났으니 다음에 또 막히면 바로 알린다
 
@@ -943,13 +948,13 @@ class HedgeBroker:
                         self._order_unknown(session, pos, exc)
                         continue
                     self._finish_entry(session, pos)
-                    logger.warning("[복구] #%d %s 진입이 끝나 있어서 OPEN 으로", pos.id, pos.coin)
+                    logger.warning("[복구] #%d %s | 진입이 끝나 있어서 OPEN 으로", pos.id, pos.coin)
                 else:
                     self._unwind_entry(session, pos, quote, "진입 도중 멈춤 (재시작/결과 확인)")
             elif pos.status == PositionStatus.CLOSING:
                 pnl = self._continue_close(session, pos, quote)
                 if pnl:
-                    logger.warning("[청산 이어서 완료] #%d %s 순손익 %+.2f USDT (%+.3f%%)",
+                    logger.warning("[청산 이어서 완료] #%d %s | 순손익 %+.2f USDT (%+.2f%%)",
                                    pos.id, pos.coin, pnl.net_usdt, pnl.net_percent)
         now = self._now().timestamp()
         if now - self._last_reconcile >= self.reconcile_interval_sec:
@@ -1071,17 +1076,16 @@ class HedgeBroker:
             if is_policy_reject(str(exc)):
                 # 거래소 규정(출금지연제 등) → 연속 실패로 세지 않는다. 그래야 신규 진입이 막히지 않는다
                 self._policy_block_until = self._now().timestamp() + POLICY_RETRY_SEC
-                logger.error("[송금 보류] %s USDT %s — 거래소가 지금은 안 된다고 합니다: %s%s",
-                             t.direction, f"{send:,.2f}", exc,
-                             f"{LF}            → {POLICY_RETRY_SEC / 60:.0f}분 뒤 다시 시도합니다. "
-                             f"업비트 출금지연제라면 원화 입금 후 24시간이 지나야 풀립니다")
+                logger.error("[송금 보류] %s | 금액 %s USDT | 거래소 규정으로 지금은 안 됨: %s | "
+                             "%.0f분 뒤 다시 시도 (업비트 출금지연제면 원화 입금 후 24시간)",
+                             dir_label(t.direction), f"{send:,.2f}", exc, POLICY_RETRY_SEC / 60)
             else:
                 self.safety.record_failure(f"송금: {exc}")
-                logger.critical("[송금 실패] %s USDT %s: %s", t.direction, f"{send:,.2f}", exc)
+                logger.critical("[송금 실패] #%d %s | 금액 %s USDT | %s", t.id, dir_label(t.direction), f"{send:,.2f}", exc)
             return 0.0
         session.commit()
-        logger.warning("[송금 요청 · %s] %s USDT %s 개 (%s, 수수료 %g)", reason or "-", t.direction, f"{send:,.2f}",
-                       self.network, fee_usdt)
+        logger.warning("[송금 요청 · %s] #%d %s | 금액 %s USDT (수수료 %g) | 망 %s",
+                       reason or "-", t.id, dir_label(t.direction), f"{send:,.2f}", fee_usdt, self.network)
         self._poll_transfers(session)
         return send if to_bybit else -send
 
@@ -1091,23 +1095,25 @@ class HedgeBroker:
             try:
                 arrived = self.ex.transfer_arrived(session, t)
             except Exception as exc:  # 조회 실패는 다음에 다시 (거래소가 한참 안 되면 5분에 한 번만 알림)
-                self._log_repeat(f"transfer-{t.id}", logging.WARNING, f"송금 #{t.id} 확인 실패 (다음에 다시): {exc}")
+                self._log_repeat(f"transfer-{t.id}", logging.WARNING,
+                                 f"[송금 확인 실패] #{t.id} {dir_label(t.direction)} | {exc} | 다음 스캔에 다시")
                 continue
             self._last_repeat.pop(f"transfer-{t.id}", None)
+            requested = t.requested_at if t.requested_at.tzinfo else t.requested_at.replace(tzinfo=timezone.utc)
+            minutes = (self._now() - requested).total_seconds() / 60
             if arrived:
                 t.status, t.confirmed_at = TransferStatus.CONFIRMED, self._now()
-                logger.warning("[송금 도착] #%d %s USDT %s 개", t.id, t.direction, f"{t.amount_usdt - t.fee_usdt:,.2f}")
+                logger.warning("[송금 도착] #%d %s | 받은 금액 %s USDT | 걸린 시간 %.0f분",
+                               t.id, dir_label(t.direction), f"{t.amount_usdt - t.fee_usdt:,.2f}", minutes)
             elif arrived is False:
                 t.status = TransferStatus.FAILED
-                logger.critical("[송금 실패] #%d %s USDT %s 개 — 거래소 출금 내역을 확인하세요",
-                                t.id, t.direction, f"{t.amount_usdt:,.2f}")
+                logger.critical("[송금 실패] #%d %s | 금액 %s USDT | 거래소 출금 내역을 확인하세요",
+                                t.id, dir_label(t.direction), f"{t.amount_usdt:,.2f}")
             else:
-                requested = t.requested_at if t.requested_at.tzinfo else t.requested_at.replace(tzinfo=timezone.utc)
-                minutes = (self._now() - requested).total_seconds() / 60
                 if minutes > self.transfer_alert_minutes and not t.alerted:
                     t.alerted = 1
-                    logger.critical("[송금 지연] #%d %s USDT %s 개가 %.0f분째 도착 안 함 — 출금·입금 내역 확인",
-                                    t.id, t.direction, f"{t.amount_usdt:,.2f}", minutes)
+                    logger.critical("[송금 지연] #%d %s | 금액 %s USDT | %.0f분째 도착 안 함 | 출금·입금 내역을 확인하세요",
+                                    t.id, dir_label(t.direction), f"{t.amount_usdt:,.2f}", minutes)
             session.commit()
 
 

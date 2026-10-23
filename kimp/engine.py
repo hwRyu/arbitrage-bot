@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
 # 같은 경고를 너무 자주 찍지 않으려고 두는 간격 (초)
 LOG_COOLDOWN_SEC = 60.0
 
+# 청산 사유 → 알림에 쓰는 한글 (DB 에는 영문 코드가 그대로 남는다)
+EXIT_LABEL = {
+    ExitReason.TAKE_PROFIT: "익절", ExitReason.STOP_LOSS: "손절", ExitReason.LIQUIDATION: "강제청산",
+    ExitReason.TIMEOUT: "시간 초과", ExitReason.MANUAL: "수동", ExitReason.FUNDING_COST: "펀딩비 한도",
+}
+
 
 def _as_utc(dt):
     """
@@ -167,7 +173,7 @@ class Engine:
                 self._log_throttled(f"manual-thin-{coin}", logging.WARNING,
                                     f"[강제 청산] {coin} 호가가 모자라서 이번 스캔에는 못 했습니다 (다시 시도합니다)")
                 continue
-            logger.warning("[강제 청산] #%d %s 사람이 지시 → 지금 시세로 정리 (순손익 %+.3f%%)",
+            logger.warning("[수동 청산] #%d %s | 순손익 지금 %+.2f%% | 텔레그램 지시로 지금 시세에 정리합니다",
                            pos.id, coin, valuation.pnl.net_percent)
             self._close(session, pos, valuation, ExitReason.MANUAL)
             self._close_requests.discard(coin)
@@ -267,7 +273,7 @@ class Engine:
                 self._try_entries(session, quotes, open_positions)
             else:
                 # 사람이 멈춘 상태는 몇 시간씩 가므로 1분마다 알리면 텔레그램이 도배된다 → 30분에 한 번
-                self._log_throttled("entries-blocked", logging.WARNING, f"신규 진입 중단 중: {why}", cooldown_sec=1800.0)
+                self._log_throttled("entries-blocked", logging.WARNING, f"[신규 진입 중단] {why}", cooldown_sec=1800.0)
             self._save_snapshots(session, quotes)
             self._log_status(session, quotes, open_positions)
             if self.s.one_shot:
@@ -303,9 +309,8 @@ class Engine:
             # 김프 회복을 기다리는 전략이라, 내는 쪽에 오래 머물면 김프가 그대로여도 손실이 쌓인다.
             cost = self._funding_cost_percent(pos)
             if cost >= self.s.max_funding_cost_percent:
-                logger.warning("[펀딩비 한도] #%d %s 펀딩비로 %.3f%% 썼습니다 (한도 %.2f%%) → 정리합니다 "
-                               "(지금 순손익 %+.3f%%)", pos.id, pos.coin, cost,
-                               self.s.max_funding_cost_percent, pnl.net_percent)
+                logger.warning("[펀딩비 한도] #%d %s | 펀딩비 지출 %.3f%% (한도 %.2f%%) | 순손익 지금 %+.2f%% | 정리합니다",
+                               pos.id, pos.coin, cost, self.s.max_funding_cost_percent, pnl.net_percent)
                 reason = ExitReason.FUNDING_COST
         if reason == ExitReason.TAKE_PROFIT:
             # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
@@ -315,8 +320,8 @@ class Engine:
                 again = confirmed.pnl.net_percent if confirmed else None
                 self._log_throttled(
                     f"tp-confirm-{pos.coin}", logging.INFO,
-                    f"[익절 보류] #{pos.id} {pos.coin} 처음 {pnl.net_percent:+.3f}% → 확인 시세 "
-                    f"{'없음' if again is None else f'{again:+.3f}%'} (목표 {target:.2f}%) — 한순간 값이라 다음 스캔에 다시")
+                    f"[익절 보류] #{pos.id} {pos.coin} | 스캔 시세 {pnl.net_percent:+.3f}% → 확인 시세 "
+                    f"{'없음' if again is None else f'{again:+.3f}%'} | 목표 {target:.2f}% | 한순간 값, 다음 스캔에 다시")
                 telemetry.decision(session, pos.coin, "tp_confirm_fail", pnl.net_percent, target,
                                    premium_depth=again, position_id=pos.id, now=self._now_utc())
                 reason = None
@@ -371,9 +376,8 @@ class Engine:
                     valuation = self.broker.value_exit(pos, quote) if quote else None
                     if valuation is None:
                         continue
-                    logger.warning("[한 번만 돌리기] #%d %s 보유 %.1f시간 > %g시간 → 지금 시세로 정리합니다 "
-                                   "(순손익 %+.3f%%)", pos.id, pos.coin, held / 3600,
-                                   self.s.one_shot_max_hours, valuation.pnl.net_percent)
+                    logger.warning("[시간 초과 청산] #%d %s | 보유 %.1f시간 > %g시간 | 순손익 지금 %+.2f%% | 지금 시세에 정리합니다",
+                                   pos.id, pos.coin, held / 3600, self.s.one_shot_max_hours, valuation.pnl.net_percent)
                     self._close(session, pos, valuation, ExitReason.TIMEOUT)
             # 방금 정리해서 남은 게 없으면 이번 스캔에서 바로 끝낸다 (한 번 더 기다리지 않게)
             if self.broker.open_positions(session) or [
@@ -415,13 +419,15 @@ class Engine:
         if final is None:
             return  # 일부 단계 실패 → CLOSING 으로 남음, 다음 스캔에서 이어서 (broker.sync)
         level = logging.CRITICAL if liquidated else logging.INFO
+        held_h = (self._now_utc() - _as_utc(pos.opened_at)).total_seconds() / 3600
         logger.log(
             level,
-            "[청산 %s] #%d %s | 김프 %+.3f%% → %+.3f%% | 업비트 USDT %.2f개 → %.2f개 (%+.2f) | 바이비트 %+.2f "
-            "| 펀딩 %+.2f - 비용 %.2f = 순손익 %+.2f USDT (%+.3f%%)",
-            reason, pos.id, pos.coin, pos.entry_premium, pos.exit_premium,
+            "[청산 · %s] #%d %s | 순손익 %+.2f USDT (%+.2f%%) | 김프 진입 %+.3f%% → 청산 %+.3f%% | "
+            "업비트 USDT %.2f → %.2f (%+.2f) | 바이비트 %+.2f USDT | 펀딩 %+.2f · 비용 %.2f | 보유 %.1f시간",
+            EXIT_LABEL.get(reason, reason), pos.id, pos.coin, final.net_usdt, final.net_percent,
+            pos.entry_premium, pos.exit_premium if pos.exit_premium is not None else float("nan"),
             pos.usdt_sold, pos.usdt_bought, pos.usdt_bought - pos.usdt_sold,
-            final.bybit_leg_usdt, final.funding_usdt, final.total_cost_usdt, final.net_usdt, final.net_percent,
+            final.bybit_leg_usdt, final.funding_usdt, final.total_cost_usdt, held_h,
         )
 
     def _close_vanished_shorts(self, session: Session, quotes: Dict[str, Quote]) -> None:
@@ -436,11 +442,11 @@ class Engine:
             valuation = self.broker.value_liquidation(pos, quote) if quote else None
             if valuation is None:
                 self._log_throttled(f"vanished-{pos.coin}", logging.CRITICAL,
-                                    f"[숏 사라짐] #{pos.id} {pos.coin} 거래소에 숏이 없는데 시세·호가가 없어 코인을 못 "
-                                    f"팔았습니다 — 다음 스캔에 다시 (그동안 코인만 들고 있어 가격에 노출)")
+                                    f"[숏 사라짐] #{pos.id} {pos.coin} | 바이비트에 숏이 없는데 시세·호가가 없어 코인을 "
+                                    f"못 팔았습니다 | 다음 스캔에 다시 (그동안 코인만 들고 있어 가격에 노출)")
                 continue
-            logger.critical("[숏 사라짐] #%d %s 거래소에 숏이 없습니다 (DB %g개) — 강제청산으로 보고 업비트 코인을 "
-                            "즉시 정리합니다 (증거금 %.2f USDT 손실로 기록, 순손익 %+.3f%%)",
+            logger.critical("[숏 사라짐] #%d %s | 바이비트에 숏이 없음 (장부 %g개) | 강제청산으로 보고 업비트 코인 즉시 정리 | "
+                            "증거금 %.2f USDT 손실 | 순손익 예상 %+.2f%%",
                             pos.id, pos.coin, pos.bybit_qty, pos.bybit_margin_usdt, valuation.pnl.net_percent)
             self._close(session, pos, valuation, ExitReason.LIQUIDATION, liquidated=True)
 
@@ -461,11 +467,10 @@ class Engine:
             valuation = self.broker.value_liquidation(pos, quote)
             if valuation is None:
                 self._log_throttled(f"liq-thin-{pos.coin}", logging.CRITICAL,
-                                    f"{pos.coin} 강제청산 가격 도달! 업비트 호가가 모자라 정리하지 못했습니다")
+                                    f"[강제청산] #{pos.id} {pos.coin} | 강제청산가 도달 | 업비트 호가가 모자라 정리 못 함 | 다음 스캔에 다시")
                 return False
-            logger.critical("[강제청산] #%d %s 바이비트 가격 %.6f ≥ 강제청산 가격 %.6f → 증거금 %.2f USDT 손실, "
-                            "업비트 코인 즉시 정리", pos.id, pos.coin, price, pos.liquidation_price,
-                            pos.bybit_margin_usdt)
+            logger.critical("[강제청산] #%d %s | 바이비트 %.6f ≥ 강제청산가 %.6f | 증거금 %.2f USDT 손실 | 업비트 코인 즉시 정리",
+                            pos.id, pos.coin, price, pos.liquidation_price, pos.bybit_margin_usdt)
             self._close(session, pos, valuation, ExitReason.LIQUIDATION, liquidated=True)
             return True
 
@@ -476,9 +481,9 @@ class Engine:
                                      self.s.liquidation_warn_percent * 2, self.s.bybit_mmr)
             self._log_throttled(
                 f"liq-warn-{pos.coin}", logging.WARNING,
-                f"[긴급] #{pos.id} {pos.coin} 강제청산까지 {distance:.1f}% 남음 (지금 {price:.6f}, 강제청산 "
-                f"{pos.liquidation_price:.6f}) → 바이비트 포지션에 증거금 약 {add:,.2f} USDT 추가하세요 "
-                f"(격리 마진이라 계좌 잔고가 자동으로 들어가지 않습니다 — 직접 넣어야 합니다)",
+                f"[긴급 · 증거금] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% (지금 {price:.6f} / 강제청산가 "
+                f"{pos.liquidation_price:.6f}) | 바이비트 포지션에 증거금 약 {add:,.2f} USDT 추가하세요 | "
+                f"격리 마진이라 계좌 잔고는 자동으로 안 들어갑니다",
             )
         return False
 
@@ -604,7 +609,7 @@ class Engine:
             sent = self.broker.transfer(session, move, fee, reason=when)
             if sent:
                 logger.warning(
-                    "[송금 · %s] %s로 USDT %s 개 (수수료 %s) | 전: 업비트 %s / 바이비트 %s (%.1f : %.1f, 목표 %.1f : %.1f)",
+                    "[송금 · %s] %s | 금액 %s USDT (수수료 %s) | 전: 업비트 %s / 바이비트 %s (%.1f : %.1f) | 목표 %.1f : %.1f",
                     when, direction, f"{abs(sent):,.2f}", f"{fee:g}", f"{upbit:,.2f}", f"{bybit:,.2f}",
                     share * 100, (1 - share) * 100, target * 100, (1 - target) * 100,
                 )
@@ -612,8 +617,8 @@ class Engine:
         self._log_throttled(
             f"rebalance-{when}", logging.WARNING,
             f"[리밸런싱 필요 · {when}] 업비트 {upbit:,.2f} / 바이비트 {bybit:,.2f} USDT "
-            f"({share * 100:.1f} : {(1 - share) * 100:.1f}, 목표 {target * 100:.1f} : {(1 - target) * 100:.1f}) "
-            f"→ {direction}로 USDT 약 {abs(move):,.2f} 개 옮기세요",
+            f"({share * 100:.1f} : {(1 - share) * 100:.1f}) | 목표 {target * 100:.1f} : {(1 - target) * 100:.1f} | "
+            f"{direction}로 약 {abs(move):,.2f} USDT 옮기세요",
         )
         return move
 
@@ -741,8 +746,8 @@ class Engine:
             if again is None or again > threshold:
                 self._log_throttled(
                     f"entry-confirm-{coin}", logging.INFO,
-                    f"[진입 보류] {coin} 처음 {depth:+.3f}% → 확인 시세 "
-                    f"{'없음' if again is None else f'{again:+.3f}%'} (기준 {threshold:+.2f}%) — 한순간 값이라 다음 스캔에 다시")
+                    f"[진입 보류] {coin} | 스캔 시세 {depth:+.3f}% → 확인 시세 "
+                    f"{'없음' if again is None else f'{again:+.3f}%'} | 기준 {threshold:+.2f}% | 한순간 값, 다음 스캔에 다시")
                 telemetry.decision(session, coin, "confirm_fail", top, threshold, premium_depth=again,
                                    size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, now=self._now_utc())
                 continue
@@ -780,17 +785,18 @@ class Engine:
             target = estimated_exit_premium(pos.entry_premium, params.target_net_profit_percent, notional, 0.0,
                                             self.s.fees, quote.usdt_spread_percent or 0.0)
             logger.info(
-                "[진입] #%d %s | 업비트 USDT %.2f개 매도(%.1f원) → %.6g개 매수(%s원) / 바이비트 %g개 숏(%.6f, %.0f배, "
-                "강제청산 %.6f) | 진입 김프 %+.3f%% (판단 %+.3f%%, 기준 %+.2f%%) → 목표 %.2f%% 되려면 김프 약 %+.2f%%",
-                pos.id, coin, pos.usdt_sold, pos.entry_usdt_price_krw, pos.upbit_qty,
-                f"{pos.entry_upbit_price_krw:,.2f}", pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage,
-                pos.liquidation_price, pos.entry_premium, depth, params.entry_premium_threshold_percent,
+                "[진입] #%d %s | 김프 %+.3f%% (기준 %+.2f%%, 판단 %+.3f%%) | 목표 %.2f%% → 김프 약 %+.2f%% 필요 | "
+                "업비트 USDT %.2f개 매도 (%.1f원) → %.6g개 매수 (%s원) | 바이비트 %g개 숏 (%.6f USDT, %.0f배) | "
+                "강제청산가 %.6f",
+                pos.id, coin, pos.entry_premium, params.entry_premium_threshold_percent, depth,
                 params.target_net_profit_percent, target,
+                pos.usdt_sold, pos.entry_usdt_price_krw, pos.upbit_qty, f"{pos.entry_upbit_price_krw:,.2f}",
+                pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage, pos.liquidation_price,
             )
             open_positions[coin] = pos
             if self.s.one_shot:
                 self._one_shot_opened = True
-                logger.warning("[한 번만 돌리기] 포지션을 잡았습니다 (#%d %s) → 더 진입하지 않고 청산까지 봅니다",
+                logger.warning("[한 번만 돌리기] #%d %s | 포지션을 잡았습니다 | 더 진입하지 않고 청산까지 봅니다",
                                pos.id, coin)
                 return  # 여러 코인이 동시에 조건을 만족해도 하나만 잡는다
 

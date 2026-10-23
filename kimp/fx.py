@@ -119,7 +119,7 @@ class FxProvider:
                 if self._rate is None:
                     logger.info("달러 환율 첫 조회 성공: %.2f원", rate)
                 if self.failures >= ALERT_AFTER_FAILURES:
-                    logger.warning("달러 환율 조회 복구 (연속 %d번 실패 뒤): %.2f원", self.failures, rate)
+                    logger.warning("[환율 조회 복구] 연속 %d번 실패 뒤 | 지금 %.2f원", self.failures, rate)
                 self._rate = rate
                 self.failures = 0
             except Exception as exc:
@@ -129,7 +129,7 @@ class FxProvider:
                 tail = "(아직 쓸 값 없음)" if self._rate is None else f"(이전 값 {self._rate:.2f}원 사용)"
                 if self.failures == ALERT_AFTER_FAILURES or (
                         self.failures > ALERT_AFTER_FAILURES and self.failures % ALERT_EVERY_FAILURES == 0):
-                    logger.warning("달러 환율 조회가 %d번 연속 실패 %s: %s", self.failures, tail, exc)
+                    logger.warning("[환율 조회 실패] %d번 연속 실패 %s | %s", self.failures, tail, exc)
                 else:
                     logger.debug("달러 환율 조회 실패 %d번째 %s: %s", self.failures, tail, exc)
 
