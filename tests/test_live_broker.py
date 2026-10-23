@@ -1041,17 +1041,17 @@ class TelegramTest(unittest.TestCase):
         out = pretty(msg, "🚨 ")
         lines = out.split("\n")
         self.assertEqual(lines[0], "🚨 <b>[청산 TAKE_PROFIT]</b> <b>#3 IRYS</b>")
-        self.assertEqual(lines[1], "김프 -0.268% → -0.605%")
+        self.assertEqual(lines[1], "• 김프 -0.268% → -0.605%")
         self.assertEqual(len(lines), 5)
         # 긴 항목은 ' / ' 에서 한 번 더
         entry = ("[진입] #4 IRYS | 업비트 USDT 19.78개 매도(1335.0원) → 690.707개 매수(38.20원) / 바이비트 690개 숏(0.028647, 1배, "
                  "강제청산 0.057151) | 진입 김프 -0.114% (판단 -0.204%, 기준 -0.13%) → 목표 0.20% 되려면 김프 약 +0.52%")
         e = pretty(entry).split("\n")
         self.assertEqual(e[0], "<b>[진입]</b> <b>#4 IRYS</b>")
-        self.assertTrue(e[2].startswith("바이비트 690개 숏"))
+        self.assertTrue(e[2].startswith("• 바이비트 690개 숏"))
         # 태그 없는 문장과 HTML 특수문자
         self.assertEqual(pretty("a < b & c", "⚠️ "), "⚠️ a &lt; b &amp; c")
-        self.assertEqual(plain(pretty("[태그] x < y")), "[태그]" + chr(10) + "x < y")   # 번호·코인이 없으면 몸통은 다음 줄
+        self.assertEqual(plain(pretty("[태그] x < y")), "[태그]" + chr(10) + "• x < y")   # 번호·코인이 없으면 몸통은 다음 줄
 
     def test_worker_falls_back_to_plain_text_when_html_rejected(self):
         """HTML 전송이 거절되면 평문으로 한 번 더 보낸다 (알림을 잃지 않게)"""

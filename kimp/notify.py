@@ -68,9 +68,9 @@ def pretty(text: str, icon: str = "") -> str:
     lines = [first]
     for p in parts:
         if len(p) > _LONG_LINE and " / " in p:
-            lines.extend(html.escape(x.strip()) for x in p.split(" / "))
+            lines.extend("• " + html.escape(x.strip()) for x in p.split(" / "))
         else:
-            lines.append(html.escape(p))
+            lines.append("• " + html.escape(p))
     return "\n".join(lines)
 
 
