@@ -196,7 +196,7 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
     if not (settings.telegram_bot_token and settings.telegram_chat_id):
         if settings.mode != "paper":
             logger.warning("텔레그램 설정이 없어서 알림을 못 보냅니다 (실거래에서는 꼭 설정하세요)")
-        return
+        return None
     from kimp.notify import TelegramCommands, TelegramLogHandler, TelegramNotifier
 
     notifier = TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id,
@@ -244,6 +244,7 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
 
     threading.Thread(target=daily, name="daily-summary", daemon=True).start()
     notifier.send(f"봇 시작 ({MODE_LABEL[settings.mode]}, 코인 {', '.join(settings.coins)})")
+    return notifier   # 종료할 때 큐를 비우려고 (notifier.flush)
 
 
 def print_one_shot_report(settings: Settings, session_factory) -> None:
@@ -413,7 +414,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    start_telegram(settings, broker, session_factory, stop_event, engine=engine, market=market)
+    notifier = start_telegram(settings, broker, session_factory, stop_event, engine=engine, market=market)
 
     # 펀딩비 수익 전략: 항상 페이퍼. 김프 전략과 자본·시세 객체·DB 연결을 따로 써서 다른 스레드로 돌린다
     carry_thread = None
@@ -431,6 +432,9 @@ def main() -> int:
         carry_thread.join(timeout=30)
     if settings.one_shot:
         print_one_shot_report(settings, session_factory)
+    # 보내는 스레드는 데몬이라 여기서 끝내면 큐에 남은 알림이 사라진다 (청산 알림이 가장 중요하다)
+    if notifier is not None:
+        notifier.flush()
     return 0
 
 

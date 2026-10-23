@@ -729,6 +729,48 @@ class TelegramTest(unittest.TestCase):
         self.assertEqual(cmds.handle({"message": {"chat": {"id": 42}, "text": "/status"}}), "OK")
         self.assertIsNone(cmds.handle({"message": {"chat": {"id": 7}, "text": "/status"}}))  # 남의 채팅 무시
 
+    def test_flush_sends_queued_before_exit(self):
+        """
+        종료 직전 flush() 가 큐에 남은 알림을 다 보낸다 (실거래에서 겪은 버그)
+
+        보내기는 데몬 스레드가 한다 → 프로그램이 끝나면 파이썬이 즉시 죽인다.
+        2026-10-23 ONE_SHOT 실거래에서 16초 만에 끝나면서 '청산' 알림이 통째로 사라졌다.
+        여기서는 전송이 느린 상황을 만들어, flush 없이는 못 보내고 flush 하면 다 보내는 것을 고정한다.
+        """
+        import time as _t
+
+        from kimp.notify import TelegramNotifier
+        sent = []
+
+        def slow_post(url, data, timeout=10.0):
+            _t.sleep(0.3)              # 네트워크가 느린 상황
+            sent.append(data["text"])
+            return {"ok": True}
+
+        n = TelegramNotifier("T", "42", post=slow_post)
+        for i in range(3):
+            n.send(f"알림 {i}")
+        self.assertLess(len(sent), 3)  # 아직 보내는 중 — 여기서 끝내면 사라진다
+        self.assertTrue(n.flush(timeout=5))
+        self.assertEqual(len(sent), 3)
+
+    def test_flush_gives_up_after_timeout(self):
+        """전송이 영영 안 끝나도 종료를 막지 않는다 (False 만 돌려주고 넘어간다)"""
+        import time as _t
+
+        from kimp.notify import TelegramNotifier
+
+        def stuck_post(url, data, timeout=10.0):
+            _t.sleep(30)
+            return {"ok": True}
+
+        n = TelegramNotifier("T", "42", post=stuck_post)
+        for i in range(5):
+            n.send(f"안 나가는 알림 {i}")
+        began = _t.monotonic()
+        self.assertFalse(n.flush(timeout=0.5))
+        self.assertLess(_t.monotonic() - began, 3.0)   # 오래 붙잡지 않는다
+
 
 if __name__ == "__main__":
     unittest.main()

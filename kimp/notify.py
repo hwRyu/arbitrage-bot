@@ -113,6 +113,29 @@ class TelegramNotifier:
             except Exception as exc:  # 알림 실패로 매매를 멈추지 않는다
                 logging.getLogger("kimp.notify.quiet").debug("텔레그램 보내기 실패: %s", exc)
 
+    def flush(self, timeout: float = 10.0) -> bool:
+        """
+        큐에 남은 메시지를 다 보낼 때까지 기다린다 (종료 직전에 부른다)
+
+        보내기는 데몬 스레드가 한다 → 프로그램이 끝나면 파이썬이 그 스레드를 **즉시 죽인다.**
+        그래서 이걸 안 부르면 마지막 알림(특히 '청산')이 통째로 사라진다.
+        ONE_SHOT 처럼 몇 초 만에 끝나는 실행에서 실제로 겪었다 (2026-10-23).
+
+        Returns:
+            다 보냈으면 True, timeout 안에 못 비웠으면 False (그래도 종료를 막지는 않는다)
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while not self._q.empty() and _time.monotonic() < deadline:
+            _time.sleep(0.1)
+        # 큐가 비어도 마지막 한 건은 아직 보내는 중일 수 있다 → 조금 더 기다린다
+        _time.sleep(min(1.0, max(0.0, deadline - _time.monotonic())))
+        left = self._q.qsize()
+        if left:
+            logger.warning("텔레그램 메시지 %d개를 못 보내고 종료합니다", left)
+        return left == 0
+
     def send_now(self, text: str) -> bool:
         """바로 보내고 성공 여부 (live_check 테스트 메시지용)"""
         try:
