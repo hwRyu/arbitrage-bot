@@ -305,7 +305,7 @@ class Engine:
         # 목표 / 손절은 진입할 때 포지션에 저장한 값 (들고 있는 중에 .env 를 바꿔도 처음 값으로)
         target, stop = self._exit_rules(pos)
         # 익절 실행 여유: 청산 순간 체결이 밀릴 만큼을 목표에 얹는다 (그 순간 호가판으로 계산, 끄면 0)
-        buf = exit_buffer(self.s, quote, pos.upbit_qty)
+        buf = exit_buffer(self.s, quote, pos.upbit_qty, pos.bybit_qty)
         need = target + buffer_total(buf)
         reason: Optional[str] = None
         if pnl.net_percent >= need:
@@ -324,7 +324,7 @@ class Engine:
             # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
             fresh = self._fresh_quote(pos.coin)
             confirmed = self.broker.value_exit(pos, fresh) if fresh else None
-            fresh_buf = exit_buffer(self.s, fresh, pos.upbit_qty) if fresh else None   # 여유도 확인 시세 호가판으로 다시
+            fresh_buf = exit_buffer(self.s, fresh, pos.upbit_qty, pos.bybit_qty) if fresh else None   # 여유도 확인 시세 호가판으로 다시
             fresh_need = target + buffer_total(fresh_buf)
             if confirmed is None or confirmed.pnl.net_percent < fresh_need:
                 again = confirmed.pnl.net_percent if confirmed else None

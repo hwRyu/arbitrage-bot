@@ -220,13 +220,12 @@ class Settings:
     # 목표 순이익률 (%). 지금 청산하면 모든 비용을 빼고 이만큼 남을 때 청산한다.
     target_net_profit_percent: float = 1.0
 
-    # ★ 익절 실행 여유 (kimp/exec_buffer.py): 익절 조건을 '순손익 ≥ 목표 + 여유' 로. 여유는 그 순간 호가판으로 매번 계산
-    #   여유 = max(업비트 한 칸 %, 스트레스 밀림 %) + 바이비트 노이즈.
+    # ★ 익절 실행 여유 (kimp/exec_buffer.py): 익절 조건을 '순손익 ≥ 목표 + 여유' 로. 고정값 없이 그 순간 호가판으로만 계산
+    #   여유 = 업비트 항 + 바이비트 항. 거래소 항 = max(한 칸 % × min(1, 우리 수량×배수 ÷ 맨 앞 줄 수량), 스트레스 밀림)
     #   스트레스 밀림 = 우리 수량 × 배수로 호가를 걸었을 때 평균가가 우리 수량 평균가보다 얼마나 나쁜가.
     #   BLEND #10 2026-10-24: 판단 +0.3% 익절 → 0.7초 사이 매수벽 3칸 빠져 −0.25% 체결. 끄면 여유 0 = 예전 동작
     tp_exec_buffer_enabled: bool = True
     tp_stress_qty_multiplier: float = 2.0
-    tp_bybit_buffer_percent: float = 0.05
 
     # 손절 순손익률 (%, 음수). 이만큼 손해면 정리한다. 0 이면 손절 안 함.
     stop_loss_percent: float = -5.0
@@ -597,7 +596,6 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         stop_loss_percent=_env_float("STOP_LOSS_PERCENT", d.stop_loss_percent),
         tp_exec_buffer_enabled=_env_bool("TP_EXEC_BUFFER_ENABLED", d.tp_exec_buffer_enabled),
         tp_stress_qty_multiplier=_env_float("TP_STRESS_QTY_MULTIPLIER", d.tp_stress_qty_multiplier),
-        tp_bybit_buffer_percent=_env_float("TP_BYBIT_BUFFER_PERCENT", d.tp_bybit_buffer_percent),
         position_size_usdt=_env_optional_float("POSITION_SIZE_USDT"),
         capital_usage_percent=_env_float("CAPITAL_USAGE_PERCENT", d.capital_usage_percent),
         max_open_positions=_env_int("MAX_OPEN_POSITIONS", d.max_open_positions),
@@ -769,8 +767,6 @@ def validate_settings(s: Settings) -> None:
         errors.append("ENTRY_MAX_SPREAD_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
     if s.tp_stress_qty_multiplier < 1:
         errors.append("TP_STRESS_QTY_MULTIPLIER 는 1 이상이어야 합니다 (1 = 스트레스 없음)")
-    if s.tp_bybit_buffer_percent < 0:
-        errors.append("TP_BYBIT_BUFFER_PERCENT 는 0 이상이어야 합니다")
     if s.scan_interval_sec < 1:
         errors.append("SCAN_INTERVAL_SEC 는 1 이상이어야 합니다 (거래소 요청 제한)")
     if s.orderbook_depth < 5:

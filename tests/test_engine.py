@@ -328,10 +328,12 @@ class EngineTest(unittest.TestCase):
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
         [pos] = self._positions()
-        buf = exit_buffer(self.engine.s, thin(0.8), pos.upbit_qty)
-        self.assertAlmostEqual(buf.tick_percent, 0.1, places=2)
-        self.assertGreater(buf.stress_percent, 0.05)          # 2배(1000개)는 5줄까지 내려가 평균이 더 나쁘다
-        self.assertAlmostEqual(buf.bybit_percent, 0.05)
+        buf = exit_buffer(self.engine.s, thin(0.8), pos.upbit_qty, pos.bybit_qty)
+        self.assertAlmostEqual(buf.upbit.tick_percent, 0.1, places=2)   # 맨 앞 200개 < 우리 2배 → 한 칸 전부
+        self.assertGreater(buf.upbit.stress_percent, 0.05)              # 2배(1000개)는 5줄까지 내려가 평균이 더 나쁘다
+        self.assertEqual(buf.bybit.total, 0.0)                          # 바이비트는 줄 하나에 1e9 → 한 칸 모름·스트레스 0
+        # 두꺼운 호가판(한 줄에 1e9)이면 여유 0 → 고정값이 없다
+        self.assertEqual(exit_buffer(self.engine.s, make_quote(0.8), pos.upbit_qty, pos.bybit_qty).total, 0.0)
         # 목표(1%)는 넘지만 목표+여유는 못 넘는 시세 찾기
         with self.sf() as s:
             p = s.get(Position, pos.id)
