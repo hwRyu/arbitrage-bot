@@ -373,8 +373,16 @@ class Settings:
     # 펀딩비 정보 갱신 간격 (초). 보유 포지션 코인만
     funding_refresh_sec: float = 60.0
 
-    # 호가창 몇 줄까지 받을지
+    # 호가창 몇 줄까지 받을지 (REST)
     orderbook_depth: int = 30
+
+    # 시세를 어떻게 받나 (kimp/ws_feed.py)
+    #   rest = 스캔마다 요청해서 받는다 (기본). 한 번에 ~190 ms, 10초에 한 번
+    #   ws   = 웹소켓으로 밀어 받는다 (바이비트 초당 ~8회, 업비트 1~2회, 70~80 ms 뒤 도착). 판단 순간 손에 최신 판이
+    #          있어 요청 시간이 0 이고, SCAN_INTERVAL_SEC 를 줄이면 기회를 1초 아래로 본다. 호가가 없거나
+    #          quote_ws_max_age_ms 보다 묵은 코인은 그 스캔만 REST 로 → 소켓이 죽어도 봇은 선다. 주문은 늘 REST
+    quote_source: str = "rest"
+    quote_ws_max_age_ms: int = 1500
 
     # ------------------------------------------------------------------
     # 달러 환율 (표시용. 사이트식 김프와 테더 프리미엄 보여주기, kimp/fx.py)
@@ -630,6 +638,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         snapshot_interval_sec=_env_float("SNAPSHOT_INTERVAL_SEC", d.snapshot_interval_sec),
         funding_refresh_sec=_env_float("FUNDING_REFRESH_SEC", d.funding_refresh_sec),
         orderbook_depth=_env_int("ORDERBOOK_DEPTH", d.orderbook_depth),
+        quote_source=_env_str("QUOTE_SOURCE", d.quote_source).strip().lower(),
+        quote_ws_max_age_ms=_env_int("QUOTE_WS_MAX_AGE_MS", d.quote_ws_max_age_ms),
         fx_refresh_sec=_env_float("FX_REFRESH_SEC", d.fx_refresh_sec),
         fixed_usd_krw=_env_optional_float("FIXED_USD_KRW"),
         paper_initial_total_usdt=_env_float("PAPER_INITIAL_TOTAL_USDT", d.paper_initial_total_usdt),
@@ -771,6 +781,10 @@ def validate_settings(s: Settings) -> None:
         errors.append("SCAN_INTERVAL_SEC 는 1 이상이어야 합니다 (거래소 요청 제한)")
     if s.orderbook_depth < 5:
         errors.append("ORDERBOOK_DEPTH 는 5 이상이어야 합니다")
+    if s.quote_source not in ("rest", "ws"):
+        errors.append("QUOTE_SOURCE 는 rest 또는 ws 여야 합니다")
+    if s.quote_ws_max_age_ms < 200:
+        errors.append("QUOTE_WS_MAX_AGE_MS 는 200 이상이어야 합니다 (소켓 호가 도착 지연이 70~80 ms)")
     if s.sim_default_spread_percent < 0:
         errors.append("SIM_DEFAULT_SPREAD_PERCENT 는 0 이상이어야 합니다")
     if s.fx_refresh_sec < 5:

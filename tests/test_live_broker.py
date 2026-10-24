@@ -772,11 +772,17 @@ class ParallelLegsTest(unittest.TestCase):
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             val = broker.value_exit(pos, prices.quote())
             t0 = time.monotonic()
-            pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+            broker.mark_decided()                                   # 엔진이 '청산하기로 정한' 순간
+            with self.assertLogs("kimp.broker", level=logging.INFO) as logs:
+                pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
             took = time.monotonic() - t0
             self.assertIsNotNone(pnl)
             self.assertEqual(pos.status, PositionStatus.CLOSED)
             self.assertLess(took, 0.95, f"{took:.2f}초 — 코인 매도·숏 닫기·USDT 매수가 전부 순차였다")
+            sent = [m for m in logs.output if "[주문 전송]" in m]
+            self.assertEqual(len(sent), 1, logs.output)             # 판단 → 전송 ms 는 첫 주문 묶음에 한 번
+            self.assertIn("판단 → 전송", sent[0])
+            self.assertIn("sell, close_short", sent[0])
 
     def test_close_coin_sell_fails_short_close_succeeds(self):
         """동시에 냈는데 코인 매도만 거절 → 숏은 닫힌 채 CLOSING → 다음 스캔에 코인만 다시 (숏 주문 중복 없음)"""

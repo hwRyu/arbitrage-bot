@@ -98,14 +98,20 @@ class MarketData:
         md = MarketData(depth=30)
         coins = md.filter_supported(["XRP", "SOL"])   # 양쪽에 다 있는 코인만 남김
         quotes = md.fetch_quotes(coins, fx_krw=1325)  # 매 스캔마다 호출 (환율은 표시용, 없어도 됨)
+
+    시세를 어디서 받나 (QUOTE_SOURCE):
+        feed 가 없으면 REST (스캔마다 요청). feed(kimp/ws_feed.WsFeed) 가 붙어 있으면 소켓으로 밀려 온 호가를
+        먼저 쓰고, 없거나 묵은 코인만 REST 로 받는다. Quote 를 만드는 곳은 여기 한 군데라 엔진은 출처를 모른다.
     """
 
-    def __init__(self, depth: int = 30):
+    def __init__(self, depth: int = 30, feed=None):
         """
         Args:
-            depth: 호가창을 몇 줄까지 받을지
+            depth: 호가창을 몇 줄까지 받을지 (REST)
+            feed: 웹소켓 호가 (WsFeed). books(coin) 만 쓴다. None 이면 REST 만
         """
         self.depth = depth
+        self.feed = feed
         # enableRateLimit: 거래소 요청 간격을 ccxt 가 알아서 지켜준다
         # 업비트 시세 조회는 초당 10회까지인데 ccxt 기본값은 50ms(초당 20회)라 너무 빠르다.
         # 그대로 두면 과거 캔들을 많이 받을 때 429(요청 과다)로 끊긴다 → 110ms(초당 약 9회)로 늘린다.
@@ -181,7 +187,34 @@ class MarketData:
 
     def fetch_quotes(self, coins: List[str], fx_krw: Optional[float] = None) -> Dict[str, Quote]:
         """
-        코인별 시세 묶음(Quote) 가져오기
+        코인별 시세 묶음(Quote) 가져오기 — 소켓 호가가 있으면 그걸, 없거나 묵은 코인만 REST 로
+
+        Returns:
+            {코인: Quote}. 어느 쪽으로도 못 받은 코인은 빠진다.
+        """
+        quotes: Dict[str, Quote] = {}
+        missing = list(coins)
+        if self.feed is not None:
+            missing = []
+            for coin in coins:
+                fb = self.feed.books(coin)
+                if fb is None:
+                    missing.append(coin)
+                    continue
+                quotes[coin] = Quote(coin=coin, upbit=fb.upbit, bybit=fb.bybit, usdt=fb.usdt, fx_krw=fx_krw,
+                                     skew_ms=fb.skew_ms)
+            if missing:
+                _log_repeat("ws-missing", logging.WARNING,
+                            f"[웹소켓 호가 없음·묵음] {', '.join(missing)} → 이 코인은 REST 로 받습니다")
+            else:
+                _log_recovered("ws-missing", "웹소켓 호가")
+        if missing:
+            quotes.update(self._fetch_quotes_rest(missing, fx_krw))
+        return quotes
+
+    def _fetch_quotes_rest(self, coins: List[str], fx_krw: Optional[float] = None) -> Dict[str, Quote]:
+        """
+        REST 로 코인별 시세 묶음 받기
 
         1) 업비트: 모든 코인 + USDT/KRW 호가를 요청 1번에
         2) 바이비트: 코인마다 호가 요청 (한 번에 받는 기능이 없음)

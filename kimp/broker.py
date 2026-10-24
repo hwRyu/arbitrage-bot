@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -310,6 +311,24 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     # 주문 한 동작 + 기록
     # ------------------------------------------------------------------
+    def mark_decided(self) -> None:
+        """
+        엔진이 '주문하기로 정한' 순간을 표시한다 (익절·손절·진입 판단 직후)
+
+        다음 주문 전송 때 '판단 → 전송 N ms' 를 로그로 남겨, 판단과 거래소 매칭 사이에서 우리 쪽이 먹는
+        시간을 잰다 (시세 지연·체결 밀림을 줄이려면 어디를 줄여야 하는지 보려고). 한 번 쓰면 지운다.
+        """
+        self._decided_at = time.monotonic()
+
+    def _log_send(self, pos: Position, sides: List[str]) -> None:
+        """주문을 거래소로 보내기 직전: 판단 → 전송 걸린 시간 (mark_decided 가 없었으면 조용히)"""
+        decided = getattr(self, "_decided_at", None)
+        if decided is None:
+            return
+        self._decided_at = None
+        logger.info("[주문 전송] #%d %s | 판단 → 전송 %d ms | %s",
+                    pos.id, pos.coin, (time.monotonic() - decided) * 1000, ", ".join(sides))
+
     def _leg(self, session: Session, pos: Position, side: str, call: Callable[[str], LegFill],
              expected_price: Optional[float] = None) -> LegFill:
         """
@@ -319,6 +338,7 @@ class HedgeBroker:
         expected_price 는 분석용: 판단 때 호가 소진 계산으로 예상한 평균가 (실제 avg_price 와 비교하려고 남긴다).
         """
         row = self._sent_row(session, pos, side, expected_price)
+        self._log_send(pos, [side])
         try:
             f = call(row.client_id)
         except OrderUnknown:
@@ -329,14 +349,23 @@ class HedgeBroker:
         self._settle(session, row, f)
         return f
 
-    def _sent_row(self, session: Session, pos: Position, side: str, expected_price: Optional[float]) -> Fill:
-        """주문을 내기 전에 SENT 기록을 먼저 적는다 (추적번호 포함). 메인 스레드에서만 부른다"""
+    def _sent_row(self, session: Session, pos: Position, side: str, expected_price: Optional[float],
+                  commit: bool = True) -> Fill:
+        """
+        주문을 내기 전에 SENT 기록을 먼저 적는다 (추적번호 포함). 메인 스레드에서만 부른다
+
+        commit=False 면 flush 만 한다 — 동시 주문은 다리마다 커밋하지 않고 묶어서 한 번 커밋한다
+        (주문 앞 커밋 하나가 SQLite 에서 수십 ms). 주문이 나가기 전에 커밋되는 것은 같다.
+        """
         exchange, cur = LEG_INFO[side]
         row = Fill(position_id=pos.id, exchange=exchange, side=side, qty=0.0, avg_price=0.0, cost=0.0, fee=0.0,
                    fee_currency=cur, slippage_percent=0.0, client_id=new_client_id(), state=FillState.SENT,
                    expected_price=expected_price, created_at=self._now())
         session.add(row)
-        session.commit()
+        if commit:
+            session.commit()
+        else:
+            session.flush()
         return row
 
     def _settle(self, session: Session, row: Fill, f: Optional[LegFill] = None, failed: bool = False) -> None:
@@ -368,7 +397,9 @@ class HedgeBroker:
         """
         if self.ex.is_paper or len(specs) <= 1:
             return {side: self._leg(session, pos, side, call, expected_price=exp) for side, call, exp in specs}
-        rows = [(side, self._sent_row(session, pos, side, exp), call) for side, call, exp in specs]
+        rows = [(side, self._sent_row(session, pos, side, exp, commit=False), call) for side, call, exp in specs]
+        session.commit()   # SENT 기록들을 한 번에 — 주문은 이 뒤에 나간다
+        self._log_send(pos, [side for side, _, _ in rows])
         with ThreadPoolExecutor(max_workers=len(rows)) as pool:
             futures = [(side, row, pool.submit(call, row.client_id)) for side, row, call in rows]
             results: Dict[str, LegFill] = {}

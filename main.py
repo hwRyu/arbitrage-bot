@@ -79,7 +79,27 @@ def make_broker(settings: Settings, coins, safety: Safety) -> HedgeBroker:
                        auto_transfer=settings.auto_transfer_enabled, **kw)
 
 
-def status_text(settings: Settings, broker: HedgeBroker, session_factory) -> str:
+def quote_source_text(settings: Settings, market=None) -> str:
+    """시세를 어디서 받고 있나 한 줄 (시작 메시지·/status). 예) 웹소켓 신선 5/5 · 업데이트 … · 스캔 10초"""
+    feed = getattr(market, "feed", None)
+    how = feed.status_text() if feed is not None else ("웹소켓 (아직 안 켜짐)" if settings.quote_source == "ws" else "REST")
+    return f"시세 {how} · 스캔 {settings.scan_interval_sec:g}초"
+
+
+def start_quote_feed(settings: Settings, coins) -> Optional["WsFeed"]:
+    """QUOTE_SOURCE=ws 면 웹소켓 호가를 켜고 첫 호가가 다 들어올 때까지 잠깐(최대 5초) 기다린다. rest 면 None"""
+    if settings.quote_source != "ws":
+        return None
+    from kimp.ws_feed import WsFeed
+    feed = WsFeed(coins, max_age_ms=settings.quote_ws_max_age_ms)
+    feed.start()
+    if not feed.wait_ready(timeout=5.0):
+        logger.warning("웹소켓 호가가 5초 안에 다 안 들어왔습니다 — 없는 코인은 REST 로 받습니다 (%s)", feed.status_text())
+    logger.info("웹소켓 호가 시작: %s", feed.status_text())
+    return feed
+
+
+def status_text(settings: Settings, broker: HedgeBroker, session_factory, market=None) -> str:
     """
     /status 답장과 하루 요약에 쓰는 현황
 
@@ -96,7 +116,8 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory) -> str
                  f"잔고 업비트 {broker.balance(session, UPBIT_USDT):,.2f} / 바이비트 "
                  f"{broker.balance(session, BYBIT_USDT):,.2f} USDT (포지션 제외)",
                  f"오늘 확정 손익 {broker.safety.daily_loss_usdt(session):+,.2f} USDT",
-                 ("신규 진입 가능" if ok else f"신규 진입 중단 — {why}") + f" · 자리 {len(positions)} / {s.max_open_positions}"]
+                 ("신규 진입 가능" if ok else f"신규 진입 중단 — {why}") + f" · 자리 {len(positions)} / {s.max_open_positions}",
+                 quote_source_text(s, market)]
         for p in broker.unfinished_positions(session):
             lines.append(f"⚠️ #{p.id} {p.coin} {p.status} — 다음 스캔에 이어서 처리")
         for t in broker.pending_transfers(session):
@@ -265,7 +286,7 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
         return "재개했습니다 — " + ", ".join(cleared) + ". 다른 이유로 막혀 있으면 /status 에 나옵니다"
 
     TelegramCommands(notifier, {
-        "/status": lambda: status_text(settings, broker, session_factory),
+        "/status": lambda: status_text(settings, broker, session_factory, market),
         "/stop": stop,
         "/resume": resume,
         "/premium": lambda: premium_text(settings, market),
@@ -288,7 +309,7 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
             if now.hour == 9 and sent_for != now.date():
                 sent_for = now.date()
                 try:
-                    logger.info("[하루 요약]\n%s", status_text(settings, broker, session_factory))
+                    logger.info("[하루 요약]\n%s", status_text(settings, broker, session_factory, market))
                 except Exception:
                     logger.exception("하루 요약 실패")
 
@@ -327,6 +348,7 @@ def startup_text(settings: Settings, open_positions) -> str:
         lines.append(f"자동 송금 켜짐 · 여유분 {s.bybit_margin_buffer_percent:.0f}% · {s.rebalance_threshold_percent:.0f}%p 어긋나면 재분배")
     else:
         lines.append("자동 송금 꺼짐 (재분배는 알림만)")
+    lines.append(("시세 웹소켓 (없거나 묵으면 REST)" if s.quote_source == "ws" else "시세 REST") + f" · 스캔 {s.scan_interval_sec:g}초")
     if open_positions:
         lines.append("이어받은 포지션 " + ", ".join(f"#{p.id} {p.coin}" for p in open_positions))
     for coin in s.coins:
@@ -466,6 +488,7 @@ def main() -> int:
     if not coins:
         logger.error("운용 가능한 코인이 없습니다 (COINS 확인)")
         return 2
+    market.feed = start_quote_feed(settings, coins)   # QUOTE_SOURCE=ws 일 때만 켜진다
 
     # 코인별로 실제로 쓰는 값 보여주기. 코인별로 따로 정한 값에는 * 표시
     logger.info("코인별 적용값 (* = 코인별 설정):")
@@ -527,6 +550,8 @@ def main() -> int:
             logger.exception("펀딩비 전략 시작 실패 (김프 전략은 계속)")
 
     engine.run(stop_event)
+    if market.feed is not None:
+        market.feed.stop()
     end_run(session_factory, engine.run_id, "one_shot" if engine._one_shot_done else "stopped")
     if carry_thread:
         carry_thread.join(timeout=30)

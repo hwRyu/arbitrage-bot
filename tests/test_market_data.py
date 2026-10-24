@@ -53,6 +53,7 @@ def fake_market(coins_parallel=3):
     """네트워크 없이 MarketData 를 만든다 (load_markets 를 건너뛰고 가짜 거래소를 꽂는다)"""
     m = MarketData.__new__(MarketData)
     m.depth = 5
+    m.feed = None          # __init__ 을 건너뛰므로 직접 (소켓 호가 없음 = REST 만)
     m.upbit = SlowUpbit()
     m.bybit = SlowBybit()
     m._bybit_pool = queue.Queue()
@@ -89,6 +90,39 @@ class ParallelQuotesTest(unittest.TestCase):
         m = fake_market()
         m.upbit.fetch_order_books = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("업비트 안 됨"))
         self.assertEqual(m.fetch_quotes(["AAA"]), {})
+
+
+class FakeFeed:
+    """코인 하나만 소켓 호가가 있는 가짜 WsFeed (books 만 흉내)"""
+
+    def __init__(self, coin):
+        from kimp.premium import OrderBook
+        from kimp.ws_feed import FeedBooks
+        self.coin = coin
+        self.fb = FeedBooks(upbit=OrderBook(bids=[(999.0, 1e9)], asks=[(1000.0, 1e9)]),
+                            bybit=OrderBook(bids=[(0.7, 1e9)], asks=[(0.7001, 1e9)]),
+                            usdt=OrderBook(bids=[(1400.0, 1e9)], asks=[(1401.0, 1e9)]), age_ms=80, skew_ms=12)
+
+    def books(self, coin):
+        return self.fb if coin == self.coin else None
+
+
+class FeedFirstTest(unittest.TestCase):
+    def test_feed_coin_skips_rest_and_others_fall_back(self):
+        """소켓 호가가 있는 코인은 그걸 쓰고(REST 안 부름), 없는 코인만 REST 로 받는다"""
+        m = fake_market()
+        m.feed = FakeFeed("XRP")
+        quotes = m.fetch_quotes(["XRP", "SOL"], fx_krw=1320.0)
+        self.assertEqual(quotes["XRP"].upbit.bids[0][0], 999.0)       # 소켓 값
+        self.assertEqual(quotes["XRP"].skew_ms, 12)
+        self.assertEqual(quotes["SOL"].upbit.bids[0][0], 1386.0)      # REST 가짜 값
+        calls = sum(b.calls for b in list(m._bybit_pool.queue))
+        self.assertEqual(calls, 1)                                    # 바이비트 REST 는 SOL 한 번만
+
+    def test_no_feed_is_plain_rest(self):
+        m = fake_market()
+        quotes = m.fetch_quotes(["XRP", "SOL"])
+        self.assertEqual({c: q.upbit.bids[0][0] for c, q in quotes.items()}, {"XRP": 1386.0, "SOL": 1386.0})
 
 
 class RepeatLogTest(unittest.TestCase):

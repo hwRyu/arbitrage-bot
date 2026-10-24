@@ -356,13 +356,15 @@ class Engine:
         if now - self._last_pos_snapshot.get(pos.id, 0.0) >= self.s.snapshot_interval_sec:
             self._last_pos_snapshot[pos.id] = now
             telemetry.position_snapshot(session, pos, valuation, quote, self._now_utc())
-        session.commit()
 
         if reason is None:
+            session.commit()
             logger.debug("%s 보유 중: 청산 김프 %+.3f%%, 순손익 %+.3f%% (%+.2f USDT)",
                          pos.coin, valuation.exit_premium, pnl.net_percent, pnl.net_usdt)
             return False
 
+        # 청산: 위 평가값은 close_hedge 의 CLOSING 커밋에 같이 실린다 (주문 앞 커밋을 하나 줄인다)
+        self.broker.mark_decided()
         self._close(session, pos, valuation, reason)
         return True
 
@@ -873,6 +875,7 @@ class Engine:
                                    size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, now=self._now_utc())
                 continue
             quote, depth = fresh, again   # 더 새 시세로 주문한다
+            self.broker.mark_decided()    # 진입 판단 → 주문 전송 ms 측정
             try:
                 try:
                     pos = self.broker.open_hedge(session, quote, bybit_qty)
