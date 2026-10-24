@@ -139,6 +139,7 @@ class Engine:
         self._account_dirty = True                      # 주문·송금·증거금을 낸 뒤 → 다음 스캔에 계좌를 꼭 새로 받는다
         self._step_started = 0.0                     # 이번 스캔 시작 (monotonic)
         self._quote_ms = 0.0                         # 이번 스캔의 시세 조회 소요 (ms)
+        self._steps_since_status = 0                 # 마지막 [현황] 뒤 판단 횟수 (소켓이면 분당 수십~수백 회)
 
     def request_close(self, coins: Optional[Sequence[str]] = None) -> str:
         """
@@ -277,6 +278,7 @@ class Engine:
     def step(self) -> None:
         """스캔 한 번 (순서는 파일 맨 위 설명 참고)"""
         self._step_started = time.monotonic()
+        self._steps_since_status += 1
         # 환율은 테더 프리미엄·사이트식 김프를 보여주는 데만 쓴다. 없으면 그 칸만 빈다
         fx_krw = self.fx.get() if self.fx else None
         t_quote = time.monotonic()
@@ -1051,7 +1053,9 @@ class Engine:
         now = self._clock()
         if now - self._last_status_log < self.s.snapshot_interval_sec:
             return
-        self._last_status_log = now
+        elapsed_min = max(1e-9, (now - self._last_status_log) / 60) if self._last_status_log else None
+        steps_per_min = self._steps_since_status / elapsed_min if elapsed_min else None
+        self._last_status_log, self._steps_since_status = now, 0
 
         q0 = next(iter(quotes.values()))
         head = f"USDT {q0.usdt_krw:,.1f}원"
@@ -1082,12 +1086,13 @@ class Engine:
         skew_ms = max(skews) if skews else None
         logger.info(
             "[현황] %s | %s | 포지션 %d/%d | 자본 업비트 %s / 바이비트 %s USDT (%.1f:%.1f, 목표 %.1f:%.1f) | "
-            "스캔 %.1f초 (시세 %.1f초, 두 거래소 어긋남 %s)",
+            "스캔 %.1f초 (시세 %.1f초, 두 거래소 어긋남 %s) | 판단 %s",
             head, ", ".join(parts), len(open_positions), self.s.max_open_positions,
             f"{upbit:,.2f}", f"{bybit:,.2f}",
             upbit / total * 100 if total else 0, bybit / total * 100 if total else 0,
             target * 100, (1 - target) * 100, scan_ms / 1000, self._quote_ms / 1000,
             "-" if skew_ms is None else f"{skew_ms}ms",
+            "-" if steps_per_min is None else f"{steps_per_min:.0f}회/분",
         )
         # 분석용: 자본 곡선과 스캔 소요 시간 (느려진 구간·통신 장애를 나중에 찾으려고)
         telemetry.engine_snapshot(session, upbit, bybit, len(open_positions), scan_ms, self._quote_ms,
