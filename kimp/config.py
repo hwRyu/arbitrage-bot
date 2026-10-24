@@ -221,8 +221,8 @@ class Settings:
     target_net_profit_percent: float = 1.0
 
     # ★ 익절 실행 여유 (kimp/exec_buffer.py): 익절 조건을 '순손익 ≥ 목표 + 여유' 로. 고정값 없이 그 순간 호가판으로만 계산
-    #   여유 = 업비트 항 + 바이비트 항. 거래소 항 = max(한 칸 % × min(1, 우리 수량×배수 ÷ 맨 앞 줄 수량), 스트레스 밀림)
-    #   스트레스 밀림 = 우리 수량 × 배수로 호가를 걸었을 때 평균가가 우리 수량 평균가보다 얼마나 나쁜가.
+    #   여유 = 업비트 항 + 바이비트 항. 거래소 항 = "우리 앞에 우리만 한 주문이 (배수−1)개 먼저 체결된 뒤" 우리 평균가가
+    #   지금 평균가보다 얼마나 나쁜가 (%). 배수 2 = 앞에 하나, 1 = 아무도 없음(여유 0). 호가 한 칸·상수 같은 고정값 없음
     #   BLEND #10 2026-10-24: 판단 +0.3% 익절 → 0.7초 사이 매수벽 3칸 빠져 −0.25% 체결. 끄면 여유 0 = 예전 동작
     tp_exec_buffer_enabled: bool = True
     tp_stress_qty_multiplier: float = 2.0
@@ -766,7 +766,7 @@ def validate_settings(s: Settings) -> None:
     if s.entry_max_spread_percent < 0:
         errors.append("ENTRY_MAX_SPREAD_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
     if s.tp_stress_qty_multiplier < 1:
-        errors.append("TP_STRESS_QTY_MULTIPLIER 는 1 이상이어야 합니다 (1 = 스트레스 없음)")
+        errors.append("TP_STRESS_QTY_MULTIPLIER 는 1 이상이어야 합니다 (1 = 앞에 아무도 없음 = 여유 0)")
     if s.scan_interval_sec < 1:
         errors.append("SCAN_INTERVAL_SEC 는 1 이상이어야 합니다 (거래소 요청 제한)")
     if s.orderbook_depth < 5:

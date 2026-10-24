@@ -329,9 +329,10 @@ class EngineTest(unittest.TestCase):
         self.engine.step()
         [pos] = self._positions()
         buf = exit_buffer(self.engine.s, thin(0.8), pos.upbit_qty, pos.bybit_qty)
-        self.assertAlmostEqual(buf.upbit.tick_percent, 0.1, places=2)   # 맨 앞 200개 < 우리 2배 → 한 칸 전부
-        self.assertGreater(buf.upbit.stress_percent, 0.05)              # 2배(1000개)는 5줄까지 내려가 평균이 더 나쁘다
-        self.assertEqual(buf.bybit.total, 0.0)                          # 바이비트는 줄 하나에 1e9 → 한 칸 모름·스트레스 0
+        # 지금: 500개 = 200@0 + 200@-0.1% + 100@-0.2% → 평균 -0.08%. 앞에 500개가 먼저 빠지면: 100@-0.2 + 200@-0.3 + 200@-0.4
+        # → 평균 -0.32% → 차이 0.24%p
+        self.assertAlmostEqual(buf.upbit_percent, 0.24, places=2)
+        self.assertEqual(buf.bybit_percent, 0.0)                        # 바이비트는 줄 하나에 1e9 → 앞에 누가 와도 그대로
         # 두꺼운 호가판(한 줄에 1e9)이면 여유 0 → 고정값이 없다
         self.assertEqual(exit_buffer(self.engine.s, make_quote(0.8), pos.upbit_qty, pos.bybit_qty).total, 0.0)
         # 목표(1%)는 넘지만 목표+여유는 못 넘는 시세 찾기
