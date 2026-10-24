@@ -525,7 +525,8 @@ class Engine:
             그 외                                     → 정리 (LIQ_GUARD). 청산당하는 것과 돈 차이는 거의 없지만 시점을 우리가 고른다
 
         넣는 돈의 출처와 양 (_margin_buffer_usdt):
-            한 번에 그 포지션의 원래 증거금 1단위 (1배면 청산가 2배 → 3배), 포지션당 최대 MARGIN_TOPUP_MAX_ROUNDS 회.
+            한 번에 그 포지션의 원래 증거금 × MARGIN_TOPUP_UNIT_RATIO (1배·배수 1 이면 청산가 2배 → 3배),
+            포지션당 최대 MARGIN_TOPUP_MAX_ROUNDS 회.
             전체 포지션이 넣은 합이 '여유분' (자본 나눌 때 바이비트에 더 둔 30%) 을 넘지 못한다
             → 자리 몫(다음 진입 돈)은 절대 건드리지 않는다. 여유분을 다 썼거나 회차를 다 썼으면 정리.
 
@@ -537,7 +538,8 @@ class Engine:
         target, _stop = self._exit_rules(pos)
         added = pos.margin_added_usdt or 0.0
         initial = pos.bybit_margin_usdt - added
-        rounds_used = int(round(added / initial)) if initial > 0 else 0
+        unit = initial * self.s.margin_topup_unit_ratio          # 한 번에 넣는 양
+        rounds_used = int(round(added / unit)) if unit > 0 else 0
 
         why_hold = None
         if net is not None and target - net <= self.s.liq_guard_near_target_percent:
@@ -554,7 +556,7 @@ class Engine:
                 buffer = self._margin_buffer_usdt(session, quote, open_positions)
                 used = sum(p.margin_added_usdt or 0.0 for p in open_positions)
                 free = self.broker.balance(session, BYBIT_USDT)
-                add = min(initial, max(0.0, buffer - used), max(0.0, free))
+                add = min(unit, max(0.0, buffer - used), max(0.0, free))
                 if add < MIN_TOPUP_USDT:
                     blocked = (f"여유분 {buffer:.2f} USDT 중 {used:.2f} 사용, 남은 {max(0.0, buffer - used):.2f} "
                                f"(바이비트 잔고 {free:.2f})")

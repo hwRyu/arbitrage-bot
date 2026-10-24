@@ -495,6 +495,28 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         self.assertAlmostEqual(pos.margin_added_usdt, 10_000 * 0.01 / 4.01, delta=0.5)
         self.assertLess(pos.margin_added_usdt, margin0 * 0.2)
 
+    def test_liq_guard_unit_ratio(self):
+        """MARGIN_TOPUP_UNIT_RATIO=0.5 → 한 번에 원래 증거금의 절반, 회수도 그 단위로 센다"""
+        market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0, margin_topup_unit_ratio=0.5,
+                                                            margin_topup_max_rounds=2)
+        margin0 = pos.bybit_margin_usdt
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        engine.step()                                     # 1차: 0.5단위
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertAlmostEqual(pos.margin_added_usdt, margin0 * 0.5, delta=0.01)
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=pos.liquidation_price / 1.08)}
+        engine.step()                                     # 2차: 또 0.5단위 → 합 1단위
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        self.assertAlmostEqual(pos.margin_added_usdt, margin0, delta=0.01)
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=pos.liquidation_price / 1.08)}
+        engine.step()                                     # 3차: 회수 소진 → 정리
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.exit_reason, ExitReason.LIQ_GUARD)
+
     def test_liq_guard_one_unit_per_round(self):
         """여유분이 넉넉하면 한 번에 '원래 증거금 1단위' 를 넣는다 (1배면 청산가 2배 → 3배)"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0)
