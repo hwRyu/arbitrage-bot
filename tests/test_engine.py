@@ -428,8 +428,8 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         self.assertGreater(pos.margin_added_usdt, 0)
         self.assertGreater(pos.bybit_margin_usdt, margin0)
         self.assertGreater(pos.liquidation_price, liq0 * 1.05)       # 청산가가 멀어짐
-        # 한 번에 넣는 양은 '원래 증거금 1단위' 이되 여유분 풀(자리 1 × 증거금 × 30%) 을 넘지 못한다
-        self.assertAlmostEqual(pos.margin_added_usdt, margin0 * 0.30, delta=0.5)
+        # 한 번에 '원래 증거금 1단위'. 여유분(자본 10,000 × 0.3/4.3 ≈ 698) 이 1단위(≈167)보다 크므로 꽉 채워 넣는다
+        self.assertAlmostEqual(pos.margin_added_usdt, margin0, delta=0.01)
 
     def test_liq_guard_adds_margin_when_premium_deeply_negative(self):
         """가드 구간인데 역프가 깊어 순손익 ≤ -2% → 지금 정리하면 손실 확정이니 증거금을 넣고 기다린다"""
@@ -471,19 +471,31 @@ class LeverageAndRebalanceTest(unittest.TestCase):
             pos = s.query(Position).one()
         self.assertEqual(pos.exit_reason, ExitReason.LIQ_GUARD)
 
-    def test_liq_guard_pool_is_the_margin_buffer_only(self):
-        """여유분이 0% 면 추가 풀이 0 → 목표가 코앞이어도 넣지 않고 정리 (자리 몫은 절대 안 건드린다)"""
+    def test_liq_guard_uses_only_the_margin_buffer(self):
+        """여유분이 0% 면 넣을 돈이 0 → 목표가 코앞이어도 넣지 않고 정리 (자리 몫은 절대 안 건드린다)"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=0.0)
         market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
         with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
             engine.step()
-        self.assertTrue(any("[증거금 추가 불가]" in m and "여유분 풀" in m for m in logs.output))
+        self.assertTrue(any("[증거금 추가 불가]" in m and "여유분 0.00 USDT" in m for m in logs.output))
         with sf() as s:
             pos = s.query(Position).one()
         self.assertEqual(pos.exit_reason, ExitReason.LIQ_GUARD)
         self.assertFalse(pos.margin_added_usdt)
 
-    def test_liq_guard_one_unit_per_round_within_pool(self):
+    def test_liq_guard_partial_when_buffer_is_short(self):
+        """여유분이 1단위보다 작으면 남은 만큼만 넣는다 — 자본 10,000 × 1%/4.01 ≈ 25 USDT < 1단위 167"""
+        market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=1.0)
+        margin0 = pos.bybit_margin_usdt
+        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        engine.step()
+        with sf() as s:
+            pos = s.query(Position).one()
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        self.assertAlmostEqual(pos.margin_added_usdt, 10_000 * 0.01 / 4.01, delta=0.5)
+        self.assertLess(pos.margin_added_usdt, margin0 * 0.2)
+
+    def test_liq_guard_one_unit_per_round(self):
         """여유분이 넉넉하면 한 번에 '원래 증거금 1단위' 를 넣는다 (1배면 청산가 2배 → 3배)"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0)
         margin0 = pos.bybit_margin_usdt

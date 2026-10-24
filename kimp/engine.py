@@ -503,17 +503,18 @@ class Engine:
             )
         return False
 
-    def _topup_pool_usdt(self, session: Session, quote: Quote, open_positions: List[Position]) -> float:
+    def _margin_buffer_usdt(self, session: Session, quote: Quote, open_positions: List[Position]) -> float:
         """
-        증거금 추가 풀 = 자리 수 × 자리당 증거금 × 여유분%
+        여유분 = 자본을 나눌 때 바이비트에 증거금 외로 더 두기로 한 돈 (BYBIT_MARGIN_BUFFER_PERCENT). 증거금 추가는 이 안에서만
 
-        자본 비율을 정할 때(upbit_target_share) 바이비트에 증거금 외로 더 두기로 한 '여유분' 이 바로 이 돈이다.
-        자리당 증거금은 지금 설정대로 계산한 포지션 크기(자동 또는 고정) ÷ 레버리지.
-        예) 자리 4 × 포지션 196 USDT, 1배, 여유분 30% → 4 × 196 × 0.3 = 235 USDT
+        자본 비율(upbit_target_share)은 업비트 : 바이비트 증거금 : 여유분 = 레버리지 : 1 : 여유분% 이다.
+        그러니 여유분 = 전체 자본 × 여유분% ÷ (레버리지 + 1 + 여유분%).
+        예) 1,400 USDT, 1배, 30% → 1,400 × 0.3 ÷ 2.3 ≈ 183 USDT
+        포지션 크기와는 무관하다 — 검증용으로 포지션을 20 USDT 로 줄여도 바이비트에 더 둔 돈은 그대로다.
         """
-        size = self._position_size_usdt(session, quote.coin, open_positions, {quote.coin: quote})
-        per_slot_margin = size / max(self.s.bybit_leverage, 1e-9)
-        return self.s.max_open_positions * per_slot_margin * self.s.bybit_margin_buffer_percent / 100
+        upbit, bybit = self.broker.capital_split(session, open_positions, {quote.coin: quote})
+        b = self.s.bybit_margin_buffer_percent / 100
+        return (upbit + bybit) * b / (self.s.bybit_leverage + 1 + b)
 
     def _liq_guard(self, session: Session, pos: Position, quote: Quote, price: float, distance: float) -> bool:
         """
@@ -523,10 +524,10 @@ class Engine:
             순손익 ≤ LIQ_GUARD_HOLD_BELOW_PERCENT    → 증거금 추가 (역프 깊음 — 지금 정리하면 손실 확정, 돌아올 때까지)
             그 외                                     → 정리 (LIQ_GUARD). 청산당하는 것과 돈 차이는 거의 없지만 시점을 우리가 고른다
 
-        넣는 돈의 출처와 양 (_topup_pool_usdt):
+        넣는 돈의 출처와 양 (_margin_buffer_usdt):
             한 번에 그 포지션의 원래 증거금 1단위 (1배면 청산가 2배 → 3배), 포지션당 최대 MARGIN_TOPUP_MAX_ROUNDS 회.
-            전체 포지션이 넣은 합이 '여유분 풀' 을 넘지 못한다 → 자리 몫(다음 진입 돈)은 절대 건드리지 않는다.
-            풀이 비었거나 회차를 다 썼으면 정리.
+            전체 포지션이 넣은 합이 '여유분' (자본 나눌 때 바이비트에 더 둔 30%) 을 넘지 못한다
+            → 자리 몫(다음 진입 돈)은 절대 건드리지 않는다. 여유분을 다 썼거나 회차를 다 썼으면 정리.
 
         Returns:
             정리했으면 True
@@ -550,12 +551,13 @@ class Engine:
                 blocked = f"이미 {rounds_used}회 넣음 (최대 {self.s.margin_topup_max_rounds}회)"
             else:
                 open_positions = self.broker.open_positions(session)
-                pool = self._topup_pool_usdt(session, quote, open_positions)
+                buffer = self._margin_buffer_usdt(session, quote, open_positions)
                 used = sum(p.margin_added_usdt or 0.0 for p in open_positions)
                 free = self.broker.balance(session, BYBIT_USDT)
-                add = min(initial, max(0.0, pool - used), max(0.0, free))
+                add = min(initial, max(0.0, buffer - used), max(0.0, free))
                 if add < MIN_TOPUP_USDT:
-                    blocked = f"여유분 풀 {pool:.2f} USDT 중 {used:.2f} 사용, 남은 {max(0.0, pool - used):.2f} (바이비트 여유 {free:.2f})"
+                    blocked = (f"여유분 {buffer:.2f} USDT 중 {used:.2f} 사용, 남은 {max(0.0, buffer - used):.2f} "
+                               f"(바이비트 잔고 {free:.2f})")
                 else:
                     try:
                         self.broker.add_margin(session, pos, add)
@@ -563,10 +565,10 @@ class Engine:
                         blocked = f"거래소 거절: {exc}"
                         logger.critical("[증거금 추가 실패] #%d %s | %s", pos.id, pos.coin, exc)
                     else:
-                        logger.warning("[증거금 추가] #%d %s | 강제청산까지 %.1f%% 였음 | +%.2f USDT (%d/%d회, 풀 %.2f 중 %.2f 사용) | "
+                        logger.warning("[증거금 추가] #%d %s | 강제청산까지 %.1f%% 였음 | +%.2f USDT (%d/%d회, 여유분 %.2f 중 %.2f 사용) | "
                                        "새 강제청산가 %.6f | 이유: %s",
                                        pos.id, pos.coin, distance, add, rounds_used + 1, self.s.margin_topup_max_rounds,
-                                       pool, used + add, pos.liquidation_price, why_hold)
+                                       buffer, used + add, pos.liquidation_price, why_hold)
                         return False
             logger.warning("[증거금 추가 불가] #%d %s | %s | 정리로 넘어갑니다", pos.id, pos.coin, blocked)
 
