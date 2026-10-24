@@ -28,7 +28,8 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Callable, Dict, Iterable, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Dict, Iterable, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -143,6 +144,34 @@ class LiveExecutor:
         self._shorts = {}
         self._liq = {}
 
+    def prefetch(self, coins: Iterable[str]) -> None:
+        """
+        캐시를 비운 직후(판단 전) 잔고와 숏을 미리 받아 둔다 — 주문 경로가 REST 를 기다리지 않게
+
+        청산 경로는 '지금 코인 잔고' 와 '숏이 살아 있나' 를 확인하는데, 캐시가 비어 있으면 그 자리에서 REST 를
+        두 번 기다린다 (CAP #8 2026-10-24: 판단 → 전송 411 ms). 스캔 맨 앞에서 받아 두면 주문 경로는 캐시만 읽는다.
+        업비트 잔고 ∥ (바이비트 잔고 → 숏 한 번에) 로 동시에 받는다 (ccxt 객체는 스레드마다 다른 것).
+        """
+        coins = [c for c in coins if c not in self._shorts]
+
+        def bybit_side():
+            self._balances_one("bybit")
+            if coins:
+                self._load_shorts(coins)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fu = pool.submit(self._balances_one, "upbit")
+            fb = pool.submit(bybit_side)
+            for f in (fu, fb):
+                f.result()
+
+    def _balances_one(self, exchange: str) -> None:
+        """한쪽 잔고만 받아 캐시에 넣는다 (prefetch 가 두 거래소를 동시에 받을 때)"""
+        if exchange == "upbit" and self._up_bal is None:
+            self._up_bal = self.up.fetch_balance()
+        elif exchange == "bybit" and self._by_bal is None:
+            self._by_bal = self.by.fetch_balance()
+
     def _balances(self):
         """
         업비트·바이비트 잔고 (스캔당 한 번만 받고 기억한다)
@@ -208,17 +237,28 @@ class LiveExecutor:
         return self._shorts[coin]
 
     def _load_short(self, coin: str) -> None:
-        """숏 개수와 거래소 강제청산가를 한 번에 받아 둔다 (스캔당 한 번)"""
-        qty, liq = 0.0, None
-        for p in self.by.fetch_positions([bybit_symbol(coin)]):
-            if p.get("side") == "short":
-                qty += abs(float(p.get("contracts") or 0.0))
-                try:
-                    liq = float(p.get("liquidationPrice") or 0) or None
-                except (TypeError, ValueError):
-                    liq = None
-        self._shorts[coin] = qty
-        self._liq[coin] = liq
+        """숏 개수와 거래소 강제청산가를 받아 둔다 (스캔당 한 번)"""
+        self._load_shorts([coin])
+
+    def _load_shorts(self, coins: List[str]) -> None:
+        """여러 코인의 숏 개수·강제청산가를 요청 한 번으로 받아 둔다 (없는 코인은 0 / None)"""
+        found: Dict[str, tuple] = {c: (0.0, None) for c in coins}
+        by_symbol = {bybit_symbol(c): c for c in coins}
+        for p in self.by.fetch_positions(list(by_symbol)):
+            # ccxt 는 symbol 을 늘 채워 준다. 심볼 하나만 물었을 땐 없어도 그 코인으로 본다 (예전 응답 모양 대비)
+            coin = by_symbol.get(p.get("symbol")) or (coins[0] if len(coins) == 1 else None)
+            if coin is None or p.get("side") != "short":
+                continue
+            qty, liq = found[coin]
+            qty += abs(float(p.get("contracts") or 0.0))
+            try:
+                liq = float(p.get("liquidationPrice") or 0) or None
+            except (TypeError, ValueError):
+                liq = None
+            found[coin] = (qty, liq)
+        for coin, (qty, liq) in found.items():
+            self._shorts[coin] = qty
+            self._liq[coin] = liq
 
     def position_liq_price(self, session: Session, coin: str) -> Optional[float]:
         """
@@ -256,8 +296,15 @@ class LiveExecutor:
         return self.short_qty(session, coin) <= 0
 
     def short_gone(self, session: Session, coin: str) -> bool:
-        """거래소에 숏이 남아 있지 않나 (캐시 비우고 다시 조회). 청산 도중 숏이 사라졌는지 볼 때 쓴다"""
-        return self.short_liquidated(session, coin)
+        """
+        거래소에 숏이 남아 있지 않나 — 청산 주문을 내기 직전에 본다
+
+        스캔 맨 앞에서 선조회(prefetch)한 값(길어야 SCAN_INTERVAL_SEC 전)을 쓴다. 예전엔 여기서 캐시를 비우고
+        REST 를 다시 불렀는데, 그 150~200 ms 가 '판단 → 주문 전송' 에 그대로 얹혔다 (CAP #8 2026-10-24: 411 ms).
+        그 2초 사이에 강제청산이 났다면 닫기 주문이 거절되고(OrderFailed → VOID) 다음 스캔에서 숏 없음으로
+        마무리되므로 복구된다. 강제청산 여부를 꼭 새로 확인해야 하는 자리는 short_liquidated 를 쓴다.
+        """
+        return self.short_qty(session, coin) <= 0
 
     def mark_liquidated(self, session: Session, coin: str, qty: float) -> None:
         """거래소가 이미 정리했으니 할 일 없음"""

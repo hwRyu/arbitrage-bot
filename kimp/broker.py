@@ -978,6 +978,8 @@ class HedgeBroker:
         """
         if refresh_account:
             self.ex.refresh()
+            # 비운 김에 바로 받아 둔다 — 주문 경로(청산의 잔고·숏 확인)가 REST 를 기다리지 않게
+            self.ex.prefetch([p.coin for p in self.open_positions(session)])
         self._poll_transfers(session)
         for pos in self.unfinished_positions(session):
             quote = quotes.get(pos.coin)

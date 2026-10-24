@@ -228,7 +228,7 @@ class FakeBybit(FakeExchange):
             return []
         # 거래소가 주는 강제청산가 흉내: 진입가 × (1 + 증거금/숏금액 − 0.005)
         liq = self.entry * (1 + self.margin / (self.entry * self.short) - 0.005) if self.entry else None
-        return [{"side": "short", "contracts": self.short, "liquidationPrice": liq}]
+        return [{"symbol": "XRP/USDT:USDT", "side": "short", "contracts": self.short, "liquidationPrice": liq}]
 
     def add_margin(self, symbol, amount, params=None):
         self.calls.append(("add_margin", amount))
@@ -290,6 +290,24 @@ def equity(up, by, prices):
     usdt_mid = (prices.usdt_bid + prices.usdt_ask) / 2
     return (up.bal["USDT"] + up.bal["KRW"] / usdt_mid + up.bal["XRP"] * prices.coin_bid / usdt_mid
             + by.free_usdt + by.margin + (by.entry - prices.perp_ask) * by.short)
+
+
+class PrefetchTest(unittest.TestCase):
+    def test_prefetch_fills_caches_so_close_path_reads_memory(self):
+        """계좌 캐시를 비운 직후 prefetch 하면 잔고·숏이 채워져, 그 뒤 조회는 REST 없이 캐시에서 나온다"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            broker.open_hedge(s, prices.quote(), 50.0)
+            broker.ex.refresh()
+            self.assertIsNone(broker.ex._up_bal)
+            broker.ex.prefetch(["XRP"])
+            self.assertIsNotNone(broker.ex._up_bal)
+            self.assertIsNotNone(broker.ex._by_bal)
+            self.assertEqual(broker.ex._shorts.get("XRP"), 50.0)
+            self.assertIsNotNone(broker.ex._liq.get("XRP"))
+            by.fetch_positions = lambda *a, **k: (_ for _ in ()).throw(AssertionError("캐시가 있는데 REST 를 불렀다"))
+            self.assertFalse(broker.ex.short_gone(s, "XRP"))
+            self.assertAlmostEqual(broker.ex.position_liq_price(s, "XRP"), broker.ex._liq["XRP"])
 
 
 class LiveRoundTripTest(unittest.TestCase):
