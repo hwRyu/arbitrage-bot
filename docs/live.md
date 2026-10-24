@@ -69,7 +69,7 @@
 | `MAX_POSITION_USDT` | 50 | 포지션 하나 최대 금액 |
 | `DAILY_LOSS_LIMIT_USDT` | 10 | 오늘(한국 시간) 확정 손실이 넘으면 그날 신규 진입 중단 |
 | `MAX_CONSECUTIVE_FAILURES` | 3 | 주문 연속 실패 시 신규 진입 중단 (`/resume` 으로 재개) |
-| `STOP_FILE` | `data/STOP` | 이 파일을 만들면 신규 진입 중단, 지우면 재개 (`touch data/STOP`) |
+| `STOP_FILE` | `data/STOP` | 이 파일을 만들면 신규 진입 중단, 지우면 재개 (`touch data/STOP`). 텔레그램 `/resume` 도 이 파일을 지운다 |
 | `RECONCILE_INTERVAL_SEC` | 600 | 10분마다 거래소 실제 숏·코인 개수와 DB 비교. 다르면 신규 진입 중단 |
 
 막혀도 **가진 포지션 관리·청산은 계속**한다.
@@ -129,7 +129,7 @@
 | `/premium` | 지금 김프 (가운데·진입·청산, **기준까지 몇 %p 남았나**, 호가 간격, 펀딩비) |
 | `/close` | 들고 있는 포지션 **강제 청산 + 신규 진입 중단** (`/close` 전부, `/close CAP,SEI` 골라서). 청산 사유 `MANUAL`. 다시 돌리려면 `/resume` |
 | `/stop` | **신규 진입만** 중단 (청산·강제청산 감시·송금은 계속) |
-| `/resume` | 재개 (`/stop` 과 연속 실패 횟수를 함께 푼다) |
+| `/resume` | 재개 (`/stop`·연속 실패 횟수를 풀고, 비상정지 파일 `data/STOP` 이 있으면 지운다 — 서버에 못 들어가도 텔레그램으로 재개) |
 | `/collect` | 시세 수집 현황. `/collect start 40` 으로 켜고 `/collect stop` 으로 끈다 |
 | `/help` | 명령 목록 |
 
