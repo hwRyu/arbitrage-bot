@@ -265,6 +265,19 @@ class RecentOpportunityTest(unittest.TestCase):
         self.assertAlmostEqual(s.base_score, min(s.monthly, s.test_monthly), places=6)
         self.assertNotIn("최근기회없음", s.flags)
 
+    def test_fixed_entry_threshold_is_used_for_full_and_test(self):
+        """--entry-threshold 를 주면 후보 탐색 없이 그 기준으로 전체·검증을 돈다 (표의 진입기준 = 그 값)"""
+        vals = self.WAVE * 40
+        kw = dict(spread_percent=0.05, usdt_spread_percent=0.05, fixed_cost_percent=0.4,
+                  target=1.0, stop=-5.0, funding=[], live=CoinLive(), size_usdt=1000)
+        s = evaluate_coin("FIX", series(vals), BAR, days=len(vals) * BAR / 86_400_000, entry_threshold=-1.0, **kw)
+        self.assertEqual(s.full.threshold, -1.0)
+        self.assertEqual(s.test.threshold, -1.0)
+        self.assertGreater(s.full.trades, 0)
+        # 아무도 못 닿는 기준이면 거래 0 → 전체 결과 없음 (점수 못 매김)
+        none = evaluate_coin("FIX", series(vals), BAR, days=len(vals) * BAR / 86_400_000, entry_threshold=-50.0, **kw)
+        self.assertTrue(none is None or none.full is None)
+
     def test_json_rows_carry_test_period_trades(self):
         """웹 추천 표: 전체 거래·승 과 별도로 검증 구간 거래·승 이 나간다"""
         import json, os, tempfile

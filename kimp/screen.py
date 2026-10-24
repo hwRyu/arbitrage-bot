@@ -562,12 +562,14 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
                   target: float, stop: float, funding: Sequence[Tuple[int, float]],
                   live: CoinLive, size_usdt: float,
                   cycle_good_hours: float = CYCLE_GOOD_HOURS,
-                  recent_days: float = 0.0) -> Optional[CoinScore]:
+                  recent_days: float = 0.0, entry_threshold: Optional[float] = None) -> Optional[CoinScore]:
     """
     코인 하나 평가: 통계 + 백테스트(전체 / 검증) + 경고 표시
 
     Args:
         series: [(시각, 김프 %)]
+        entry_threshold: 진입 김프 기준을 이 값(%)으로 고정 (.env 의 ENTRY_PREMIUM_THRESHOLD_PERCENT 와 같은 뜻).
+            None 이면 코인마다 후보를 다 돌려 가장 좋았던 기준을 고른다 (전체·검증 모두)
         spread_percent: 코인 호가 간격 (업비트 + 바이비트, %)
         usdt_spread_percent: 업비트 USDT/KRW 호가 간격 (%)
         fixed_cost_percent: 수수료 + 전송비 (%)
@@ -580,7 +582,8 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
     leg = spread_percent + usdt_spread_percent
     costs = SwingCosts(leg_spread=leg, fixed=fixed_cost_percent, target=target, stop=stop)
 
-    full = best_swing(series, costs, funding)
+    fixed_candidates = [entry_threshold] if entry_threshold is not None else None
+    full = best_swing(series, costs, funding, fixed_candidates)
 
     # 검증: 앞 구간에서 기준 고르기 → 뒤 구간(최근)에 그대로 써보기
     # 기본은 뒤 1/3. --recent-days 를 주면 그 일수로 자른다 (--days 를 바꿔도 검증 길이가 안 흔들리게)
@@ -591,7 +594,7 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
         if at is not None and 0 < at < len(series):
             cut = at
     train, test_part = series[:cut], series[cut:]
-    picked = best_swing(train, costs, funding)
+    picked = best_swing(train, costs, funding, fixed_candidates)
     test = run_swing(test_part, picked.threshold, costs, funding) if picked else None
     test_days = (test_part[-1][0] - test_part[0][0]) / DAY_MS if test_part else 0.0
 
@@ -811,7 +814,8 @@ def load_series(store: HistoryStore, md, coins: Sequence[str], timeframe: str, s
 
 def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, float], usdt_spread: float,
                  fixed: float, target: float, stop: float, live: Dict[str, CoinLive],
-                 size: float, cycle_hours: float, recent_days: float = 0.0) -> List[CoinScore]:
+                 size: float, cycle_hours: float, recent_days: float = 0.0,
+                 entry_threshold: Optional[float] = None) -> List[CoinScore]:
     """받아둔 종가로 코인마다 점수 계산 (호가 간격은 미리 정해둔 resolved 값 사용)"""
     bar_ms = TIMEFRAME_MS[timeframe]
     scores = []
@@ -819,7 +823,7 @@ def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, fl
         floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
         spread = max(resolved.get(c, 0.0), floor)
         s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, days, spread, usdt_spread,
-                          fixed, target, stop, funding, live[c], size, cycle_hours, recent_days)
+                          fixed, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold)
         if s:
             s.timeframe = timeframe
             scores.append(s)
@@ -897,6 +901,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--min-upbit-krw", type=float, default=1e9, help="업비트 24시간 거래대금 최소 (원, 기본 10억)")
     parser.add_argument("--min-bybit-usdt", type=float, default=1e6, help="바이비트 24시간 거래대금 최소 (USDT, 기본 100만)")
     parser.add_argument("--target", type=float, default=None, help="목표 순이익 %% (안 적으면 .env)")
+    parser.add_argument("--entry-threshold", type=float, default=None,
+                        help="진입 김프 기준 %% 를 이 값으로 고정 (ENTRY_PREMIUM_THRESHOLD_PERCENT 와 같은 뜻). "
+                             "안 적으면 코인마다 후보를 돌려 가장 좋았던 기준을 고른다")
     parser.add_argument("--cycle-hours", type=float, default=CYCLE_GOOD_HOURS,
                         help="반복 주기가 이 시간 이하면 가중치 1 (기본 24)")
     parser.add_argument("--size-usdt", type=float, default=None, help="포지션 크기 USDT (전송비 %%·물량 확인용)")
@@ -961,7 +968,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         live[c].spread_percent, live[c].depth_usdt = books.get(c, (None, None))
 
     scores = evaluate_all(data, usdt, args.timeframe, args.days, resolved, usdt_spread, fixed, target,
-                          settings.stop_loss_percent, live, size, args.cycle_hours, args.recent_days)
+                          settings.stop_loss_percent, live, size, args.cycle_hours, args.recent_days,
+                          args.entry_threshold)
 
     # 2단계: 1단계 상위 코인만 더 짧은 봉으로 다시 평가 (시뮬레이션과 같은 기준으로 맞추기)
     refined_timeframe = None
@@ -980,7 +988,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if r_data:
                 refined = evaluate_all(r_data, r_usdt, refined_timeframe, args.days, resolved, r_usdt_spread,
                                        fixed, target, settings.stop_loss_percent, live, size,
-                                       args.cycle_hours, args.recent_days)
+                                       args.cycle_hours, args.recent_days, args.entry_threshold)
                 done = {x.coin for x in refined}
                 scores = refined + [x for x in scores if x.coin not in done]
                 usdt_spread = r_usdt_spread
@@ -992,8 +1000,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     used = Counter(spread_sources[s.coin] for s in scores)
     bars = (f"{args.timeframe}봉 → 상위 {args.refine_top}개는 {refined_timeframe}봉 재평가"
             if refined_timeframe else f"{args.timeframe}봉")
+    entry_note = (f"진입 기준 고정 {args.entry_threshold:+g}% · " if args.entry_threshold is not None
+                  else "진입 기준 코인별 최적 · ")
     note = (f"{'~' + args.end + ' ' if args.end else '최근 '}{args.days:g}일 · {bars} · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
-            f"손절 {settings.stop_loss_percent:g}% · 포지션 {size:,.0f} USDT · "
+            f"{entry_note}손절 {settings.stop_loss_percent:g}% · 포지션 {size:,.0f} USDT · "
             f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}%\n"
             f"코인 호가 간격 출처: {', '.join(f'{k} {v}개' for k, v in used.most_common())} "
             f"(호가 단위보다 좁으면 호가 단위로 올림)")

@@ -542,7 +542,7 @@ JOB_LOG_LINES = 400  # 로그는 마지막 400줄만 들고 있는다
 SCREEN_PARAMS = {"days": "--days", "top": "--top", "coins": "--coins", "timeframe": "--timeframe",
                  "refine_top": "--refine-top", "refine_timeframe": "--refine-timeframe",
                  "target": "--target", "recent_days": "--recent-days",
-                 "spread_source": "--spread-source"}
+                 "entry_threshold": "--entry-threshold", "spread_source": "--spread-source"}
 # 손절은 스크리너에 옵션이 없고 설정에서 읽는다 → 환경 변수로 넘긴다 (비우면 .env 값)
 SCREEN_ENV = {"stop": "STOP_LOSS_PERCENT"}
 SIM_PARAMS = {"start": "--from", "end": "--to", "coins": "--coins",
