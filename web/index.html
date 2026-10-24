@@ -311,6 +311,7 @@
       <span class="hint" id="levelTip" style="font-size:13px">목표 순이익으로 관리선 맞추기</span>
       <label>목표 <input id="lvTarget" type="number" value="1" step="0.1" min="0.05" style="width:70px">%</label>
       <label>포지션 <input id="lvNotional" type="number" placeholder="설정값" step="10" style="width:95px">USDT</label>
+      <label><span class="hint" id="lvSlipTip">체결 밀림</span> <input id="lvSlip" placeholder="설정값 · auto" style="width:95px">%</label>
       <button class="act" id="lvRun">목표로 맞추기</button>
       <span class="muted">비용(수수료·호가 간격·전송비·펀딩비)을 역산해 UCL/LCL 을 정하고, 이 기간에 몇 번 왕복했는지 셉니다</span>
     </div>
@@ -343,6 +344,8 @@
           <input id="scTarget" type="number" step="0.1" min="0.05" style="width:80px">%</label>
         <label><span class="hint" id="scEntryTip">진입 김프</span>
           <input id="scEntry" type="number" step="0.05" placeholder="코인별 최적" style="width:100px">%</label>
+        <label><span class="hint" id="scSlipTip">체결 밀림</span>
+          <input id="scSlip" placeholder="설정값 · auto" style="width:95px">%</label>
         <label><span class="hint" id="scStopTip">손절</span>
           <input id="scStop" type="number" step="0.5" max="0" style="width:85px">%</label>
         <span class="muted" id="scEnvNote"></span>
@@ -394,6 +397,7 @@
         <label>동시 <input id="smMax" type="number" value="3" min="1" max="10" style="width:55px"></label>
         <label>목표 <input id="smTarget" type="number" value="1" step="0.1" style="width:65px">%</label>
         <label>손절 <input id="smStop" type="number" step="0.5" max="0" style="width:75px">%</label>
+        <label><span class="hint" id="smSlipTip">체결 밀림</span> <input id="smSlip" placeholder="설정값 · auto" style="width:95px">%</label>
         <label>코인별 진입기준 <input id="smTh" placeholder="CAP=-0.55,SEI=-0.45" style="width:190px"></label>
       </div>
       <div class="row">
@@ -620,6 +624,11 @@ const TIP = {
            "적으면 모든 코인을 이 기준으로 백테스트한다 (전체·검증 모두). 표의 '진입기준' 열도 이 값이 된다." + NL + NL +
            "비우면 코인마다 그 코인 김프 분포의 하위 1~50% 지점을 후보로 다 돌려 총 순손익이 가장 컸던 기준을 고른다." + NL +
            "고정값은 '내 기준으로 어느 코인이 통하나' 를 보는 용도, 비움은 '코인별로 어디가 좋은가' 를 찾는 용도.",
+  execSlippage: "체결 밀림 가정 (%)  — 청산 때 판단한 호가보다 얼마나 불리하게 체결되나를 거래당 비용으로 넣는다" + NL +
+                "실거래 봇은 이걸 그 순간 호가판으로 계산한다(유동 여유). 과거 데이터엔 호가판이 없어서 백테스트·차트는" + NL +
+                "평균 가정값을 쓴다. 비우면 .env SLIPPAGE_BUFFER_PERCENT, 숫자(예 0.15)면 그 값," + NL +
+                "auto 면 실거래 체결 기록의 코인별 청산 밀림 중앙값(3건 이상인 코인, 아니면 전체 중앙값)." + NL +
+                "2026-10-24 실거래: 청산 다리 밀림 0.12~1.58%, 진입 다리는 거의 0.",
   scStop: "손절 (%, 음수)  — 평가 순손익이 이 값 이하로 내려가면 손실을 확정하고 나온다" + NL +
           "0 에 가까우면 조금만 밀려도 털리고(승률 하락), 너무 깊으면 한 포지션이 자리를 오래 묶는다." + NL +
           "김프는 보통 되돌아오기 때문에 깊게 두는 쪽이 유리할 수 있지만, 강제청산 위험과 자리 점유를 함께 봐야 한다." + NL + NL +
@@ -1131,6 +1140,7 @@ async function applyTargetLevels() {
   const q = [`coin=${encodeURIComponent(coin)}`, `hours=${$("chartHours").value}`,
              `target=${$("lvTarget").value || 1}`];
   if ($("lvNotional").value) q.push(`notional=${$("lvNotional").value}`);
+  if ($("lvSlip").value.trim()) q.push(`slippage=${encodeURIComponent($("lvSlip").value.trim())}`);
   $("lvRun").disabled = true;
   $("levelBox").innerHTML = `<p class="muted" style="margin:0">계산 중…</p>`;
   try {
@@ -1511,12 +1521,13 @@ $("scRun").onclick = () => runJob("screen", {
   days: $("scDays").value, top: $("scTop").value, refine_top: $("scRefine").value, coins: $("scCoins").value,
   recent_days: $("scRecent").value, target: $("scTarget").value, stop: $("scStop").value,
   entry_threshold: $("scEntry").value, spread_source: $("scSpread").value,
+  exec_slippage: $("scSlip").value.trim(),
 });
 $("smRun").onclick = () => runJob("sim", {
   start: $("smFrom").value, end: $("smTo").value, coins: $("smCoins").value, seed: $("smSeed").value,
   spread_source: $("smSpread").value,
   size: $("smSize").value, max_positions: $("smMax").value, target: $("smTarget").value,
-  stop: $("smStop").value,
+  stop: $("smStop").value, exec_slippage: $("smSlip").value.trim(),
   thresholds: $("smTh").value, rough: $("smRough").checked ? "1" : "", verbose: $("smVerbose").checked ? "1" : "",
 });
 $("btRun").onclick = () => runJob("bot", {
@@ -1961,6 +1972,7 @@ $("levelTip").setAttribute("data-tip", TIP.levels);
 $("scTargetTip").setAttribute("data-tip", TIP.scTarget);
 $("scStopTip").setAttribute("data-tip", TIP.scStop);
 $("scEntryTip").setAttribute("data-tip", TIP.scEntry);
+["scSlipTip", "smSlipTip", "lvSlipTip"].forEach((id) => $(id).setAttribute("data-tip", TIP.execSlippage));
 $("scRecentTip").setAttribute("data-tip", TIP.scRecent);
 ["spModeTip", "scSpreadTip", "smSpreadTip"].forEach((id) => $(id).setAttribute("data-tip", TIP.spreadSource));
 loadBands();

@@ -87,8 +87,10 @@ class FeeSettings:
     # 그래도 거래 손익에 미리 나눠서 반영하고 싶을 때만 쓴다. 예) 다섯 사이클에 한 번 송금 → 0.2
     transfer_fee_usdt_per_cycle: float = 0.0
 
-    # "김프가 대략 몇 % 가 되면 청산되나" 를 로그에 보여줄 때만 쓰는 여유분 (%)
-    # 실제 판단은 호가창으로 계산한 실제 체결가로 한다.
+    # 체결 밀림 가정 (%) — 추천·시뮬레이션·김프 차트 관리선·'필요 김프' 표시가 거래당 비용으로 쓰는 값.
+    # 청산 때 판단한 호가보다 불리하게 체결되는 몫 (2026-10-24 실거래: 청산 다리 0.12~1.58%, 진입은 거의 0).
+    # 실거래 익절 판단은 이 값을 쓰지 않고 유동 여유(TP_EXEC_BUFFER, 그 순간 호가판)로 계산한다.
+    # 세 도구는 --exec-slippage 숫자|auto 로 실행마다 바꿀 수 있다 (auto = 실거래 체결 기록 중앙값, kimp/slippage.py)
     slippage_buffer_percent: float = 0.05
 
     def round_trip_trade_fee_percent(self) -> float:

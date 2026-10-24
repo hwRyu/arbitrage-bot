@@ -114,6 +114,24 @@ class SimulationTest(unittest.TestCase):
         gap_min = (r.trades[1].opened_at - r.trades[0].closed_at).total_seconds() / 60
         self.assertGreaterEqual(gap_min, 5)
 
+    def test_exit_slippage_lowers_only_upbit_bids(self):
+        """체결 밀림 가정은 청산 다리(업비트 매수호가)만 낮춘다 — 매도호가(진입)·바이비트는 그대로"""
+        fx = 1400.0
+        n = 3
+        clock = SimClock(START / 1000 + 60 * n)
+        upbit = {"XRP": {START + i * MINUTE_MS: 1386.0 for i in range(n)}}
+        bybit = {"XRP": {START + i * MINUTE_MS: 1.0 for i in range(n)}}
+        usdt = {START + i * MINUTE_MS: fx for i in range(n)}
+        plain = HistoricalMarket(clock, FakePrecision(), upbit, bybit, usdt, {"XRP": []}, {"XRP": 0.1},
+                                 usdt_spread_percent=0.0)
+        slipped = HistoricalMarket(clock, FakePrecision(), upbit, bybit, usdt, {"XRP": []}, {"XRP": 0.1},
+                                   usdt_spread_percent=0.0, exit_slippage_percent={"XRP": 0.2})
+        a, b = plain.fetch_quotes(["XRP"])["XRP"], slipped.fetch_quotes(["XRP"])["XRP"]
+        self.assertAlmostEqual(b.upbit.best_bid, a.upbit.best_bid * (1 - 0.002), places=6)
+        self.assertEqual(b.upbit.best_ask, a.upbit.best_ask)
+        self.assertEqual(b.bybit.best_ask, a.bybit.best_ask)
+        self.assertLess(b.exit_premium_top, a.exit_premium_top)        # 청산 김프만 나빠진다
+
     def test_tick_bounce_gives_no_fake_profit(self):
         """
         DOGE 처럼 업비트 호가 단위가 커서 종가가 109 ↔ 110원을 오가기만 하는 경우,

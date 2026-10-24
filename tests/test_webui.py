@@ -159,9 +159,9 @@ class BuildCommandTest(unittest.TestCase):
     def test_screen(self):
         from kimp.webui import build_command
         cmd, env = build_command("screen", {"days": "30", "coins": "CAP,SEI", "refine_top": "20", "몰래": "rm",
-                                            "entry_threshold": "-0.3"})
+                                            "entry_threshold": "-0.3", "exec_slippage": "auto"})
         self.assertEqual(cmd[1:], ["-m", "kimp.screen", "--days", "30", "--coins", "CAP,SEI", "--refine-top", "20",
-                                   "--entry-threshold", "-0.3"])
+                                   "--entry-threshold", "-0.3", "--exec-slippage", "auto"])
         self.assertEqual(env, {})
 
     def test_sim_env_and_flags(self):

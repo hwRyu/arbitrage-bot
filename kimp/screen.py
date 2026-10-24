@@ -815,15 +815,17 @@ def load_series(store: HistoryStore, md, coins: Sequence[str], timeframe: str, s
 def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, float], usdt_spread: float,
                  fixed: float, target: float, stop: float, live: Dict[str, CoinLive],
                  size: float, cycle_hours: float, recent_days: float = 0.0,
-                 entry_threshold: Optional[float] = None) -> List[CoinScore]:
+                 entry_threshold: Optional[float] = None, exec_slippage=None) -> List[CoinScore]:
     """받아둔 종가로 코인마다 점수 계산 (호가 간격은 미리 정해둔 resolved 값 사용)"""
     bar_ms = TIMEFRAME_MS[timeframe]
     scores = []
     for c, (up, by, funding) in data.items():
         floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
         spread = max(resolved.get(c, 0.0), floor)
+        # 체결 밀림 가정(kimp/slippage.py)은 거래당 고정 비용으로 — 청산 때 판단 호가보다 불리하게 체결되는 몫
+        slip = exec_slippage.for_coin(c) if exec_slippage is not None else 0.0
         s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, days, spread, usdt_spread,
-                          fixed, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold)
+                          fixed + slip, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold)
         if s:
             s.timeframe = timeframe
             scores.append(s)
@@ -904,6 +906,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--entry-threshold", type=float, default=None,
                         help="진입 김프 기준 %% 를 이 값으로 고정 (ENTRY_PREMIUM_THRESHOLD_PERCENT 와 같은 뜻). "
                              "안 적으면 코인마다 후보를 돌려 가장 좋았던 기준을 고른다")
+    parser.add_argument("--exec-slippage", default=None,
+                        help="체결 밀림 가정 %% (청산 때 판단 호가보다 불리하게 체결되는 몫, 거래당 비용에 더함). "
+                             "숫자 또는 auto(실거래 체결 기록의 코인별 중앙값). 안 적으면 .env SLIPPAGE_BUFFER_PERCENT")
     parser.add_argument("--cycle-hours", type=float, default=CYCLE_GOOD_HOURS,
                         help="반복 주기가 이 시간 이하면 가중치 1 (기본 24)")
     parser.add_argument("--size-usdt", type=float, default=None, help="포지션 크기 USDT (전송비 %%·물량 확인용)")
@@ -913,6 +918,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     settings = load_settings()
     target = args.target if args.target is not None else settings.target_net_profit_percent
     size = args.size_usdt or default_size_usdt(settings)
+    from kimp.slippage import resolve as resolve_slippage
+    slip = resolve_slippage(args.exec_slippage, settings.fees.slippage_buffer_percent, settings.live_db_path)
     fixed = settings.fees.round_trip_trade_fee_percent() + settings.fees.transfer_fee_usdt_per_cycle / size * 100
     bar_ms = TIMEFRAME_MS[args.timeframe]
 
@@ -969,7 +976,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     scores = evaluate_all(data, usdt, args.timeframe, args.days, resolved, usdt_spread, fixed, target,
                           settings.stop_loss_percent, live, size, args.cycle_hours, args.recent_days,
-                          args.entry_threshold)
+                          args.entry_threshold, exec_slippage=slip)
 
     # 2단계: 1단계 상위 코인만 더 짧은 봉으로 다시 평가 (시뮬레이션과 같은 기준으로 맞추기)
     refined_timeframe = None
@@ -988,7 +995,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if r_data:
                 refined = evaluate_all(r_data, r_usdt, refined_timeframe, args.days, resolved, r_usdt_spread,
                                        fixed, target, settings.stop_loss_percent, live, size,
-                                       args.cycle_hours, args.recent_days, args.entry_threshold)
+                                       args.cycle_hours, args.recent_days, args.entry_threshold, exec_slippage=slip)
                 done = {x.coin for x in refined}
                 scores = refined + [x for x in scores if x.coin not in done]
                 usdt_spread = r_usdt_spread
@@ -1004,7 +1011,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   else "진입 기준 코인별 최적 · ")
     note = (f"{'~' + args.end + ' ' if args.end else '최근 '}{args.days:g}일 · {bars} · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
             f"{entry_note}손절 {settings.stop_loss_percent:g}% · 포지션 {size:,.0f} USDT · "
-            f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}%\n"
+            f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}% · {slip.describe()}\n"
             f"코인 호가 간격 출처: {', '.join(f'{k} {v}개' for k, v in used.most_common())} "
             f"(호가 단위보다 좁으면 호가 단위로 올림)")
     print()

@@ -104,6 +104,7 @@ class HistoricalMarket:
         spread_percent: Dict[str, float],
         usdt_spread_percent: float = 0.075,
         bybit_high: Optional[Dict[str, Dict[int, float]]] = None,
+        exit_slippage_percent: Optional[Dict[str, float]] = None,
     ):
         """
         Args:
@@ -124,6 +125,10 @@ class HistoricalMarket:
         self.funding = funding
         self._funding_times = {c: [ts for ts, _ in rows] for c, rows in funding.items()}
         self.spread_percent = spread_percent
+        # 체결 밀림 가정 (kimp/slippage.py): 청산 다리 — 업비트 코인 매수호가 — 를 이만큼 낮춰서 체결·평가한다.
+        # 진입은 실측상 밀림이 거의 0 이라 그대로. 실거래의 유동 여유(호가판 두께)는 과거 데이터엔 호가판이
+        # 없어 재현할 수 없으니, 그 효과를 '청산이 이만큼 더 불리하다' 는 가정으로 대신한다
+        self.exit_slippage_percent = exit_slippage_percent or {}
         self.usdt_spread_percent = usdt_spread_percent
         self.bybit_high = bybit_high or {}
 
@@ -166,7 +171,13 @@ class HistoricalMarket:
             # 코인 호가 간격을 업비트 코인과 바이비트에 반씩 나눠 준다
             leg = self.spread_percent.get(coin, 0.0) / 2
             high = self.bybit_high.get(coin, {}).get(minute)
-            quotes[coin] = Quote(coin=coin, upbit=self._book(up, leg), bybit=self._book(by, leg), usdt=usdt_book,
+            upbit_book = self._book(up, leg)
+            slip = self.exit_slippage_percent.get(coin, 0.0)
+            if slip:
+                # 청산 다리(코인 매도 = 매수호가)만 밀림만큼 낮춘다. 매도호가(진입 때 사는 쪽)는 그대로
+                upbit_book = OrderBook(bids=[(p * (1 - slip / 100), q) for p, q in upbit_book.bids],
+                                       asks=upbit_book.asks)
+            quotes[coin] = Quote(coin=coin, upbit=upbit_book, bybit=self._book(by, leg), usdt=usdt_book,
                                  fx_krw=fx_krw, bybit_high=high)
         return quotes
 
@@ -629,6 +640,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="호가 간격을 어디서 가져올지. auto=기록→지금 호가→공통값 (기본) / "
                              "records=실측 기록만 / common=공통값으로 통일 / live=지금 호가. "
                              "<코인>_SIM_SPREAD_PERCENT 가 있으면 그 코인은 모드와 무관하게 그 값")
+    parser.add_argument("--exec-slippage", default=None,
+                        help="체결 밀림 가정 %% (청산 때 업비트 매수호가를 이만큼 낮춰 체결·평가). 숫자 또는 "
+                             "auto(실거래 체결 기록의 코인별 중앙값). 안 적으면 .env SLIPPAGE_BUFFER_PERCENT")
     parser.add_argument("--rough-spread", action="store_true",
                         help="호가 간격 기록이 없어도 '지금 호가' 로 대충 돌린다 (숫자가 실행마다 바뀜)")
     args = parser.parse_args(argv)
@@ -673,12 +687,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               f"— 숫자가 실행마다 바뀝니다 (--rough-spread)")
     apply_tick_floor(spreads, sources, {c: tick_floor_percent(list(upbit[c].values()), list(bybit[c].values()))
                                         for c in coins})
+    from kimp.slippage import resolve as resolve_slippage
+    slip = resolve_slippage(args.exec_slippage, settings.fees.slippage_buffer_percent, settings.live_db_path)
+    print(slip.describe())
     clock = SimClock(start_ms / 1000)
     market = HistoricalMarket(
         clock=clock, precision=md, upbit=upbit, bybit=bybit, usdt_krw=usdt,
         funding={c: store.load_funding(c, start_ms, end_ms) for c in coins},
         spread_percent=spreads, usdt_spread_percent=usdt_tick_percent(list(usdt.values())),
         bybit_high={c: store.load_highs(BYBIT, c, start_ms - pad, end_ms) for c in coins},
+        exit_slippage_percent={c: slip.for_coin(c) for c in coins},
     )
     fx = SimFx(clock, store.load_fx(start_ms, end_ms))
 

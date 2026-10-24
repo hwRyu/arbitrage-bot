@@ -542,11 +542,12 @@ JOB_LOG_LINES = 400  # 로그는 마지막 400줄만 들고 있는다
 SCREEN_PARAMS = {"days": "--days", "top": "--top", "coins": "--coins", "timeframe": "--timeframe",
                  "refine_top": "--refine-top", "refine_timeframe": "--refine-timeframe",
                  "target": "--target", "recent_days": "--recent-days",
-                 "entry_threshold": "--entry-threshold", "spread_source": "--spread-source"}
+                 "entry_threshold": "--entry-threshold", "spread_source": "--spread-source",
+                 "exec_slippage": "--exec-slippage"}
 # 손절은 스크리너에 옵션이 없고 설정에서 읽는다 → 환경 변수로 넘긴다 (비우면 .env 값)
 SCREEN_ENV = {"stop": "STOP_LOSS_PERCENT"}
 SIM_PARAMS = {"start": "--from", "end": "--to", "coins": "--coins",
-              "spread_source": "--spread-source"}
+              "spread_source": "--spread-source", "exec_slippage": "--exec-slippage"}
 SIM_ENV = {"seed": "PAPER_INITIAL_TOTAL_USDT", "size": "POSITION_SIZE_USDT",
            "max_positions": "MAX_OPEN_POSITIONS", "target": "TARGET_NET_PROFIT_PERCENT",
            "stop": "STOP_LOSS_PERCENT"}
@@ -757,9 +758,14 @@ class Handler(BaseHTTPRequestHandler):
                 hours = float((query.get("hours") or ["24"])[0])
                 target = float((query.get("target") or ["1"])[0])
                 notional = (query.get("notional") or [""])[0].strip()
+                slippage = (query.get("slippage") or [""])[0].strip()   # 숫자 | auto | 빈칸(설정값)
+                from kimp.slippage import resolve as resolve_slippage
+                slip = resolve_slippage(slippage or None, self.settings.fees.slippage_buffer_percent,
+                                        self.settings.live_db_path)
                 data = premium_history(self.settings, coin, hours, md=None)
                 self._json(level_plan(self.settings, coin, data["series"], target,
-                                      notional_usdt=float(notional) if notional else None, hours=hours))
+                                      notional_usdt=float(notional) if notional else None, hours=hours,
+                                      exec_slippage=slip))
             elif url.path == "/api/universe":
                 u = universe(self._market())
                 self._json({"coins": u["coins"], "volume": u["volume"], "my": list(self.settings.coins),

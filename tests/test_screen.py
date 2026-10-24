@@ -278,6 +278,25 @@ class RecentOpportunityTest(unittest.TestCase):
         none = evaluate_coin("FIX", series(vals), BAR, days=len(vals) * BAR / 86_400_000, entry_threshold=-50.0, **kw)
         self.assertTrue(none is None or none.full is None)
 
+    def test_exec_slippage_adds_to_fixed_cost_per_coin(self):
+        """체결 밀림 가정은 코인별로 거래당 고정 비용에 더해진다 → 비용이 그만큼 커지고 수익은 줄어든다"""
+        from kimp.screen import evaluate_all
+        from kimp.slippage import SlippageAssumption
+        vals = self.WAVE * 40
+        up = {i * BAR: 1386.0 * (1 + v / 100) for i, v in enumerate(vals)}
+        by = {i * BAR: 1.0 for i in range(len(vals))}
+        us = {i * BAR: 1386.0 for i in range(len(vals))}
+        data = {"A": (up, by, []), "B": (dict(up), dict(by), [])}
+        live = {"A": CoinLive(), "B": CoinLive()}
+        kw = dict(usdt=us, timeframe="15m", days=len(vals) * BAR / 86_400_000, resolved={"A": 0.05, "B": 0.05},
+                  usdt_spread=0.05, fixed=0.4, target=1.0, stop=-5.0, live=live, size=1000, cycle_hours=24)
+        base = {s.coin: s for s in evaluate_all(data, **kw)}
+        slip = SlippageAssumption(default=0.0, per_coin={"B": 0.3})
+        with_slip = {s.coin: s for s in evaluate_all(data, exec_slippage=slip, **kw)}
+        self.assertAlmostEqual(with_slip["A"].cost_percent, base["A"].cost_percent)          # A 는 가정 0
+        self.assertAlmostEqual(with_slip["B"].cost_percent, base["B"].cost_percent + 0.3)    # B 는 +0.3
+        self.assertLessEqual(with_slip["B"].monthly, base["B"].monthly)
+
     def test_json_rows_carry_test_period_trades(self):
         """웹 추천 표: 전체 거래·승 과 별도로 검증 구간 거래·승 이 나간다"""
         import json, os, tempfile

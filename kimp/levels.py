@@ -120,12 +120,13 @@ def tick_floor_from_series(series: Sequence[Dict[str, Any]]) -> Optional[float]:
 
 
 def cost_items(settings: Settings, coin: str, series: Sequence[Dict[str, Any]],
-               notional_usdt: float, hold_hours: float) -> List[CostItem]:
+               notional_usdt: float, hold_hours: float, exec_slippage=None) -> List[CostItem]:
     """
     나가는 돈 전부 (포지션 금액 대비 %)
 
     Args:
         hold_hours: 예상 보유 시간. 펀딩비가 여기에 비례한다
+        exec_slippage: 체결 밀림 가정 (kimp/slippage.SlippageAssumption). None 이면 SLIPPAGE_BUFFER_PERCENT
     """
     f = settings.fees
     spread, spread_source = coin_spread_percent(settings, coin)
@@ -155,7 +156,11 @@ def cost_items(settings: Settings, coin: str, series: Sequence[Dict[str, Any]],
         items.append(CostItem("funding", "펀딩비", -funding_8h * hold_hours / 8.0,
                               f"8시간 {funding_8h:+.4f}% × 예상 보유 {hold_hours:.1f}시간"
                               f" ({'내는 쪽' if funding_8h < 0 else '받는 쪽'})"))
-    items.append(CostItem("buffer", "여유", f.slippage_buffer_percent, "체결 밀림 대비 (SLIPPAGE_BUFFER_PERCENT)"))
+    if exec_slippage is not None:
+        items.append(CostItem("buffer", "체결 밀림 가정", exec_slippage.for_coin(coin), exec_slippage.source))
+    else:
+        items.append(CostItem("buffer", "체결 밀림 가정", f.slippage_buffer_percent,
+                              "SLIPPAGE_BUFFER_PERCENT — 청산 때 판단 호가보다 불리하게 체결되는 몫"))
     return items
 
 
@@ -249,7 +254,7 @@ def best_levels(points: Sequence[Tuple[int, float]], gap: float,
 # 한 덩어리로
 # ======================================================================
 def plan(settings: Settings, coin: str, series: Sequence[Dict[str, Any]], target_percent: float = 1.0,
-         notional_usdt: Optional[float] = None, hours: Optional[float] = None) -> Dict[str, Any]:
+         notional_usdt: Optional[float] = None, hours: Optional[float] = None, exec_slippage=None) -> Dict[str, Any]:
     """
     목표 순이익에 맞는 관리선 한 쌍과 그 근거
 
@@ -278,13 +283,13 @@ def plan(settings: Settings, coin: str, series: Sequence[Dict[str, Any]], target
                      "mean": statistics.fmean(values), "last": values[-1]}
 
     # 1차: 펀딩비를 모르는 상태(보유 0시간)로 폭을 잡고 한 번 돌려 본다
-    first_items = cost_items(settings, coin, series, notional, hold_hours=0.0)
+    first_items = cost_items(settings, coin, series, notional, hold_hours=0.0, exec_slippage=exec_slippage)
     first_gap = target_percent + sum(i.percent for i in first_items)
     first, _ = best_levels(points, first_gap)
 
     # 2차: 1차에서 나온 평균 보유 시간으로 펀딩비를 넣어 다시 잡는다 (서로 물려 있어서 한 번 더 돈다)
     hold = (first.avg_hold_hours if first and first.avg_hold_hours else 0.0)
-    items = cost_items(settings, coin, series, notional, hold_hours=hold)
+    items = cost_items(settings, coin, series, notional, hold_hours=hold, exec_slippage=exec_slippage)
     gap = target_percent + sum(i.percent for i in items)
     best, candidates = best_levels(points, gap)
 
