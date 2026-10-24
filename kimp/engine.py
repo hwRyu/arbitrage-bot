@@ -36,7 +36,7 @@ from kimp.broker import EntryRejected, ExitValuation, HedgeBroker, InsufficientB
 from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.market_data import MarketData
-from kimp.pnl import estimated_exit_premium, margin_to_add_usdt
+from kimp.pnl import estimated_exit_premium
 from kimp.premium import Quote
 from kimp import telemetry
 
@@ -493,13 +493,23 @@ class Engine:
         if distance < self.s.liq_guard_percent:
             return self._liq_guard(session, pos, quote, price, distance)
         if distance < self.s.liquidation_warn_percent:
-            add = margin_to_add_usdt(pos.entry_bybit_price_usdt, price, pos.bybit_qty, pos.bybit_margin_usdt,
-                                     self.s.liquidation_warn_percent * 2, self.s.bybit_mmr)
+            # 예고: 가드(liq_guard_percent)가 곧 할 일을 그대로 적는다 — 사람이 먼저 /close 하거나 손으로 넣을 시간
+            added = pos.margin_added_usdt or 0.0
+            unit = (pos.bybit_margin_usdt - added) * self.s.margin_topup_unit_ratio
+            rounds_left = max(0, self.s.margin_topup_max_rounds - (int(round(added / unit)) if unit > 0 else 0))
+            target, _stop = self._exit_rules(pos)
+            valuation = self.broker.value_exit(pos, quote)
+            net_text = f"순손익 {valuation.pnl.net_percent:+.2f}% / 목표 {target:.2f}%" if valuation else "순손익 계산 불가"
+            if rounds_left:
+                plan = (f"목표까지 {self.s.liq_guard_near_target_percent:.1f}%p 이내거나 순손익 "
+                        f"{self.s.liq_guard_hold_below_percent:+.0f}% 이하면 증거금 {unit:,.2f} USDT 추가 (남은 {rounds_left}회), "
+                        f"아니면 정리")
+            else:
+                plan = f"증거금 추가 {self.s.margin_topup_max_rounds}회 다 써서 정리"
             self._log_throttled(
                 f"liq-warn-{pos.coin}", logging.WARNING,
-                f"[긴급 · 증거금] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% (지금 {price:.6f} / 강제청산가 {liq:.6f}) | "
-                f"증거금 약 {add:,.2f} USDT 를 넣으면 30% 로 돌아갑니다 | {self.s.liq_guard_percent:.0f}% 안으로 오면 "
-                f"봇이 증거금 추가 또는 정리를 스스로 합니다",
+                f"[긴급 · 강제청산 임박] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% (지금 {price:.6f} / 강제청산가 {liq:.6f}) | "
+                f"{net_text} | {self.s.liq_guard_percent:.0f}% 안으로 오면 봇이: {plan}",
             )
         return False
 

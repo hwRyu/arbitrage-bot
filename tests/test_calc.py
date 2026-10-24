@@ -9,7 +9,7 @@
 import unittest
 
 from kimp.config import FeeSettings
-from kimp.pnl import EntryLegs, ExitLegs, compute_pnl, estimated_exit_premium, liquidation_price, margin_to_add_usdt
+from kimp.pnl import EntryLegs, ExitLegs, compute_pnl, estimated_exit_premium, liquidation_price
 from kimp.premium import (OrderBook, Quote, estimate_fill, estimate_fill_by_cost, premium_percent,
                           tether_premium_percent)
 
@@ -191,14 +191,6 @@ class LiquidationTest(unittest.TestCase):
         self.assertAlmostEqual(liquidation_price(1.35, 1, 0.005), 1.35 * 1.995)
         self.assertAlmostEqual(liquidation_price(1.35, 3, 0.005) / 1.35 - 1, 1 / 3 - 0.005)
 
-    def test_margin_to_add(self):
-        """3배 숏(증거금 = 금액의 1/3), 가격이 1.35 → 1.60 → 강제청산까지 30% 남기려면 얼마 더 넣어야 하나"""
-        qty, entry = 1000 / 1.35, 1.35
-        margin = 1000 / 3
-        add = margin_to_add_usdt(entry, 1.60, qty, margin, 30, 0.005)
-        # 넣은 뒤 강제청산 가격 = 진입가 × (1 + (증거금+추가)/금액 - mmr) 가 1.60 × 1.3 이어야 함
-        self.assertAlmostEqual(entry * (1 + (margin + add) / 1000 - 0.005), 1.60 * 1.3)
-        self.assertEqual(margin_to_add_usdt(entry, 1.36, qty, margin, 15, 0.005), 0.0)  # 이미 충분
 
 
 if __name__ == "__main__":

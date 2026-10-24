@@ -393,7 +393,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
             market.quotes = {"XRP": make_quote(-1.0, bybit_price=1.20)}  # 강제청산(약 1.328)까지 약 10.6%
             engine.step()
-        self.assertTrue(any("증거금 약" in m for m in logs.output))
+        self.assertTrue(any("[긴급 · 강제청산 임박]" in m and "증거금 " in m and "추가 (남은 2회)" in m for m in logs.output))
         with sf() as s:
             pos = s.query(Position).one()
         self.assertEqual(pos.status, PositionStatus.OPEN)

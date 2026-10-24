@@ -214,21 +214,6 @@ def liquidation_price_from_margin(entry_price_usdt: float, qty: float, margin_us
     return entry_price_usdt * (1 + margin_usdt / notional - mmr)
 
 
-def margin_to_add_usdt(entry_price: float, current_price: float, qty: float, margin_usdt: float,
-                       target_distance_percent: float, mmr: float) -> float:
-    """
-    강제청산까지 남은 상승폭을 target_distance_percent 로 되돌리려면 증거금을 얼마나 더 넣어야 하나 (USDT)
-
-    격리 마진 숏의 강제청산 가격 ≈ 진입가 × (1 + 증거금/숏금액 - 유지증거금률) 이므로
-        원하는 강제청산 가격 = 지금 가격 × (1 + 목표 거리)
-        필요한 증거금 = 숏금액 × (원하는 강제청산 가격 / 진입가 - 1 + 유지증거금률)
-    예) 이미 충분하면 0
-    """
-    notional = entry_price * qty
-    want_liq = current_price * (1 + target_distance_percent / 100)
-    needed = notional * (want_liq / entry_price - 1 + mmr)
-    return max(0.0, needed - margin_usdt)
-
 
 def estimated_exit_premium(entry_premium: float, target_net_profit_percent: float, notional_usdt: float,
                            funding_usdt: float, fees: FeeSettings, usdt_spread_percent: float = 0.0) -> float:
