@@ -1012,6 +1012,23 @@ class SafetyAndConfigTest(unittest.TestCase):
                 open(path, "w").close()
                 self.assertFalse(safety.entries_allowed(s)[0])
 
+    def test_resume_removes_stop_file(self):
+        """/resume 은 수동 정지·연속 실패를 풀고 비상정지 파일도 지운다 (서버에 못 들어가도 텔레그램으로 재개)"""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "STOP")
+            open(path, "w").close()
+            safety = Safety(stop_file=path)
+            safety.manual_stop = True
+            cleared = safety.resume()
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(safety.manual_stop)
+            self.assertEqual(cleared[0], "수동 정지")
+            self.assertIn("비상정지 파일", cleared[-1])
+            self.assertEqual(safety.resume(), [])                 # 두 번째는 풀 게 없다
+            sf = make_session_factory(":memory:")
+            with sf() as s:
+                self.assertTrue(safety.entries_allowed(s)[0])
+
     def test_daily_loss_limit(self):
         safety = Safety(daily_loss_limit_usdt=10)
         sf = make_session_factory(":memory:")
@@ -1064,6 +1081,12 @@ class TelegramTest(unittest.TestCase):
         cmds = TelegramCommands(n, {"/status": lambda: "OK"})
         self.assertEqual(cmds.handle({"message": {"chat": {"id": 42}, "text": "/status"}}), "OK")
         self.assertIsNone(cmds.handle({"message": {"chat": {"id": 7}, "text": "/status"}}))  # 남의 채팅 무시
+
+    def test_pretty_subheads(self):
+        """몸통 줄이 '[PYTH]' 하나면 굵은 소제목, 머리기호 없음"""
+        from kimp.notify import pretty
+        out = pretty("[봇 시작] 실거래" + chr(10) + "포지션 20 USDT" + chr(10) + "[PYTH]" + chr(10) + "진입 ≤ -0.15%")
+        self.assertEqual(out.split(chr(10)), ["<b>[봇 시작]</b>", "• 실거래", "• 포지션 20 USDT", "<b>[PYTH]</b>", "• 진입 ≤ -0.15%"])
 
     def test_pretty_splits_pipes_and_bolds_head(self):
         """한 줄 로그 → 머리 굵게 + 항목마다 줄바꿈 + HTML 특수문자 처리"""

@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -102,10 +102,24 @@ class Safety:
         """주문 성공 → 연속 실패 횟수를 0 으로"""
         self.failures = 0
 
-    def resume(self) -> None:
-        """사람이 재개 (텔레그램 /resume): 수동 정지·연속 실패 횟수만 푼다"""
+    def resume(self) -> List[str]:
+        """
+        사람이 재개 (텔레그램 /resume): 수동 정지·연속 실패 횟수를 풀고, 비상정지 파일이 있으면 지운다
+
+        서버에 못 들어가는 상황(이동 중)에서도 텔레그램만으로 파일 정지를 풀 수 있어야 한다.
+        Returns: 실제로 푼 것들 (답장용). 아무것도 안 막혀 있었으면 빈 목록
+        """
+        cleared = []
+        if self.manual_stop:
+            cleared.append("수동 정지")
+        if self.failures:
+            cleared.append(f"연속 실패 {self.failures}회")
         self.manual_stop = False
         self.failures = 0
+        if self.stop_file and os.path.exists(self.stop_file):
+            os.remove(self.stop_file)
+            cleared.append(f"비상정지 파일 {self.stop_file} 삭제")
+        return cleared
 
     def daily_loss_usdt(self, session: Session) -> float:
         """

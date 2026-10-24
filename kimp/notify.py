@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # 로그 한 줄의 모양: "[태그] #번호 코인 | 항목 | 항목 ..." — 텔레그램에서는 한 줄로 길게 오면 눈에 안 들어온다
 _TAG_RE = re.compile(r"^(\[[^\]]+\])\s*(.*)$", re.S)
 _POS_RE = re.compile(r"(#\d+(?: [A-Z0-9]+)?)")   # '#4 IRYS' 또는 '#9' (송금 번호)
+_SUBHEAD_RE = re.compile(r"^\[[^\]]+\]$")        # 줄 전체가 '[PYTH]' 꼴이면 소제목
 _LONG_LINE = 70
 _BOLD_ITEMS = ("순손익",)   # 이 라벨로 시작하는 항목은 굵게 (결과가 먼저 눈에 들어오게)
 
@@ -65,6 +66,7 @@ def pretty(text: str, icon: str = "") -> str:
 
     - 맨 앞 [태그] 와 '#번호 코인' 은 굵게, 첫 줄에
     - ' | ' 로 이어 붙인 항목은 줄마다 하나씩. 그래도 긴 줄은 ' / ' 에서 한 번 더 나눈다
+    - 몸통 줄이 '[소제목]' 하나면 굵은 소제목 (머리기호 없이) — 그 아래 항목들을 묶는다 (시작 메시지의 코인별 설정)
     - 태그가 없는 문장은 그대로 (HTML 특수문자만 피한다)
     """
     m = _TAG_RE.match(text)
@@ -87,7 +89,9 @@ def pretty(text: str, icon: str = "") -> str:
         return "• " + (f"<b>{html.escape(x)}</b>" if bold else html.escape(x))
 
     for p in parts:
-        if len(p) > _LONG_LINE and " / " in p:
+        if _SUBHEAD_RE.match(p):
+            lines.append(f"<b>{html.escape(p)}</b>")
+        elif len(p) > _LONG_LINE and " / " in p:
             lines.extend(item(x) for x in p.split(" / "))
         else:
             lines.append(item(p))

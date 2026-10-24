@@ -116,7 +116,7 @@ HELP_TEXT = (
     "/premium  지금 김프 (가운데·진입·청산, 기준까지 얼마 남았나)" + LF +
     "/close    강제 청산 + 신규 진입 중단 (예: /close 또는 /close CAP,SEI → 재개는 /resume)" + LF +
     "/stop     신규 진입 중단 (청산·관리는 계속)" + LF +
-    "/resume   재개" + LF +
+    "/resume   재개 (수동 정지·연속 실패 해제, 비상정지 파일 data/STOP 도 삭제)" + LF +
     "/collect  시세 수집 현황 (/collect start 40 · /collect stop)" + LF +
     "/help     이 목록"
 )
@@ -222,8 +222,10 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
         return "신규 진입을 멈췄습니다 (가진 포지션은 계속 관리). 재개: /resume"
 
     def resume() -> str:
-        broker.safety.resume()
-        return "재개했습니다 (수동 정지·연속 실패 횟수 풀림). 다른 이유로 막혀 있으면 /status 에 나옵니다"
+        cleared = broker.safety.resume()
+        if not cleared:
+            return "풀 게 없었습니다 (수동 정지·연속 실패·비상정지 파일 모두 없음). 다른 이유로 막혀 있으면 /status 에 나옵니다"
+        return "재개했습니다 — " + ", ".join(cleared) + ". 다른 이유로 막혀 있으면 /status 에 나옵니다"
 
     TelegramCommands(notifier, {
         "/status": lambda: status_text(settings, broker, session_factory),
@@ -255,8 +257,50 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
 
     threading.Thread(target=daily, name="daily-summary", daemon=True).start()
     from kimp.notify import pretty
-    notifier.send(pretty(f"[봇 시작] {MODE_LABEL[settings.mode]} | 코인 {', '.join(settings.coins)}"))
+    with session_factory() as session:
+        notifier.send(pretty(startup_text(settings, broker.open_positions(session))))
     return notifier   # 종료할 때 큐를 비우려고 (notifier.flush)
+
+
+def startup_text(settings: Settings, open_positions) -> str:
+    """
+    [봇 시작] 메시지: 어떤 설정으로 떴는지 — 돈과 위험을 정하는 값만 (나중에 '저때 왜 저렇게 움직였지' 할 때 보는 것)
+
+    공통 항목을 먼저, 코인별 진입·목표는 '[코인]' 소제목 아래 (pretty 가 굵은 소제목으로 그린다)
+    """
+    s = settings
+    lev = s.bybit_leverage
+    size = f"최대 {s.max_position_usdt:,.0f} USDT" if s.max_position_usdt else "자동 크기"
+    lines = [f"[봇 시작] {MODE_LABEL[s.mode]} · {datetime.now(KST):%m-%d %H:%M}",
+             f"포지션 {size} × {s.max_open_positions}자리 · {lev:g}배 격리"]
+    if s.one_shot:
+        lines.append("한 번만 돌리기" + (f" (최대 {s.one_shot_max_hours:g}시간)" if s.one_shot_max_hours else ""))
+    common = s.default_params()
+    daily = f"{s.daily_loss_limit_usdt:,.0f} USDT" if s.daily_loss_limit_usdt else "없음"
+    spread = f"{s.entry_max_spread_percent:.1f}%" if s.entry_max_spread_percent else "안 봄"
+    lines.append(f"손절 {common.stop_loss_percent:.0f}% · 하루 손실 한도 {daily} · 왕복 호가 한도 {spread}")
+    if s.liq_guard_topup_max_rounds:
+        unit = (f"{s.max_position_usdt / lev * s.liq_guard_topup_unit_ratio:,.0f} USDT ({s.liq_guard_topup_unit_ratio:g}배)"
+                if s.max_position_usdt else f"원래 증거금의 {s.liq_guard_topup_unit_ratio:g}배")
+        topup = f"증거금 {unit} × 최대 {s.liq_guard_topup_max_rounds}회"
+    else:
+        topup = "증거금 추가 없이 정리만"
+    lines.append(f"강제청산 가드 {s.liq_guard_percent:.0f}% 안에서 판단 · {topup}")
+    if s.auto_transfer_enabled:
+        lines.append(f"자동 송금 켜짐 · 여유분 {s.bybit_margin_buffer_percent:.0f}% · {s.rebalance_threshold_percent:.0f}%p 어긋나면 재분배")
+    else:
+        lines.append("자동 송금 꺼짐 (재분배는 알림만)")
+    if open_positions:
+        lines.append("이어받은 포지션 " + ", ".join(f"#{p.id} {p.coin}" for p in open_positions))
+    for coin in s.coins:
+        p = s.params_for(coin)
+        item = f"진입 ≤ {p.entry_premium_threshold_percent:+.2f}% → 목표 {p.target_net_profit_percent:.2f}%"
+        if p.stop_loss_percent != common.stop_loss_percent:
+            item += f" · 손절 {p.stop_loss_percent:.0f}%"
+        if p.position_size_usdt:
+            item += f" · 크기 {p.position_size_usdt:,.0f} USDT"
+        lines += [f"[{coin}]", item]
+    return LF.join(lines)
 
 
 def print_one_shot_report(settings: Settings, session_factory) -> None:
