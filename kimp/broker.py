@@ -978,8 +978,12 @@ class HedgeBroker:
         """
         if refresh_account:
             self.ex.refresh()
-            # 비운 김에 바로 받아 둔다 — 주문 경로(청산의 잔고·숏 확인)가 REST 를 기다리지 않게
-            self.ex.prefetch([p.coin for p in self.open_positions(session)])
+            # 비운 김에 바로 받아 둔다 — 주문 경로(청산의 잔고·숏 확인)가 REST 를 기다리지 않게.
+            # 선조회는 '미리' 일 뿐이라 실패해도 스캔을 멈추지 않는다 — 필요한 쪽이 그때 다시 받는다
+            try:
+                self.ex.prefetch([p.coin for p in self.open_positions(session)])
+            except Exception as exc:
+                self._log_repeat("prefetch", logging.WARNING, f"[계좌 선조회 실패] {exc} | 주문 때 다시 받습니다")
         self._poll_transfers(session)
         for pos in self.unfinished_positions(session):
             quote = quotes.get(pos.coin)

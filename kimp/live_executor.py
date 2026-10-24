@@ -241,22 +241,22 @@ class LiveExecutor:
         self._load_shorts([coin])
 
     def _load_shorts(self, coins: List[str]) -> None:
-        """여러 코인의 숏 개수·강제청산가를 요청 한 번으로 받아 둔다 (없는 코인은 0 / None)"""
-        found: Dict[str, tuple] = {c: (0.0, None) for c in coins}
-        by_symbol = {bybit_symbol(c): c for c in coins}
-        for p in self.by.fetch_positions(list(by_symbol)):
-            # ccxt 는 symbol 을 늘 채워 준다. 심볼 하나만 물었을 땐 없어도 그 코인으로 본다 (예전 응답 모양 대비)
-            coin = by_symbol.get(p.get("symbol")) or (coins[0] if len(coins) == 1 else None)
-            if coin is None or p.get("side") != "short":
-                continue
-            qty, liq = found[coin]
-            qty += abs(float(p.get("contracts") or 0.0))
-            try:
-                liq = float(p.get("liquidationPrice") or 0) or None
-            except (TypeError, ValueError):
-                liq = None
-            found[coin] = (qty, liq)
-        for coin, (qty, liq) in found.items():
+        """
+        코인들의 숏 개수·강제청산가를 받아 둔다 (없는 코인은 0 / None)
+
+        ccxt 바이비트 fetch_positions 는 심볼을 **하나씩만** 받는다 (둘 이상 넘기면 ArgumentsRequired —
+        2026-10-24 22:05 포지션이 2개가 되자 매 스캔 예외로 1분간 관리가 멈췄다). 그래서 코인마다 한 번씩 부른다.
+        """
+        for coin in coins:
+            qty, liq = 0.0, None
+            for p in self.by.fetch_positions([bybit_symbol(coin)]):
+                if p.get("side") != "short":
+                    continue
+                qty += abs(float(p.get("contracts") or 0.0))
+                try:
+                    liq = float(p.get("liquidationPrice") or 0) or None
+                except (TypeError, ValueError):
+                    liq = None
             self._shorts[coin] = qty
             self._liq[coin] = liq
 
