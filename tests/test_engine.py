@@ -313,6 +313,33 @@ class EngineTest(unittest.TestCase):
         self.assertGreaterEqual(pos.net_pnl_percent, 1.0)
         self.assertGreater(pos.usdt_bought, pos.usdt_sold)
 
+    def test_wait_next_follows_feed_when_present(self):
+        """소켓이 있으면 다음 판단은 '호가 변경' 을 기다리되 직전 판단에서 최소 0.25초 뒤, 없으면 SCAN_INTERVAL 대기"""
+        import threading
+        import time as _t
+        from kimp.engine import EVENT_STEP_MIN_GAP_SEC
+
+        class FakeFeed:
+            def __init__(self):
+                self.waits = []
+
+            def wait_change(self, timeout):
+                self.waits.append(timeout)
+                return True
+
+        stop = threading.Event()
+        feed = FakeFeed()
+        t0 = _t.monotonic()
+        self.engine._wait_next(stop, feed, started=t0)
+        self.assertGreaterEqual(_t.monotonic() - t0, EVENT_STEP_MIN_GAP_SEC - 0.02)   # 최소 간격은 지킨다
+        self.assertEqual(len(feed.waits), 1)
+        self.assertLessEqual(feed.waits[0], self.engine.s.scan_interval_sec)          # 최대 대기는 SCAN_INTERVAL
+        # 소켓이 없으면 예전처럼 SCAN_INTERVAL 만큼 잔다 (여기선 종료 신호로 바로 깨운다)
+        stop.set()
+        t1 = _t.monotonic()
+        self.engine._wait_next(stop, None, started=t1)
+        self.assertLess(_t.monotonic() - t1, 0.05)
+
     def test_tp_exec_buffer_waits_on_thin_book(self):
         """익절 실행 여유: 얇은 호가판이면 '목표 + 여유' 전엔 안 팔고, 끄면 목표에서 판다"""
         from kimp.exec_buffer import exit_buffer

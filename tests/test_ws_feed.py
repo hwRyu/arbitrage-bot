@@ -89,6 +89,13 @@ class WsFeedTest(unittest.TestCase):
         self.assertIn("CAP 끊김·묵음 → REST", text)
         self.assertIn("업데이트 업비트 2.0/s 바이비트 1.0/s", text)   # 2초 동안 업비트 4회, 바이비트 2회
 
+    def test_wait_change_wakes_on_new_book_and_times_out_otherwise(self):
+        """호가가 새로 오면 바로 깨고(True), 안 오면 timeout 뒤 False. 기다리는 동안 온 변경은 다음 호출에서 True"""
+        self.assertFalse(self.feed.wait_change(0.05))
+        self.feed._store(("upbit", "MINA/KRW"), book(91.4))
+        self.assertTrue(self.feed.wait_change(0.0))
+        self.assertFalse(self.feed.wait_change(0.0))             # 신호는 한 번 읽으면 비워진다
+
     def test_subscriptions_cover_each_coin_and_usdt_once(self):
         subs = self.feed._subscriptions()
         self.assertEqual([s[2] for s in subs], ["MINA/KRW", "MINA/USDT:USDT", "CAP/KRW", "CAP/USDT:USDT", "USDT/KRW"])

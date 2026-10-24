@@ -30,8 +30,9 @@ import os
 import subprocess
 import traceback
 from dataclasses import asdict, is_dataclass
+import time
 from datetime import datetime
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -175,6 +176,16 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
         tp_judge       익절 확정 (premium_top = 확인 순손익, threshold = 목표 + 여유, premium_depth = 여유 %p). 체결 뒤
                        fills.expected_price 와 비교하면 여유가 밀림을 얼마나 덮었는지 나온다
     """
+    # 조건이 유지되는 동안 매 판단마다 같은 줄이 쌓이는 단계(near·spread_block …)는 코인·단계별로
+    # REPEAT_COOLDOWN_SEC 에 한 번만 적는다. 소켓 시세로 0.25초마다 판단하면 그냥 두면 시간당 만 줄이 넘는다.
+    # 사건성 단계(entered·rejected·confirm_fail·tp_*)는 매번 적는다.
+    if stage in REPEAT_STAGES:
+        key = (coin, stage)
+        last = _repeat_last.get(key)
+        mono = time.monotonic()
+        if last is not None and mono - last < REPEAT_COOLDOWN_SEC:
+            return
+        _repeat_last[key] = mono
     session.add(Decision(coin=coin, stage=stage, premium_top=premium_top, threshold_percent=threshold,
                          premium_depth=premium_depth, size_usdt=size_usdt, bybit_qty=bybit_qty,
                          funding_8h_percent=funding_8h, position_id=position_id, note=(note or "")[:200],
@@ -182,15 +193,35 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
     session.commit()
 
 
+# 반복 단계: 조건이 이어지는 동안 매 판단마다 나오는 것들 (코인·단계별로 REPEAT_COOLDOWN_SEC 에 한 번만 기록)
+REPEAT_STAGES = frozenset({"near", "spread_block", "funding_block", "size_reject", "depth_reject", "depth_fail",
+                           "no_slot", "balance_block"})
+REPEAT_COOLDOWN_SEC = 10.0
+_repeat_last: Dict[Tuple[str, str], float] = {}
+
+
+def reset_repeat_cooldown() -> None:
+    """테스트용: 반복 단계 기록 억제를 초기화 (같은 프로세스에서 여러 테스트가 돌 때)"""
+    _repeat_last.clear()
+
+
 # ----------------------------------------------------------------------
 # 보유 중 평가 (position_snapshots + 최고/최저)
 # ----------------------------------------------------------------------
-def note_extremes(pos: Position, net_percent: float, now: datetime) -> None:
-    """보유 중 순손익의 최고·최저를 포지션에 적어 둔다 (목표에 얼마나 가까웠다가 놓쳤는지 보려고). commit 은 부르는 쪽"""
+def note_extremes(pos: Position, net_percent: float, now: datetime) -> bool:
+    """
+    보유 중 순손익의 최고·최저를 포지션에 적어 둔다 (목표에 얼마나 가까웠다가 놓쳤는지 보려고). commit 은 부르는 쪽
+
+    Returns: 최고나 최저가 바뀌었으면 True (부르는 쪽이 이때는 꼭 커밋한다)
+    """
+    changed = False
     if pos.max_net_percent is None or net_percent > pos.max_net_percent:
         pos.max_net_percent, pos.max_net_at = net_percent, now
+        changed = True
     if pos.min_net_percent is None or net_percent < pos.min_net_percent:
         pos.min_net_percent, pos.min_net_at = net_percent, now
+        changed = True
+    return changed
 
 
 def position_snapshot(session: Session, pos: Position, valuation, quote, now: datetime) -> None:

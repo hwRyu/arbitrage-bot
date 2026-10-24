@@ -49,6 +49,12 @@ logger = logging.getLogger(__name__)
 # 같은 경고를 너무 자주 찍지 않으려고 두는 간격 (초)
 LOG_COOLDOWN_SEC = 60.0
 
+# 소켓 시세일 때 연속 판단 사이 최소 간격 (초). 호가는 초당 10회 넘게 바뀌는데 판단마다 평가·기록이 따라오므로
+# 이 간격으로 묶는다. 계좌 조회(REST)는 이와 무관하게 SCAN_INTERVAL_SEC 마다
+EVENT_STEP_MIN_GAP_SEC = 0.25
+# 포지션 평가값(순손익·청산 김프·여유)을 DB 에 적는 최소 간격 (초). 최고·최저가 바뀌면 간격과 무관하게 바로 적는다
+POSITION_WRITE_MIN_GAP_SEC = 1.0
+
 # 강제청산 가드가 한 번에 넣는 증거금의 최소 (USDT). 이보다 작으면 넣어도 의미가 없다 → 정리로
 MIN_TOPUP_USDT = 0.5
 
@@ -127,6 +133,10 @@ class Engine:
         # 분석용 기록 (kimp/telemetry.py). 매매 판단에는 안 쓴다
         self.run_id: Optional[int] = None            # main 이 넣어 준다 (runs.id). 새 포지션에 적어 둔다
         self._last_pos_snapshot: Dict[int, float] = {}  # 포지션별 마지막 평가 기록 시각
+        self._last_pos_write: Dict[int, float] = {}     # 포지션별 마지막 평가값 커밋 시각
+        telemetry.reset_repeat_cooldown()               # 새 엔진 = 새 기록 흐름 (반복 단계 억제 초기화)
+        self._last_account_refresh = 0.0                # 마지막으로 잔고·포지션을 거래소에서 새로 받은 시각
+        self._account_dirty = True                      # 주문·송금·증거금을 낸 뒤 → 다음 스캔에 계좌를 꼭 새로 받는다
         self._step_started = 0.0                     # 이번 스캔 시작 (monotonic)
         self._quote_ms = 0.0                         # 이번 스캔의 시세 조회 소요 (ms)
 
@@ -228,9 +238,18 @@ class Engine:
             self._check_rebalance(session, positions, {}, when="시작")
 
     def run(self, stop_event: threading.Event) -> None:
-        """메인 루프. 종료 신호가 올 때까지 SCAN_INTERVAL_SEC 마다 step(). 에러가 나도 다음 스캔에서 다시"""
+        """
+        메인 루프. 종료 신호가 올 때까지 step() 을 반복한다. 에러가 나도 다음 스캔에서 다시
+
+        언제 다음 step 을 도나:
+            REST 시세  → SCAN_INTERVAL_SEC 마다 (예전 그대로)
+            소켓 시세  → 호가가 바뀌는 즉시 (직전 step 에서 EVENT_STEP_MIN_GAP_SEC 뒤), 안 바뀌어도 SCAN_INTERVAL_SEC 마다
+        """
         self.startup()
-        logger.info("엔진 시작: 코인 %s, %.1f초마다 스캔", ", ".join(self.coins), self.s.scan_interval_sec)
+        feed = getattr(self.market, "feed", None)
+        logger.info("엔진 시작: 코인 %s, %s", ", ".join(self.coins),
+                    f"호가가 바뀌면 즉시 판단 (최소 {EVENT_STEP_MIN_GAP_SEC:g}초 간격), 계좌 조회 {self.s.scan_interval_sec:g}초마다"
+                    if feed is not None else f"{self.s.scan_interval_sec:.1f}초마다 스캔")
         while not stop_event.is_set():
             started = time.monotonic()
             try:
@@ -241,8 +260,19 @@ class Engine:
                 logger.warning("[한 번만 돌리기] 포지션이 끝났습니다 → 봇을 종료합니다")
                 stop_event.set()
                 break
-            stop_event.wait(max(0.0, self.s.scan_interval_sec - (time.monotonic() - started)))
+            self._wait_next(stop_event, feed, started)
         logger.info("엔진 종료 (열린 포지션은 DB 에 남아서 다음 실행 때 이어서 관리)")
+
+    def _wait_next(self, stop_event: threading.Event, feed, started: float) -> None:
+        """다음 step 까지 대기 (run 의 설명 참고). 종료 신호가 오면 바로 돌아온다"""
+        remain = self.s.scan_interval_sec - (time.monotonic() - started)
+        if feed is None:
+            stop_event.wait(max(0.0, remain))
+            return
+        gap = EVENT_STEP_MIN_GAP_SEC - (time.monotonic() - started)
+        if gap > 0 and stop_event.wait(gap):
+            return
+        feed.wait_change(max(0.0, self.s.scan_interval_sec - (time.monotonic() - started)))
 
     def step(self) -> None:
         """스캔 한 번 (순서는 파일 맨 위 설명 참고)"""
@@ -257,7 +287,13 @@ class Engine:
 
         with self.session_factory() as session:
             # 송금 도착 확인, 덜 끝난 진입·청산 이어서, 거래소와 대조 (페이퍼도 같은 흐름)
-            self.broker.sync(session, quotes, self.coins)
+            # 잔고·포지션 REST 재조회는 SCAN_INTERVAL_SEC 마다, 그리고 주문·송금·증거금을 낸 다음 스캔엔 반드시.
+            # 소켓 시세로 0.25초마다 판단할 때 이걸 매번 하면 거래소 요청 제한에 걸린다 (이 조회가 요청의 본체)
+            now_mono = time.monotonic()
+            refresh = self._account_dirty or now_mono - self._last_account_refresh >= self.s.scan_interval_sec
+            self.broker.sync(session, quotes, self.coins, refresh_account=refresh)
+            if refresh:
+                self._last_account_refresh, self._account_dirty = now_mono, False
             self._close_vanished_shorts(session, quotes)
             open_positions = {p.coin: p for p in self.broker.open_positions(session)}
 
@@ -353,19 +389,25 @@ class Engine:
         pos.last_exit_premium = valuation.exit_premium
         pos.last_exit_buffer_percent = buf.total if buf else None
         now = self._clock()
-        telemetry.note_extremes(pos, pnl.net_percent, self._now_utc())
-        if now - self._last_pos_snapshot.get(pos.id, 0.0) >= self.s.snapshot_interval_sec:
+        changed = telemetry.note_extremes(pos, pnl.net_percent, self._now_utc())
+        snapshot = now - self._last_pos_snapshot.get(pos.id, 0.0) >= self.s.snapshot_interval_sec
+        if snapshot:
             self._last_pos_snapshot[pos.id] = now
             telemetry.position_snapshot(session, pos, valuation, quote, self._now_utc())
 
         if reason is None:
-            session.commit()
+            # 소켓 시세면 0.25초마다 오는데 매번 커밋할 필요는 없다 — 최고·최저가 바뀌었거나, 스냅샷을 적었거나,
+            # 1초 지났을 때만. 안 적은 평가값은 다음 판단에서 다시 계산된다 (세션이 닫히며 버려진다)
+            if changed or snapshot or now - self._last_pos_write.get(pos.id, 0.0) >= POSITION_WRITE_MIN_GAP_SEC:
+                self._last_pos_write[pos.id] = now
+                session.commit()
             logger.debug("%s 보유 중: 청산 김프 %+.3f%%, 순손익 %+.3f%% (%+.2f USDT)",
                          pos.coin, valuation.exit_premium, pnl.net_percent, pnl.net_usdt)
             return False
 
         # 청산: 위 평가값은 close_hedge 의 CLOSING 커밋에 같이 실린다 (주문 앞 커밋을 하나 줄인다)
         self.broker.mark_decided()
+        self._account_dirty = True
         self._close(session, pos, valuation, reason)
         return True
 
@@ -589,6 +631,7 @@ class Engine:
                                f"(바이비트 잔고 {free:.2f})")
                 else:
                     try:
+                        self._account_dirty = True
                         self.broker.add_margin(session, pos, add)
                     except Exception as exc:
                         blocked = f"거래소 거절: {exc}"
@@ -877,6 +920,7 @@ class Engine:
                 continue
             quote, depth = fresh, again   # 더 새 시세로 주문한다
             self.broker.mark_decided()    # 진입 판단 → 주문 전송 ms 측정
+            self._account_dirty = True    # 주문이 나가니 다음 스캔엔 잔고를 새로 받는다 (성공하든 거절되든)
             try:
                 try:
                     pos = self.broker.open_hedge(session, quote, bybit_qty)

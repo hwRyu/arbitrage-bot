@@ -81,6 +81,7 @@ class WsFeed:
         self._updates: Dict[Key, int] = {}                     # key → 받은 횟수 (상태 표시용)
         self._last_any: Dict[str, float] = {}                  # 거래소 이름 → 그 거래소에서 마지막으로 뭔가 온 시각
         self._lock = threading.Lock()
+        self._changed = threading.Event()   # 호가가 하나라도 새로 오면 켜진다 (엔진이 기다렸다 깨는 신호)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started_at: Optional[float] = None
@@ -108,6 +109,17 @@ class WsFeed:
         (up, t_up), (by, t_by), (us, t_us) = got
         return FeedBooks(upbit=up, bybit=by, usdt=us, age_ms=int(round((now - min(t_up, t_by, t_us)) * 1000)),
                          skew_ms=int(round(abs(t_up - t_by) * 1000)))
+
+    def wait_change(self, timeout: float) -> bool:
+        """
+        호가가 새로 올 때까지 기다린다 (최대 timeout 초). 왔으면 True, 시간이 다 됐으면 False
+
+        엔진이 "소켓이 바뀌면 즉시 판단" 하려고 쓴다. 기다리는 동안 온 변경은 다음 호출에서 바로 True 로 나온다
+        (신호를 비우는 건 여기뿐).
+        """
+        changed = self._changed.wait(timeout)
+        self._changed.clear()
+        return changed
 
     def fresh_coins(self) -> List[str]:
         """지금 소켓 호가로 바로 쓸 수 있는 코인"""
@@ -166,6 +178,7 @@ class WsFeed:
             self._books[key] = (book, now)
             self._updates[key] = self._updates.get(key, 0) + 1
             self._last_any[key[0]] = now
+        self._changed.set()
 
     def _subscriptions(self) -> List[Tuple[str, Key, str]]:
         """(거래소 이름, key, 심볼) 목록: 코인마다 업비트·바이비트 + 업비트 USDT/KRW 한 번"""

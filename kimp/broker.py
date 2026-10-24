@@ -960,12 +960,14 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     # 매 스캔: 송금 확인 → 덜 끝난 진입/청산 이어서 → 대조
     # ------------------------------------------------------------------
-    def sync(self, session: Session, quotes: Dict[str, Quote], coins: Iterable[str] = ()) -> None:
+    def sync(self, session: Session, quotes: Dict[str, Quote], coins: Iterable[str] = (),
+             refresh_account: bool = True) -> None:
         """
         스캔 맨 앞에서 하는 정리 — 덜 끝난 일을 이어서 하고 거래소와 대조한다
 
         순서가 중요하다. 새 포지션을 잡기 전에 **어긋난 것을 먼저 맞춰야** 한다.
-            1) 잔고 캐시 비우기 (실거래)
+            1) 잔고·포지션 캐시 비우기 (실거래, refresh_account=True 일 때). 소켓 시세로 자주 판단할 때는
+               엔진이 SCAN_INTERVAL_SEC 마다 한 번만 True 로 준다 — 이 REST 조회가 요청 제한의 본체라서
             2) 송금이 도착했나 확인 (_poll_transfers)
             3) 덜 끝난 포지션(OPENING/CLOSING)을 이어서 처리.
                ERROR 는 건드리지 않는다 — 사람이 거래소에서 직접 정리해야 하는 상태다
@@ -974,7 +976,8 @@ class HedgeBroker:
         Args:
             quotes: 코인별 지금 시세. 없는 코인은 이번 스캔에 건너뛴다 (시세 없이 주문하면 안 된다)
         """
-        self.ex.refresh()
+        if refresh_account:
+            self.ex.refresh()
         self._poll_transfers(session)
         for pos in self.unfinished_positions(session):
             quote = quotes.get(pos.coin)
