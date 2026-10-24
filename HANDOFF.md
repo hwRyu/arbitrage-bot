@@ -40,7 +40,7 @@ python -m unittest discover -s tests      # 134개 통과해야 정상 (인터�
 - 진입: 실제 체결가로 계산한 진입 김프 ≤ 기준 (코인별 덮어쓰기 `<COIN>_ENTRY_PREMIUM_THRESHOLD_PERCENT`).
 - 청산: 비용(수수료·펀딩비) 뺀 순이익 ≥ 목표(기본 1%), 손절 −5%. 목표·손절은 진입 때 값으로 고정.
 - 레버리지 `BYBIT_LEVERAGE`(기본 1) → 자본 비율 자동 (업비트 = L/(L+1+여유 30%), 1배면 43.5:56.5).
-- **1배 숏도 강제청산 있음** (가격 약 2배에서). 경고 `LIQUIDATION_WARN_PERCENT` 15%.
+- **1배 숏도 강제청산 있음** (가격 약 2배에서). 경고 `LIQ_WARN_PERCENT` 15%.
 - 리밸런싱(송금)은 **필요할 때만**: 청산 후 비율 10%p 넘게 깨짐 / 진입하려는데 한쪽 부족. 거래마다 송금하지 않는다 (사용자가 강하게 지적했던 부분). 송금 한 번 수수료 `REBALANCE_TRANSFER_FEE_USDT` 1.
 
 ### 펀딩비 전략 (docs/carry.md)

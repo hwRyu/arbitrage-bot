@@ -464,7 +464,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
 
     def test_liq_guard_closes_when_topup_cap_is_zero(self):
         """추가 회차 0 이면 목표가 코앞이어도 정리"""
-        market, engine, sf, broker, pos = self._guard_setup(margin_topup_max_rounds=0)
+        market, engine, sf, broker, pos = self._guard_setup(liq_guard_topup_max_rounds=0)
         market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
         engine.step()
         with sf() as s:
@@ -496,9 +496,9 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         self.assertLess(pos.margin_added_usdt, margin0 * 0.2)
 
     def test_liq_guard_unit_ratio(self):
-        """MARGIN_TOPUP_UNIT_RATIO=0.5 → 한 번에 원래 증거금의 절반, 회수도 그 단위로 센다"""
-        market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0, margin_topup_unit_ratio=0.5,
-                                                            margin_topup_max_rounds=2)
+        """LIQ_GUARD_TOPUP_UNIT_RATIO=0.5 → 한 번에 원래 증거금의 절반, 회수도 그 단위로 센다"""
+        market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0, liq_guard_topup_unit_ratio=0.5,
+                                                            liq_guard_topup_max_rounds=2)
         margin0 = pos.bybit_margin_usdt
         market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
         engine.step()                                     # 1차: 0.5단위
@@ -531,7 +531,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
 
     def test_liq_guard_cap_is_cumulative(self):
         """회차 한도(1회)를 다 쓰면 다음 가드 구간에서는 정리"""
-        market, engine, sf, broker, pos = self._guard_setup(margin_topup_max_rounds=1, bybit_margin_buffer_percent=300.0)
+        market, engine, sf, broker, pos = self._guard_setup(liq_guard_topup_max_rounds=1, bybit_margin_buffer_percent=300.0)
         initial = pos.bybit_margin_usdt
         market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
         engine.step()                                     # 1차: 1단위

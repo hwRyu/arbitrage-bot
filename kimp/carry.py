@@ -443,7 +443,7 @@ class CarryEngine:
                                "순손익 %+.2f USDT (펀딩 %+.2f)", pos.id, pos.coin, left, guard, val.net_usdt,
                                pos.funding_usdt)
                 return True
-        if left < self.s.liquidation_warn_percent:
+        if left < self.s.liq_warn_percent:
             self._log_throttled(f"carry-liq-{pos.id}", logging.WARNING,
                                 f"[펀딩비 전략 · 강제청산 주의] #{pos.id} {pos.coin} 강제청산까지 +{left:.1f}% "
                                 f"→ 현물 이익 일부를 선물 증거금으로 옮기세요")

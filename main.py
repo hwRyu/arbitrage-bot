@@ -371,7 +371,7 @@ def main() -> int:
                 "(여유분 %.0f%% — 수수료·펀딩비·추가 포지션용, 강제청산을 막아주지는 않음) | "
                 "강제청산 경고 %.0f%% 이내 | 리밸런싱 %.0f%%p 이탈",
                 settings.bybit_leverage, share * 100, (1 - share) * 100, settings.bybit_margin_buffer_percent,
-                settings.liquidation_warn_percent, settings.rebalance_threshold_percent)
+                settings.liq_warn_percent, settings.rebalance_threshold_percent)
     logger.info("비용: 업비트 %.3f%% (코인·USDT 매매 각각) · 바이비트 %.3f%% (왕복 %.2f%%) · "
                 "송금 한 번 업비트→바이비트 %.2f / 바이비트→업비트 %.2f USDT",
                 f.upbit_trade_fee_rate * 100, f.bybit_taker_fee_rate * 100,

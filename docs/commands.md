@@ -359,7 +359,7 @@ python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP
 | `PAPER_INITIAL_TOTAL_USDT` | 10,000 | 김프 전략 페이퍼 시작 자본 |
 | `POSITION_SIZE_USDT` | 자동 | 포지션 하나 크기 |
 | `BYBIT_LEVERAGE` | 1 | 김프 전략 숏 레버리지 (자본 비율 자동) |
-| `LIQUIDATION_WARN_PERCENT` | 15 | 강제청산까지 남은 상승폭이 이보다 작으면 경고 (두 전략 공통) |
+| `LIQ_WARN_PERCENT` | 15 | 강제청산까지 남은 상승폭이 이보다 작으면 경고 (두 전략 공통) |
 | `REBALANCE_THRESHOLD_PERCENT` | 10 | 양쪽 비율이 이만큼 깨지면 리밸런싱 |
 | `ENTRY_MIN_FUNDING_8H_PERCENT` | -0.05 | 8시간 기준 펀딩비율이 이보다 나쁘면 진입 안 함 (비우면 끔) |
 | `MAX_FUNDING_COST_PERCENT` | 0.3 | 펀딩비로 낸 돈이 포지션 금액의 이 %를 넘으면 정리 (0 = 무제한). 펀딩비만큼 필요 청산 김프가 올라가서, 0.3%면 이미 도달이 어려워진다 |

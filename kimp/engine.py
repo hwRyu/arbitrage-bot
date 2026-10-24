@@ -461,7 +461,7 @@ class Engine:
         1) 강제청산가는 거래소 값을 우선 쓴다 (봇 계산값보다 거래소가 먼저 자른다)
         2) 바이비트 가격이 강제청산가 이상이면: 숏은 강제청산된 것으로 보고(증거금 잃음), 업비트 코인도 즉시 정리 → True
         3) 남은 상승폭이 LIQ_GUARD_PERCENT 안이면 봇이 판단한다 (_liq_guard): 증거금 추가 또는 정리
-        4) 그 밖에 LIQUIDATION_WARN_PERCENT 안이면 사람에게 경고만
+        4) 그 밖에 LIQ_WARN_PERCENT 안이면 사람에게 경고만
 
         예) 강제청산가 1.793, 지금 1.60 → 남은 상승폭 12% → 경고(15%). 1.64 → 9.3% → 가드(10%)
         """
@@ -492,11 +492,11 @@ class Engine:
         pos.last_liq_distance_percent = distance
         if distance < self.s.liq_guard_percent:
             return self._liq_guard(session, pos, quote, price, distance)
-        if distance < self.s.liquidation_warn_percent:
+        if distance < self.s.liq_warn_percent:
             # 예고: 가드(liq_guard_percent)가 곧 할 일을 그대로 적는다 — 사람이 먼저 /close 하거나 손으로 넣을 시간
             added = pos.margin_added_usdt or 0.0
-            unit = (pos.bybit_margin_usdt - added) * self.s.margin_topup_unit_ratio
-            rounds_left = max(0, self.s.margin_topup_max_rounds - (int(round(added / unit)) if unit > 0 else 0))
+            unit = (pos.bybit_margin_usdt - added) * self.s.liq_guard_topup_unit_ratio
+            rounds_left = max(0, self.s.liq_guard_topup_max_rounds - (int(round(added / unit)) if unit > 0 else 0))
             target, _stop = self._exit_rules(pos)
             valuation = self.broker.value_exit(pos, quote)
             net_text = f"순손익 {valuation.pnl.net_percent:+.2f}% / 목표 {target:.2f}%" if valuation else "순손익 계산 불가"
@@ -505,7 +505,7 @@ class Engine:
                         f"{self.s.liq_guard_hold_below_percent:+.0f}% 이하면 증거금 {unit:,.2f} USDT 추가 (남은 {rounds_left}회), "
                         f"아니면 정리")
             else:
-                plan = f"증거금 추가 {self.s.margin_topup_max_rounds}회 다 써서 정리"
+                plan = f"증거금 추가 {self.s.liq_guard_topup_max_rounds}회 다 써서 정리"
             self._log_throttled(
                 f"liq-warn-{pos.coin}", logging.WARNING,
                 f"[긴급 · 강제청산 임박] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% (지금 {price:.6f} / 강제청산가 {liq:.6f}) | "
@@ -535,8 +535,8 @@ class Engine:
             그 외                                     → 정리 (LIQ_GUARD). 청산당하는 것과 돈 차이는 거의 없지만 시점을 우리가 고른다
 
         넣는 돈의 출처와 양 (_margin_buffer_usdt):
-            한 번에 그 포지션의 원래 증거금 × MARGIN_TOPUP_UNIT_RATIO (1배·배수 1 이면 청산가 2배 → 3배),
-            포지션당 최대 MARGIN_TOPUP_MAX_ROUNDS 회.
+            한 번에 그 포지션의 원래 증거금 × LIQ_GUARD_TOPUP_UNIT_RATIO (1배·배수 1 이면 청산가 2배 → 3배),
+            포지션당 최대 LIQ_GUARD_TOPUP_MAX_ROUNDS 회.
             전체 포지션이 넣은 합이 '여유분' (자본 나눌 때 바이비트에 더 둔 30%) 을 넘지 못한다
             → 자리 몫(다음 진입 돈)은 절대 건드리지 않는다. 여유분을 다 썼거나 회차를 다 썼으면 정리.
 
@@ -548,7 +548,7 @@ class Engine:
         target, _stop = self._exit_rules(pos)
         added = pos.margin_added_usdt or 0.0
         initial = pos.bybit_margin_usdt - added
-        unit = initial * self.s.margin_topup_unit_ratio          # 한 번에 넣는 양
+        unit = initial * self.s.liq_guard_topup_unit_ratio          # 한 번에 넣는 양
         rounds_used = int(round(added / unit)) if unit > 0 else 0
 
         why_hold = None
@@ -559,8 +559,8 @@ class Engine:
 
         blocked = None   # 넣고 싶은데 못 넣는 이유
         if why_hold:
-            if rounds_used >= self.s.margin_topup_max_rounds:
-                blocked = f"이미 {rounds_used}회 넣음 (최대 {self.s.margin_topup_max_rounds}회)"
+            if rounds_used >= self.s.liq_guard_topup_max_rounds:
+                blocked = f"이미 {rounds_used}회 넣음 (최대 {self.s.liq_guard_topup_max_rounds}회)"
             else:
                 open_positions = self.broker.open_positions(session)
                 buffer = self._margin_buffer_usdt(session, quote, open_positions)
@@ -579,7 +579,7 @@ class Engine:
                     else:
                         logger.warning("[증거금 추가] #%d %s | 강제청산까지 %.1f%% 였음 | +%.2f USDT (%d/%d회, 여유분 %.2f 중 %.2f 사용) | "
                                        "새 강제청산가 %.6f | 이유: %s",
-                                       pos.id, pos.coin, distance, add, rounds_used + 1, self.s.margin_topup_max_rounds,
+                                       pos.id, pos.coin, distance, add, rounds_used + 1, self.s.liq_guard_topup_max_rounds,
                                        buffer, used + add, pos.liquidation_price, why_hold)
                         return False
             logger.warning("[증거금 추가 불가] #%d %s | %s | 정리로 넘어갑니다", pos.id, pos.coin, blocked)

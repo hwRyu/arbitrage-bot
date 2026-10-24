@@ -41,7 +41,7 @@ Engine.step()  (스캔 한 번)
 - `FeeSettings`: 업비트 수수료율(코인·USDT 매매 공통), 바이비트 수수료율, 사이클당 전송비(선택, 기본 0), 표시용 여유분. 송금 수수료는 방향별 `Settings.transfer_fee_usdt(to_bybit)` (업비트 출금 무료 0 / 바이비트 출금 1.3), 페이퍼 자동 송금은 `paper_auto_rebalance`
   - `round_trip_trade_fee_percent()`: 업비트 4번 + 바이비트 2번 = 0.31%
 - **코인별 덮어쓰기:** 진입 기준, 목표, 손절, 포지션 크기. `params_for(coin)` 으로 꺼내 쓴다
-- **레버리지 / 자본:** `bybit_leverage`, `bybit_margin_buffer_percent`, `bybit_mmr`, `liquidation_warn_percent`, `rebalance_threshold_percent`
+- **레버리지 / 자본:** `bybit_leverage`, `bybit_margin_buffer_percent`, `bybit_mmr`, `liq_warn_percent`, `rebalance_threshold_percent`
   - `upbit_target_share()`: 업비트 목표 비율 = 레버리지 ÷ (레버리지 + 1 + 여유분)
 - **포지션 크기:** `position_size_usdt` (None 이면 자동), `capital_usage_percent`
 - `validate_settings()`: 이상한 값을 한 번에 모아서 알려준다

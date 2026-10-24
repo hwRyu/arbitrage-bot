@@ -41,7 +41,7 @@
 | 진입: 지금 펀딩비율 > 0 | | |
 | 진입: 선물 매수1호가 ÷ 현물 매도1호가 − 1 ≥ 기준 (들어가자마자 손해 방지) | −0.1% | `CARRY_MIN_ENTRY_BASIS_PERCENT` |
 | 청산: 최근 24시간 하루 평균 < 기준 (펀딩비를 내기 시작) | 0%/일 | `CARRY_EXIT_BELOW_DAILY_PERCENT`, `CARRY_EXIT_LOOKBACK_HOURS` |
-| 강제청산 미리 피하기: 강제청산까지 남은 상승폭 < 기준이면 양쪽 정리 | 15% | `CARRY_LIQ_GUARD_PERCENT` (0 = 끔, 이때는 `LIQUIDATION_WARN_PERCENT` 경고만) |
+| 강제청산 미리 피하기: 강제청산까지 남은 상승폭 < 기준이면 양쪽 정리 | 15% | `CARRY_LIQ_GUARD_PERCENT` (0 = 끔, 이때는 `LIQ_WARN_PERCENT` 경고만) |
 | 청산한 코인 재진입 대기 | 24시간 | `CARRY_REENTRY_COOLDOWN_HOURS` |
 | 여러 코인이 조건을 만족하면 | 72시간 평균 높은 순 | |
 
