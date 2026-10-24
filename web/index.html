@@ -933,6 +933,20 @@ function controlBands(rows, series) {
            ucl: st.mean + k * st.sd, lcl: st.mean - k * st.sd };
 }
 
+// 가격 기록에서 호가 한 칸 알아내기 (kimp/simulate.py tick_size 와 같은 규칙: 자주 나오는 가장 작은 변화폭)
+function tickSize(values) {
+  const diffs = new Map();
+  let total = 0;
+  for (let i = 1; i < values.length; i++) {
+    if (values[i] == null || values[i - 1] == null) continue;
+    const d = Math.round(Math.abs(values[i] - values[i - 1]) * 1e10) / 1e10;
+    if (d > 1e-12) { diffs.set(d, (diffs.get(d) || 0) + 1); total++; }
+  }
+  if (!diffs.size) return null;
+  const common = [...diffs].filter(([, n]) => n >= total * 0.01).map(([d]) => d);
+  return Math.min(...(common.length ? common : [...diffs.keys()]));
+}
+
 function drawChart(data) {
   LAST = data;
   const W = 900, H = 340, L = 56, R = 56, T = 14, B = 26;
@@ -1033,7 +1047,15 @@ function drawChart(data) {
   PLOT = { rows, picked, L, R, W, T, H, B, x0: xs[0], x1: xs[xs.length - 1] };
 
   const last = rows[rows.length - 1];
-  $("chartInfo").textContent = `${rows.length.toLocaleString()}개 · 출처 ${data.source} · 마지막 김프 ${sign(last.mid, 3)}%`;
+  // 현재가와 업비트 호가 한 칸: 가격이 호가 단위 경계(10·100·1,000원)를 넘으면 한 칸이 10배 넓어져 목표가 안 나온다
+  // (IRYS 가 100원을 넘으며 한 칸 1원 ≈ 1% 가 된 사고). 한 칸은 파이썬 tick_size 와 같은 방법 — 이어진 종가 차이 중
+  // '자주 나오는' 가장 작은 값 — 으로 이 기간 데이터에서 알아낸다.
+  const up = last.upbit_krw, by = last.bybit_usdt;
+  const tick = tickSize(rows.map((r) => r.upbit_krw));
+  const priceInfo = up ? ` · 업비트 ${up.toLocaleString(undefined, { maximumFractionDigits: 4 })}원` +
+      (tick ? ` (한 칸 ${tick}원 = ${fmt(tick / up * 100, 3)}%)` : "") : "";
+  const byInfo = by ? ` · 바이비트 ${by.toLocaleString(undefined, { maximumFractionDigits: 6 })} USDT` : "";
+  $("chartInfo").textContent = `${rows.length.toLocaleString()}개 · 출처 ${data.source} · 마지막 김프 ${sign(last.mid, 3)}%${priceInfo}${byInfo}`;
   $("legend").innerHTML = picked.map((s) =>
     `<span><i style="background:${s.color}"></i>${s.name} ${s.axis === "원" ? "(오른쪽 축, 점선)" : ""}
       <b style="color:${s.color}">${s.axis === "%" ? sign(last[s.k], 3) + "%" : fmt(last[s.k], 1)}</b></span>`).join("")
