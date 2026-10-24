@@ -80,34 +80,68 @@ def make_broker(settings: Settings, coins, safety: Safety) -> HedgeBroker:
 
 
 def status_text(settings: Settings, broker: HedgeBroker, session_factory) -> str:
-    """/status 답장과 하루 요약에 쓰는 현황"""
+    """
+    /status 답장과 하루 요약에 쓰는 현황
+
+    공통 항목 먼저, 포지션은 '[#번호 코인]' 소제목 아래 (pretty 가 굵은 소제목으로 그린다):
+        순손익 → 목표까지 / 손절까지·보유·펀딩 / 강제청산까지 남은 상승폭·증거금 / 가드가 할 일
+    """
+    s = settings
     with session_factory() as session:
         broker.ex.refresh()
         ok, why = broker.entries_allowed(session)
         from kimp.broker import dir_label
         positions = broker.open_positions(session)
-        lines = [f"[현황] {MODE_LABEL[settings.mode]} · {datetime.now(KST):%m-%d %H:%M}",
+        lines = [f"[현황] {MODE_LABEL[s.mode]} · {datetime.now(KST):%m-%d %H:%M}",
                  f"잔고 업비트 {broker.balance(session, UPBIT_USDT):,.2f} / 바이비트 "
                  f"{broker.balance(session, BYBIT_USDT):,.2f} USDT (포지션 제외)",
                  f"오늘 확정 손익 {broker.safety.daily_loss_usdt(session):+,.2f} USDT",
-                 "신규 진입 " + ("가능" if ok else f"중단 — {why}"),
-                 f"포지션 {len(positions)} / {settings.max_open_positions}"]
-        for p in positions:
-            # 남은 거리: 순손익과 청산 김프는 1:1 로 움직이므로 '목표 − 지금 순손익' 이 곧 필요한 상승폭(%p)
-            net = p.last_net_percent or 0.0
-            target = p.target_net_profit_percent or 0.0
-            stop = p.stop_loss_percent or 0.0
-            held_h = (datetime.now(timezone.utc) - _as_utc(p.opened_at)).total_seconds() / 3600
-            limit = f" / {settings.one_shot_max_hours:g}시간" if (settings.one_shot and settings.one_shot_max_hours) else ""
-            lines.append(
-                f"#{p.id} {p.coin} 진입 {p.entry_premium:+.2f}% · 순손익 {net:+.2f}% → 목표 {target:+.2f}% "
-                f"({target - net:+.2f}%p 더) · 손절 {stop:.0f}% 까지 {net - stop:+.2f}%p · "
-                f"보유 {held_h:.1f}시간{limit} · 펀딩 {p.funding_usdt:+.3f} USDT")
+                 ("신규 진입 가능" if ok else f"신규 진입 중단 — {why}") + f" · 자리 {len(positions)} / {s.max_open_positions}"]
         for p in broker.unfinished_positions(session):
             lines.append(f"⚠️ #{p.id} {p.coin} {p.status} — 다음 스캔에 이어서 처리")
         for t in broker.pending_transfers(session):
             lines.append(f"송금 중 #{t.id} {dir_label(t.direction)} {t.amount_usdt:,.2f} USDT")
-    return "\n".join(lines)
+        for p in positions:
+            lines += position_status_lines(s, broker, session, p)
+    return LF.join(lines)
+
+
+def position_status_lines(settings: Settings, broker: HedgeBroker, session, p) -> list:
+    """포지션 하나의 현황 줄들 (/status). 첫 줄은 '[#번호 코인]' 소제목"""
+    s = settings
+    # 남은 거리: 순손익과 청산 김프는 1:1 로 움직이므로 '목표 − 지금 순손익' 이 곧 필요한 상승폭(%p)
+    net = p.last_net_percent or 0.0
+    target = p.target_net_profit_percent or 0.0
+    stop = p.stop_loss_percent or 0.0
+    held_h = (datetime.now(timezone.utc) - _as_utc(p.opened_at)).total_seconds() / 3600
+    limit = f" / {s.one_shot_max_hours:g}시간" if (s.one_shot and s.one_shot_max_hours) else ""
+    lines = [f"[#{p.id} {p.coin}]",
+             f"순손익 {net:+.2f}% → 목표 {target:.2f}% ({target - net:+.2f}%p 더) · 진입 김프 {p.entry_premium:+.2f}%",
+             f"손절 {stop:.0f}% 까지 {net - stop:.2f}%p · 보유 {held_h:.1f}시간{limit} · 펀딩 {p.funding_usdt:+.3f} USDT"]
+
+    # 강제청산: 거래소가 주는 청산가 (없으면 봇 계산값), 남은 상승폭은 마지막 스캔에서 잰 값
+    liq = broker.ex.position_liq_price(session, p.coin) or p.liquidation_price
+    dist = p.last_liq_distance_percent
+    added = p.margin_added_usdt or 0.0
+    margin = f"증거금 {p.bybit_margin_usdt:,.2f} USDT" + (f" (+{added:,.2f} 추가됨)" if added else "")
+    if dist is not None and liq:
+        now_price = liq / (1 + dist / 100)
+        lines.append(f"강제청산가 {liq:.6g} 까지 {dist:.1f}% 남음 (지금 {now_price:.6g}) · {margin}")
+    else:
+        lines.append(f"강제청산가 {liq:.6g} (남은 상승폭은 다음 스캔에) · {margin}")
+
+    # 가드가 할 일 (설정 그대로)
+    initial = p.bybit_margin_usdt - added
+    unit = initial * s.liq_guard_topup_unit_ratio
+    rounds_used = int(round(added / unit)) if unit > 0 else 0
+    rounds_left = max(0, s.liq_guard_topup_max_rounds - rounds_used)
+    if rounds_left:
+        plan = (f"목표까지 {s.liq_guard_near_target_percent:g}%p 이내거나 순손익 {s.liq_guard_hold_below_percent:+g}% 이하면 "
+                f"증거금 {unit:,.2f} USDT 추가 (남은 {rounds_left}회), 아니면 정리")
+    else:
+        plan = "증거금 추가 회수를 다 써서 정리"
+    lines.append(f"가드: 강제청산까지 {s.liq_guard_percent:g}% 안으로 오면 {plan}")
+    return lines
 
 
 HELP_TEXT = (

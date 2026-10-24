@@ -1088,6 +1088,14 @@ class TelegramTest(unittest.TestCase):
         out = pretty("[봇 시작] 실거래" + chr(10) + "포지션 20 USDT" + chr(10) + "[PYTH]" + chr(10) + "진입 ≤ -0.15%")
         self.assertEqual(out.split(chr(10)), ["<b>[봇 시작]</b>", "• 실거래", "• 포지션 20 USDT", "<b>[PYTH]</b>", "• 진입 ≤ -0.15%"])
 
+    def test_pretty_status_positions_as_subheads(self):
+        """/status: 포지션은 '[#8 CAP]' 굵은 소제목, 순손익 줄은 굵게"""
+        from kimp.notify import pretty
+        out = pretty("[현황] 실거래" + chr(10) + "자리 1 / 4" + chr(10) + "[#8 CAP]" + chr(10)
+                     + "순손익 -0.45% → 목표 0.20%" + chr(10) + "강제청산가 0.2468 까지 97.0% 남음")
+        self.assertEqual(out.split(chr(10)), ["<b>[현황]</b>", "• 실거래", "• 자리 1 / 4", "<b>[#8 CAP]</b>",
+                                              "• <b>순손익 -0.45% → 목표 0.20%</b>", "• 강제청산가 0.2468 까지 97.0% 남음"])
+
     def test_pretty_splits_pipes_and_bolds_head(self):
         """한 줄 로그 → 머리 굵게 + 항목마다 줄바꿈 + HTML 특수문자 처리"""
         from kimp.notify import plain, pretty
