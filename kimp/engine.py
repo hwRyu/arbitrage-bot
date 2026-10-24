@@ -36,6 +36,7 @@ from kimp.broker import EntryRejected, ExitValuation, HedgeBroker, InsufficientB
 from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.market_data import MarketData
+from kimp.exec_buffer import buffer_total, exit_buffer
 from kimp.pnl import estimated_exit_premium
 from kimp.premium import Quote
 from kimp import telemetry
@@ -303,8 +304,11 @@ class Engine:
 
         # 목표 / 손절은 진입할 때 포지션에 저장한 값 (들고 있는 중에 .env 를 바꿔도 처음 값으로)
         target, stop = self._exit_rules(pos)
+        # 익절 실행 여유: 청산 순간 체결이 밀릴 만큼을 목표에 얹는다 (그 순간 호가판으로 계산, 끄면 0)
+        buf = exit_buffer(self.s, quote, pos.upbit_qty)
+        need = target + buffer_total(buf)
         reason: Optional[str] = None
-        if pnl.net_percent >= target:
+        if pnl.net_percent >= need:
             reason = ExitReason.TAKE_PROFIT
         elif stop < 0 and pnl.net_percent <= stop:
             reason = ExitReason.STOP_LOSS
@@ -320,23 +324,33 @@ class Engine:
             # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
             fresh = self._fresh_quote(pos.coin)
             confirmed = self.broker.value_exit(pos, fresh) if fresh else None
-            if confirmed is None or confirmed.pnl.net_percent < target:
+            fresh_buf = exit_buffer(self.s, fresh, pos.upbit_qty) if fresh else None   # 여유도 확인 시세 호가판으로 다시
+            fresh_need = target + buffer_total(fresh_buf)
+            if confirmed is None or confirmed.pnl.net_percent < fresh_need:
                 again = confirmed.pnl.net_percent if confirmed else None
                 self._log_throttled(
                     f"tp-confirm-{pos.coin}", logging.INFO,
                     f"[익절 보류] #{pos.id} {pos.coin} | 스캔 시세 {pnl.net_percent:+.3f}% → 확인 시세 "
-                    f"{'없음' if again is None else f'{again:+.3f}%'} | 목표 {target:.2f}% | 한순간 값, 다음 스캔에 다시")
-                telemetry.decision(session, pos.coin, "tp_confirm_fail", pnl.net_percent, target,
+                    f"{'없음' if again is None else f'{again:+.3f}%'} | 목표 {target:.2f}%"
+                    f"{f' + 여유 {buffer_total(fresh_buf):.3f}%p' if fresh_buf else ''} | 한순간 값, 다음 스캔에 다시")
+                telemetry.decision(session, pos.coin, "tp_confirm_fail", pnl.net_percent, fresh_need,
                                    premium_depth=again, position_id=pos.id, now=self._now_utc())
                 reason = None
                 if confirmed is not None:
-                    valuation, pnl = confirmed, confirmed.pnl   # 한순간 튄 값이 아니라 확인된 값으로 기록한다
+                    valuation, pnl, buf = confirmed, confirmed.pnl, fresh_buf   # 한순간 튄 값이 아니라 확인된 값으로 기록한다
             else:
-                valuation, pnl = confirmed, confirmed.pnl       # 더 새 시세로 주문한다
+                valuation, pnl, buf = confirmed, confirmed.pnl, fresh_buf       # 더 새 시세로 주문한다
+                if buf is not None:
+                    # 나중에 배수를 맞추려고 판단 때 호가판을 남긴다 (체결 뒤 fills.expected_price 와 비교)
+                    logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%% + %s | 업비트 매수호가 %s",
+                                pos.id, pos.coin, pnl.net_percent, target, buf.describe(), buf.book_text())
+                telemetry.decision(session, pos.coin, "tp_judge", pnl.net_percent, fresh_need,
+                                   premium_depth=buffer_total(buf), position_id=pos.id, now=self._now_utc())
 
         # 기록은 확인 시세 판정이 끝난 값으로 (가짜 꼭대기가 최고점·평가 기록에 남지 않게)
         pos.last_net_percent = pnl.net_percent
         pos.last_exit_premium = valuation.exit_premium
+        pos.last_exit_buffer_percent = buf.total if buf else None
         now = self._clock()
         telemetry.note_extremes(pos, pnl.net_percent, self._now_utc())
         if now - self._last_pos_snapshot.get(pos.id, 0.0) >= self.s.snapshot_interval_sec:

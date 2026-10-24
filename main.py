@@ -115,8 +115,11 @@ def position_status_lines(settings: Settings, broker: HedgeBroker, session, p) -
     stop = p.stop_loss_percent or 0.0
     held_h = (datetime.now(timezone.utc) - _as_utc(p.opened_at)).total_seconds() / 3600
     limit = f" / {s.one_shot_max_hours:g}시간" if (s.one_shot and s.one_shot_max_hours) else ""
+    buf = p.last_exit_buffer_percent
+    need = target + (buf or 0.0)
+    goal = f"목표 {target:.2f}%" + (f" + 여유 {buf:.2f} = {need:.2f}%" if buf is not None else "")
     lines = [f"[#{p.id} {p.coin}]",
-             f"순손익 {net:+.2f}% → 목표 {target:.2f}% ({target - net:+.2f}%p 더) · 진입 김프 {p.entry_premium:+.2f}%",
+             f"순손익 {net:+.2f}% → {goal} ({need - net:+.2f}%p 더) · 진입 김프 {p.entry_premium:+.2f}%",
              f"손절 {stop:.0f}% 까지 {net - stop:.2f}%p · 보유 {held_h:.1f}시간{limit} · 펀딩 {p.funding_usdt:+.3f} USDT"]
 
     # 강제청산: 거래소가 주는 청산가 (없으면 봇 계산값), 남은 상승폭은 마지막 스캔에서 잰 값

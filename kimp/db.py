@@ -122,6 +122,7 @@ class Position(Base):
     last_net_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 마지막 평가 순손익률
     last_exit_premium: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 마지막 평가 청산 김프
     last_liq_distance_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 강제청산까지 남은 상승폭
+    last_exit_buffer_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 마지막 익절 실행 여유 (%p, 꺼져 있으면 비움)
 
     # ---------------- 분석용 (매매 판단에는 안 쓴다, kimp/telemetry.py) ----------------
     planned_entry_premium: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 판단 때 김프 (실제와의 차이 = 주문 사이 밀림)

@@ -243,7 +243,8 @@ FROM premium_snapshots GROUP BY coin;
 | `rejected` | 주문 단계 거절·되돌림 (`note`) |
 | `confirm_fail` | 조건은 됐는데 **주문 직전 확인 시세**에서는 기준을 못 넘음 — 한순간 튄 값 (`premium_depth` = 확인 시세 김프) |
 | `entered` | 진입함 |
-| `tp_confirm_fail` | 익절 조건이 됐는데 확인 시세에서는 목표 미달 (`premium_top` = 처음 순손익, `premium_depth` = 확인 순손익, `position_id`) |
+| `tp_confirm_fail` | 익절 조건이 됐는데 확인 시세에서는 목표 미달 (`premium_top` = 처음 순손익, `premium_depth` = 확인 순손익, `threshold_percent` = 목표 + 여유, `position_id`) |
+| `tp_judge` | **익절 확정** (`premium_top` = 확인 순손익, `threshold_percent` = 목표 + 실행 여유, `premium_depth` = 여유 %p). 그 포지션의 청산 `fills.expected_price` 대 `avg_price` 와 비교하면 여유가 밀림을 얼마나 덮었는지 나온다 |
 
 ```sql
 -- 코인별로 어디서 막히는지

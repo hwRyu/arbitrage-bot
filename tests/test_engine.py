@@ -313,6 +313,53 @@ class EngineTest(unittest.TestCase):
         self.assertGreaterEqual(pos.net_pnl_percent, 1.0)
         self.assertGreater(pos.usdt_bought, pos.usdt_sold)
 
+    def test_tp_exec_buffer_waits_on_thin_book(self):
+        """익절 실행 여유: 얇은 호가판이면 '목표 + 여유' 전엔 안 팔고, 끄면 목표에서 판다"""
+        from kimp.exec_buffer import exit_buffer
+        from kimp.premium import OrderBook, Quote
+
+        def thin(premium, lots=(0.1,) * 8, each=200.0):
+            """업비트 매수호가가 0.1% 씩 내려가며 각 200개 → 우리 500개는 3줄, 2배는 5줄을 쓴다"""
+            q = make_quote(premium)
+            top = q.upbit.bids[0][0]
+            bids = [(round(top * (1 - 0.001 * i), 4), each) for i in range(len(lots))]
+            return Quote(coin="XRP", upbit=OrderBook(bids=bids, asks=q.upbit.asks), bybit=q.bybit, usdt=q.usdt)
+
+        self.market.quotes = {"XRP": make_quote(-1.0)}
+        self.engine.step()
+        [pos] = self._positions()
+        buf = exit_buffer(self.engine.s, thin(0.8), pos.upbit_qty)
+        self.assertAlmostEqual(buf.tick_percent, 0.1, places=2)
+        self.assertGreater(buf.stress_percent, 0.05)          # 2배(1000개)는 5줄까지 내려가 평균이 더 나쁘다
+        self.assertAlmostEqual(buf.bybit_percent, 0.05)
+        # 목표(1%)는 넘지만 목표+여유는 못 넘는 시세 찾기
+        with self.sf() as s:
+            p = s.get(Position, pos.id)
+            cands = [(pr, self.broker.value_exit(p, thin(pr)).pnl.net_percent) for pr in
+                     [x / 100 for x in range(60, 160, 2)]]
+        between = next(pr for pr, net in cands if 1.0 <= net < 1.0 + buf.total)
+        above = next(pr for pr, net in cands if net >= 1.0 + buf.total + 0.05)
+        self.market.quotes = {"XRP": thin(between)}
+        self.engine.step()
+        [pos] = self._positions()
+        self.assertEqual(pos.status, PositionStatus.OPEN)          # 목표는 넘었지만 여유 때문에 기다린다
+        self.assertIsNotNone(pos.last_exit_buffer_percent)
+        self.market.quotes = {"XRP": thin(above)}
+        with self.assertLogs("kimp.engine", level=logging.INFO) as logs:
+            self.engine.step()
+        self.assertEqual(self._positions()[0].exit_reason, ExitReason.TAKE_PROFIT)
+        self.assertTrue(any("[익절 판단]" in m and "여유" in m and "업비트 매수호가" in m for m in logs.output))
+        # 끄면 목표만 본다 → 같은 '사이' 시세에서 바로 판다
+        engine2, sf2, _ = make_engine(make_settings(tp_exec_buffer_enabled=False), self.market)
+        self.market.quotes = {"XRP": make_quote(-1.0)}
+        engine2.step()
+        self.market.quotes = {"XRP": thin(between)}
+        engine2.step()
+        with sf2() as s:
+            p2 = s.query(Position).one()
+        self.assertEqual(p2.exit_reason, ExitReason.TAKE_PROFIT)
+        self.assertIsNone(p2.last_exit_buffer_percent)
+
     def test_stop_loss_and_no_immediate_reentry(self):
         """김프 급락 → 손절, 손절 직후엔 다시 안 들어감"""
         self.market.quotes = {"XRP": make_quote(-1.0)}
