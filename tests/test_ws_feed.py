@@ -72,7 +72,7 @@ class WsFeedTest(unittest.TestCase):
         fb = self.feed.books("MINA")
         self.assertIsNotNone(fb)
         self.assertEqual(fb.age_ms, 10_000)
-        self.clock.t += 55                                         # 65초째 조용 → 심볼 자체를 의심
+        self.clock.t += 295                                        # 305초째 조용 → 심볼 자체를 의심 (SYMBOL_SILENT_MAX_SEC 5분)
         self.feed._store(("upbit", "USDT/KRW"), book(1340.0))
         self.feed._store(("bybit", "CAP/USDT:USDT"), book(0.07))
         self.assertIsNone(self.feed.books("MINA"))
