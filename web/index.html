@@ -566,6 +566,9 @@ const TIP = {
            "답을 보고 기준을 고른 값이라 실제보다 좋게 나온다 (과최적화).",
   testMonthly: "검증/월 = 앞 2/3 기간으로 고른 기준을 뒤 1/3 기간에 그대로 써본 월 환산 수익" + NL +
                "고를 때 보지 않은 구간이라 이 값이 더 믿을 만하다. 0 이면 그 기간에 거래가 없었다는 뜻.",
+  trades: "거래 전체 = 기간 전체를 '전체/월' 의 진입 기준으로 돌렸을 때 닫힌 거래 수 (승 = 순이익 > 0)",
+  testTrades: "거래 검증 = 검증 구간(뒤 1/3)만 '검증/월' 의 기준으로 돌렸을 때 닫힌 거래 수" + NL +
+              "0건이면 검증/월 도 0 이고 점수가 1/4 로 깎인다 (최근기회없음). 붉게 표시.",
   occupancy: "자리 점유율 = 포지션을 들고 있던 시간 ÷ 전체 기간" + NL +
              "90% 면 자리를 거의 혼자 쓴다는 뜻. 동시 보유가 3개뿐이라 낮을수록 좋다.",
   netPnl: "순손익 (USDT) = 업비트 몫 + 바이비트 몫 + 펀딩비 − 수수료·전송비" + NL +
@@ -1229,7 +1232,9 @@ async function loadScreen() {
       { t: "점수", tip: TIP.score, v: (r) => sign(r.score), cls: (r) => cls(r.score) },
       { t: "전체/월", tip: TIP.monthly, v: (r) => sign(r.monthly) + "%", cls: (r) => cls(r.monthly) },
       { t: "검증/월", tip: TIP.testMonthly, v: (r) => sign(r.test_monthly) + "%", cls: (r) => cls(r.test_monthly) },
-      { t: "거래", v: (r) => `${r.trades}건 ${r.wins}승` },
+      { t: "거래 전체", tip: TIP.trades, v: (r) => `${r.trades}건 ${r.wins}승 ${r.trades - r.wins}패` },
+      { t: "거래 검증", tip: TIP.testTrades, v: (r) => `${r.test_trades ?? 0}건 ${r.test_wins ?? 0}승 ${(r.test_trades ?? 0) - (r.test_wins ?? 0)}패`,
+        cls: (r) => (r.test_trades ? "" : "minus") },
       { t: "진입기준", v: (r) => sign(r.threshold) + "%" },
       { t: "보유h", v: (r) => fmt(r.holding_hours, 1) },
       { t: "점유", tip: TIP.occupancy, v: (r) => fmt(r.occupancy * 100, 0) + "%" },

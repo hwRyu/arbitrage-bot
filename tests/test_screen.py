@@ -265,6 +265,20 @@ class RecentOpportunityTest(unittest.TestCase):
         self.assertAlmostEqual(s.base_score, min(s.monthly, s.test_monthly), places=6)
         self.assertNotIn("최근기회없음", s.flags)
 
+    def test_json_rows_carry_test_period_trades(self):
+        """웹 추천 표: 전체 거래·승 과 별도로 검증 구간 거래·승 이 나간다"""
+        import json, os, tempfile
+        from kimp.screen import save_json
+        s = self._eval("BOTH", self.WAVE * 40)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "screen.json")
+            save_json([s], 5, "", "", path)
+            row = json.load(open(path, encoding="utf-8"))["rows"][0]
+        self.assertEqual((row["trades"], row["wins"]), (s.full.trades, s.full.wins))
+        self.assertEqual((row["test_trades"], row["test_wins"]), (s.test.trades, s.test.wins))
+        self.assertGreater(row["test_trades"], 0)
+        self.assertLessEqual(row["test_trades"], row["trades"])
+
     def test_recent_loss_is_not_rescued_by_discount(self):
         """최근에 손절이 났으면 감점으로 구제하지 않는다 (음수가 그대로 깔린다)"""
         # 진입 기준에 닿은 뒤 -4% 로 떨어져 손절 (stop -2%) → 검증 구간 손실

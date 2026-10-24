@@ -653,7 +653,7 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
         "점수 = min(전체 월수익, 검증 월수익) ÷ 자리 점유율 × 띠 가중치 · 수익은 포지션 금액 대비 % "
         "(한 번에 포지션 1개, 펀딩비 포함)",
         "",
-        f"{'순위':>3} {'코인':<7}{'봉':>4}{'점수':>7} {'전체/월':>7} {'검증/월':>7} {'거래':>4} {'승':>3} "
+        f"{'순위':>3} {'코인':<7}{'봉':>4}{'점수':>7} {'전체/월':>7} {'검증/월':>7} {'거래':>4} {'승':>3} {'검증거래':>7} {'승':>3} "
         f"{'진입기준':>7} {'보유h':>5} {'주기h':>5} {'점유':>5} {'가중':>4} │ {'중간값':>6} {'범위(5~95%)':>13} {'횡보':>4} "
         f"{'띠이동':>5} {'반감h':>5} "
         f"│ {'호가':>5} {'비용':>5} {'업비트(억)':>9} {'바이비트(M$)':>11} {'펀딩/8h':>7}  경고",
@@ -664,6 +664,7 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
         lines.append(
             f"{i:>3}. {s.coin:<7}{s.timeframe:>4}{(f'{s.score:+.2f}' if f else '-'):>7} {s.monthly:>+7.2f} {s.test_monthly:>+7.2f} "
             f"{(f.trades if f else 0):>4} {(f.wins if f else 0):>3} "
+            f"{(s.test.trades if s.test else 0):>7} {(s.test.wins if s.test else 0):>3} "
             f"{(f'{f.threshold:+.2f}' if f else '-'):>7} {hold:>5.1f} {_hl(s.cycle_hours):>5} "
             f"{s.occupancy * 100:>4.0f}% {s.weight:>4.2f} │ "
             f"{s.stats.median:>+6.2f} {s.stats.p5:>+6.2f}~{s.stats.p95:>+6.2f} "
@@ -840,6 +841,7 @@ def save_json(ranked: Sequence[CoinScore], top: int, note: str, snippet: str, pa
             "rank": i, "coin": s.coin, "timeframe": s.timeframe, "score": s.score,
             "monthly": s.monthly, "test_monthly": s.test_monthly,
             "trades": f.trades if f else 0, "wins": f.wins if f else 0,
+            "test_trades": s.test.trades if s.test else 0, "test_wins": s.test.wins if s.test else 0,
             "threshold": f.threshold if f else None,
             "holding_hours": _stat.fmean(f.holding_hours) if f and f.holding_hours else 0.0,
             "cycle_hours": s.cycle_hours, "occupancy": s.occupancy,
