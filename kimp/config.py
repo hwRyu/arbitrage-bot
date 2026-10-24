@@ -264,7 +264,7 @@ class Settings:
 
     # ★ 강제청산 가드 — 남은 상승폭이 이 % 안으로 오면 (= 청산가의 90% 지점) 봇이 스스로 판단한다.
     #   거래소가 주는 강제청산가 기준 (봇 계산값은 거래소보다 늦게 잡힌다: IRYS 12.8% 경고 때 실제는 6.3%).
-    #     목표까지 ≤ liq_guard_near_target_percent (%p)  → 증거금 추가 (곧 익절이니 들고 간다)
+    #     목표까지 ≤ liq_guard_near_target_percent (%p)  → 증거금 추가 (목표 1% 면 절반 넘게 와 있으면 들고 간다)
     #     순손익 ≤ liq_guard_hold_below_percent (%)       → 증거금 추가 (역프가 깊다 = 지금 정리하면 손실 확정.
     #                                                      급등 때 역프는 수 분 만에 돌아온다 — IRYS 2026-10-24)
     #     그 외                                            → 정리 (사유 LIQ_GUARD). 1배 헷지라 청산당하는 것과
@@ -276,7 +276,7 @@ class Settings:
     #   왜 교차 마진이 아닌가: 격리는 코인 하나의 손실 상한이 증거금이다. IRYS 가 하루에 21배 갈 때 교차였다면
     #   20 USDT 포지션이 계좌 400 USDT 를 끌어다 쓰며 다른 포지션까지 위험해진다. 헷지에서 청산은 거의 본전이다.
     liq_guard_percent: float = 10.0
-    liq_guard_near_target_percent: float = 0.3
+    liq_guard_near_target_percent: float = 0.5
     liq_guard_hold_below_percent: float = -2.0
     margin_topup_max_rounds: int = 2
 
