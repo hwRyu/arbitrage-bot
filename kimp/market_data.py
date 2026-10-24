@@ -201,8 +201,8 @@ class MarketData:
                 if fb is None:
                     missing.append(coin)
                     continue
-                quotes[coin] = Quote(coin=coin, upbit=fb.upbit, bybit=fb.bybit, usdt=fb.usdt, fx_krw=fx_krw,
-                                     skew_ms=fb.skew_ms)
+                # skew 0: 소켓 호가는 세 장 모두 '지금' 유효하다 (조용한 코인은 마지막 변경이 오래됐을 뿐 어긋난 게 아니다)
+                quotes[coin] = Quote(coin=coin, upbit=fb.upbit, bybit=fb.bybit, usdt=fb.usdt, fx_krw=fx_krw, skew_ms=0)
             if missing:
                 _log_repeat("ws-missing", logging.WARNING,
                             f"[웹소켓 호가 없음·묵음] {', '.join(missing)} → 이 코인은 REST 로 받습니다")

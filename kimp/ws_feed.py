@@ -45,6 +45,10 @@ Key = Tuple[str, str]   # (거래소 이름, 심볼). 예) ("upbit", "MINA/KRW")
 
 RETRY_BACKOFF_MAX_SEC = 10.0   # 소켓 예외 뒤 다시 붙기까지 최대 대기 (1초에서 두 배씩)
 SYMBOL_SILENT_MAX_SEC = 60.0   # 심볼 하나가 이보다 오래 아무것도 안 오면 (연결은 살아 있어도) 의심 → REST 로
+# 시작 뒤 이 시간 안의 끊김은 조용히 다시 붙는다 (경고 안 함). 업비트는 ccxt 가 심볼을 하나 더 구독할 때마다 연결을
+# 닫고 새로 여는데(원격 종료 코드 1000), 코인 6개면 시작 3초 동안 그게 열두 번쯤 찍힌다 — 실거래면 전부 텔레그램으로
+# 간다. 이 시간이 지나도 끊기면 진짜 문제라 경고한다. (업비트 묶음 구독은 ccxt 가 아직 지원하지 않는다)
+WARMUP_SEC = 10.0
 
 
 @dataclass(frozen=True)
@@ -206,6 +210,10 @@ class WsFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if self._clock() - (self._started_at or 0.0) < WARMUP_SEC:
+                    logger.debug("[웹소켓 호가] 시작 중 재접속 %s %s: %s", key[0], symbol, exc)
+                    await asyncio.sleep(0.5)
+                    continue
                 _log_repeat(log_key, logging.WARNING,
                             f"[웹소켓 호가 끊김] {key[0]} {symbol} | {exc} | 다시 붙는 중 (그동안 REST 로 받습니다)")
                 await asyncio.sleep(backoff)

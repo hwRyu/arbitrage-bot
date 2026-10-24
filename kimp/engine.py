@@ -249,8 +249,9 @@ class Engine:
         self._step_started = time.monotonic()
         # 환율은 테더 프리미엄·사이트식 김프를 보여주는 데만 쓴다. 없으면 그 칸만 빈다
         fx_krw = self.fx.get() if self.fx else None
+        t_quote = time.monotonic()
         quotes = self.market.fetch_quotes(self.coins, fx_krw)
-        self._quote_ms = (time.monotonic() - self._step_started) * 1000
+        self._quote_ms = (time.monotonic() - t_quote) * 1000   # 시세 조회만 (환율 조회는 빼고)
         if not quotes:
             return
 

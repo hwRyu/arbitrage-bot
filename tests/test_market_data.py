@@ -114,7 +114,7 @@ class FeedFirstTest(unittest.TestCase):
         m.feed = FakeFeed("XRP")
         quotes = m.fetch_quotes(["XRP", "SOL"], fx_krw=1320.0)
         self.assertEqual(quotes["XRP"].upbit.bids[0][0], 999.0)       # 소켓 값
-        self.assertEqual(quotes["XRP"].skew_ms, 12)
+        self.assertEqual(quotes["XRP"].skew_ms, 0)                   # 소켓 호가는 어긋남 0 으로 본다
         self.assertEqual(quotes["SOL"].upbit.bids[0][0], 1386.0)      # REST 가짜 값
         calls = sum(b.calls for b in list(m._bybit_pool.queue))
         self.assertEqual(calls, 1)                                    # 바이비트 REST 는 SOL 한 번만
