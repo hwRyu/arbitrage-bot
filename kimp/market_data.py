@@ -32,12 +32,14 @@ logger = logging.getLogger(__name__)
 REPEAT_COOLDOWN_SEC = 300.0
 _fail_since: Dict[str, float] = {}   # 키 → 처음 실패한 시각 (monotonic)
 _last_told: Dict[str, float] = {}    # 키 → 마지막으로 알린 시각
+_fail_level: Dict[str, int] = {}     # 키 → 실패를 알린 레벨 (복구도 같은 레벨로 — INFO 로 알린 건 INFO 로 복구)
 
 
 def _log_repeat(key: str, level: int, message: str) -> None:
     """되풀이되는 조회 실패를 REPEAT_COOLDOWN_SEC 에 한 번만 알린다"""
     now = time.monotonic()
     _fail_since.setdefault(key, now)
+    _fail_level[key] = level
     if now - _last_told.get(key, -1e18) >= REPEAT_COOLDOWN_SEC:
         _last_told[key] = now
         logger.log(level, message)
@@ -49,8 +51,9 @@ def _log_recovered(key: str, what: str) -> None:
     """막혔던 조회가 다시 되면 얼마나 막혔었는지 한 번 알린다 (알렸던 적이 있을 때만)"""
     since = _fail_since.pop(key, None)
     _last_told.pop(key, None)
+    level = _fail_level.pop(key, logging.WARNING)
     if since is not None:
-        logger.warning("[%s 복구] %.0f초 동안 안 됐음", what, time.monotonic() - since)
+        logger.log(level, "[%s 복구] %.0f초 동안 안 됐음", what, time.monotonic() - since)
 
 
 # 업비트 USDT/KRW: 김프 계산 기준이자, 진입/청산 때 실제로 USDT 를 사고파는 마켓
@@ -204,7 +207,8 @@ class MarketData:
                 # skew 0: 소켓 호가는 세 장 모두 '지금' 유효하다 (조용한 코인은 마지막 변경이 오래됐을 뿐 어긋난 게 아니다)
                 quotes[coin] = Quote(coin=coin, upbit=fb.upbit, bybit=fb.bybit, usdt=fb.usdt, fx_krw=fx_krw, skew_ms=0)
             if missing:
-                _log_repeat("ws-missing", logging.WARNING,
+                # INFO: 소켓이 끊긴 게 아니라(그건 ws_feed 가 경고) 조용한 코인을 REST 로 받는 것뿐 — 텔레그램까진 안 간다
+                _log_repeat("ws-missing", logging.INFO,
                             f"[웹소켓 호가 없음·묵음] {', '.join(missing)} → 이 코인은 REST 로 받습니다")
             else:
                 _log_recovered("ws-missing", "웹소켓 호가")
