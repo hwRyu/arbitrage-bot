@@ -11,9 +11,11 @@
 이 모듈이 하는 일 / 안 하는 일
     - 한다: 심볼마다 최신 호가창(OrderBook)과 받은 시각을 들고 있는다. books(coin) 으로 세 장(코인·바이비트·USDT)을
       준다 — 셋 다 있고 "신선" 할 때만. 아니면 None.
-      신선 = 그 거래소 연결이 살아 있다 (그 거래소에서 max_age_ms 안에 뭔가 왔다) + 그 심볼 호가가 SYMBOL_SILENT_MAX_SEC
-      안에 온 적 있다. 심볼 하나가 한동안 조용한 건 "호가가 안 바뀜" 이지 묵은 게 아니다 — 거래소는 바뀔 때만 보낸다
-      (실측: 조용한 코인은 수 초씩 안 온다). 연결 생존은 USDT/KRW(초당 ~2회)·활발한 코인이 알려 준다.
+      신선 = 그 거래소 연결이 살아 있다 + 그 심볼 호가가 SYMBOL_SILENT_MAX_SEC 안에 온 적 있다.
+      연결이 죽은 건 두 가지로 안다: ① 소켓이 예외를 던지면 즉시 (그 거래소 전체를 죽음으로 표시, 다음 메시지가 오면
+      산 것), ② 예외 없이 max_age_ms 동안 아무것도 안 오면 (조용히 매달린 연결). 심볼 하나가 한동안 조용한 건 "호가가
+      안 바뀜" 이지 묵은 게 아니다 — 거래소는 바뀔 때만 보낸다 (실측: 조용한 코인은 수 초씩 안 온다). 거래소 전체가
+      1~2초 조용한 것도 한가한 장에선 생기므로 ② 는 몇 초 단위로 둔다 (기본 5초).
     - 안 한다: 김프 계산, Quote 조립, 매매 판단. 그건 MarketData.fetch_quotes 가 한다 — 여기 books() 를 먼저 보고
       없거나 묵은 코인만 REST 로 받는다. 그래서 엔진·브로커는 시세가 어디서 왔는지 모른다.
     - 주문은 그대로 REST (live_executor). 소켓 주문은 쓰지 않는다.
@@ -152,6 +154,11 @@ class WsFeed:
     # ------------------------------------------------------------------
     # 내부: 받기 (소켓 스레드)
     # ------------------------------------------------------------------
+    def _mark_dead(self, exchange: str) -> None:
+        """소켓이 예외를 던졌다 → 그 거래소 호가는 다음 메시지가 올 때까지 안 쓴다 (books() 가 None)"""
+        with self._lock:
+            self._last_any[exchange] = float("-inf")
+
     def _store(self, key: Key, book: OrderBook) -> None:
         """호가창 한 장 갱신 (테스트에서는 소켓 없이 이걸로 넣는다)"""
         now = self._clock()
@@ -210,6 +217,7 @@ class WsFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._mark_dead(key[0])
                 if self._clock() - (self._started_at or 0.0) < WARMUP_SEC:
                     logger.debug("[웹소켓 호가] 시작 중 재접속 %s %s: %s", key[0], symbol, exc)
                     await asyncio.sleep(0.5)

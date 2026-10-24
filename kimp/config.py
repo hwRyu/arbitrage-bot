@@ -379,10 +379,11 @@ class Settings:
     # 시세를 어떻게 받나 (kimp/ws_feed.py)
     #   rest = 스캔마다 요청해서 받는다 (기본). 한 번에 ~190 ms, 10초에 한 번
     #   ws   = 웹소켓으로 밀어 받는다 (바이비트 초당 ~8회, 업비트 1~2회, 70~80 ms 뒤 도착). 판단 순간 손에 최신 판이
-    #          있어 요청 시간이 0 이고, SCAN_INTERVAL_SEC 를 줄이면 기회를 1초 아래로 본다. 호가가 없거나
-    #          quote_ws_max_age_ms 보다 묵은 코인은 그 스캔만 REST 로 → 소켓이 죽어도 봇은 선다. 주문은 늘 REST
+    #          있어 요청 시간이 0 이고, SCAN_INTERVAL_SEC 를 줄이면 기회를 1초 아래로 본다. 소켓이 끊기거나(예외)
+    #          그 거래소에서 quote_ws_max_age_ms 동안 아무것도 안 오면 그 코인들은 그 스캔만 REST 로 → 소켓이 죽어도
+    #          봇은 선다. 주문은 늘 REST
     quote_source: str = "rest"
-    quote_ws_max_age_ms: int = 1500
+    quote_ws_max_age_ms: int = 5000
 
     # ------------------------------------------------------------------
     # 달러 환율 (표시용. 사이트식 김프와 테더 프리미엄 보여주기, kimp/fx.py)

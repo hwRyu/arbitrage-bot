@@ -51,6 +51,16 @@ class WsFeedTest(unittest.TestCase):
         self.feed._store(("bybit", "CAP/USDT:USDT"), book(0.07))   # 바이비트에서 다른 코인이 와도 연결은 산 것
         self.assertIsNotNone(self.feed.books("MINA"))
 
+    def test_socket_error_marks_exchange_dead_until_next_message(self):
+        """소켓 예외 → 그 거래소 호가는 바로 안 쓴다 (묵을 때까지 기다리지 않는다). 다음 메시지가 오면 다시 산다"""
+        for key, p in ((("upbit", "MINA/KRW"), 91.4), (("bybit", "MINA/USDT:USDT"), 0.0682), (("upbit", "USDT/KRW"), 1340.0)):
+            self.feed._store(key, book(p))
+        self.assertIsNotNone(self.feed.books("MINA"))
+        self.feed._mark_dead("bybit")
+        self.assertIsNone(self.feed.books("MINA"))
+        self.feed._store(("bybit", "CAP/USDT:USDT"), book(0.07))   # 바이비트에서 뭔가 다시 옴
+        self.assertIsNotNone(self.feed.books("MINA"))
+
     def test_quiet_symbol_stays_valid_while_exchange_is_alive(self):
         """코인 호가가 한참 안 바뀌어도(거래소는 바뀔 때만 보낸다) 그 거래소에서 다른 게 계속 오면 유효하다"""
         self.feed._store(("upbit", "MINA/KRW"), book(91.4))
