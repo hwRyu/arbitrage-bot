@@ -32,7 +32,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from kimp.config import Settings
-from kimp.broker import EntryRejected, ExitValuation, HedgeBroker, InsufficientBalance
+from kimp.broker import EntryMissed, EntryRejected, ExitDeferred, ExitValuation, HedgeBroker, InsufficientBalance
 from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
 from kimp.market_data import MarketData
@@ -54,6 +54,9 @@ LOG_COOLDOWN_SEC = 60.0
 EVENT_STEP_MIN_GAP_SEC = 0.25
 # 포지션 평가값(순손익·청산 김프·여유)을 DB 에 적는 최소 간격 (초). 최고·최저가 바뀌면 간격과 무관하게 바로 적는다
 POSITION_WRITE_MIN_GAP_SEC = 1.0
+# 지정가 FOK 가 취소(놓침)된 뒤 같은 코인·포지션을 다시 시도하기까지 (초). 소켓 시세는 0.25초마다 판단하므로
+# 이게 없으면 호가가 비껴 있는 동안 초당 4번 주문·취소가 나가 업비트 요청 제한에 걸린다
+FOK_RETRY_SEC = 2.0
 
 # 강제청산 가드가 한 번에 넣는 증거금의 최소 (USDT). 이보다 작으면 넣어도 의미가 없다 → 정리로
 MIN_TOPUP_USDT = 0.5
@@ -120,6 +123,7 @@ class Engine:
         self._funding_8h_at: Dict[str, float] = {}    # 그 값을 받은 시각 (너무 자주 조회하지 않게)
         self._last_log: Dict[str, float] = {}
         self._reentry_allowed_at: Dict[str, float] = {}
+        self._tp_retry_at: Dict[int, float] = {}   # 익절 지정가가 놓친 포지션 → 이 시각까지 익절 판단 쉼
         self._last_status_log = 0.0
 
         # 사람이 지시한 강제 청산 요청 (텔레그램 /close). 다른 스레드에서 직접 청산하면
@@ -359,6 +363,8 @@ class Engine:
                 logger.warning("[펀딩비 한도] #%d %s | 펀딩비 지출 %.3f%% (한도 %.2f%%) | 순손익 지금 %+.2f%% | 정리합니다",
                                pos.id, pos.coin, cost, self.s.max_funding_cost_percent, pnl.net_percent)
                 reason = ExitReason.FUNDING_COST
+        if reason == ExitReason.TAKE_PROFIT and self._clock() < self._tp_retry_at.get(pos.id, 0.0):
+            reason = None   # 방금 익절 지정가가 놓침 → FOK_RETRY_SEC 지나고 다시
         if reason == ExitReason.TAKE_PROFIT:
             # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
             fresh = self._fresh_quote(pos.coin)
@@ -478,8 +484,15 @@ class Engine:
 
     def _close(self, session: Session, pos: Position, valuation: ExitValuation, reason: str,
                liquidated: bool = False) -> None:
-        """청산 실행 + 로그 + 재진입 대기 시작"""
-        final = self.broker.close_hedge(session, pos, valuation, reason, liquidated=liquidated)
+        """청산 실행 + 로그 + 재진입 대기 시작. 익절 지정가가 놓치면(ExitDeferred) 포지션은 그대로, 잠시 뒤 다시"""
+        try:
+            final = self.broker.close_hedge(session, pos, valuation, reason, liquidated=liquidated)
+        except ExitDeferred as exc:
+            self._tp_retry_at[pos.id] = self._clock() + FOK_RETRY_SEC
+            logger.info("[익절 보류] #%d %s | %s | %g초 뒤 다시 판단", pos.id, pos.coin, exc, FOK_RETRY_SEC)
+            telemetry.decision(session, pos.coin, "tp_miss", valuation.pnl.net_percent, 0.0, position_id=pos.id,
+                               note=str(exc), now=self._now_utc())
+            return
         self._reentry_allowed_at[pos.coin] = self._clock() + self.s.reentry_cooldown_sec
         if final is None:
             return  # 일부 단계 실패 → CLOSING 으로 남음, 다음 스캔에서 이어서 (broker.sync)
@@ -937,6 +950,13 @@ class Engine:
                     if self.broker.pending_transfers(session):
                         continue  # 실거래: 송금이 도착하면 다음 스캔에 다시 시도
                     pos = self.broker.open_hedge(session, quote, bybit_qty)
+            except EntryMissed as exc:
+                # 지정가가 비껴가 못 삼. 판 USDT 는 되샀고 숏은 없었다 → 잠시 뒤 다시 (호가가 돌아오면 그때)
+                self._reentry_allowed_at[coin] = self._clock() + FOK_RETRY_SEC
+                logger.info("[진입 놓침] %s | %s | %g초 뒤 다시", coin, exc, FOK_RETRY_SEC)
+                telemetry.decision(session, coin, "entry_miss", top, threshold, premium_depth=depth, size_usdt=size,
+                                   bybit_qty=bybit_qty, funding_8h=funding, note=str(exc), now=self._now_utc())
+                continue
             except EntryRejected as exc:
                 self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
                 telemetry.decision(session, coin, "rejected", top, threshold, premium_depth=depth, size_usdt=size,

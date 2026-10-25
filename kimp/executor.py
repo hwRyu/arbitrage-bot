@@ -205,6 +205,18 @@ class PaperExecutor:
         return LegFill(qty=est.filled_qty, avg_price=est.avg_price, cost=est.cost, fee=0.0,
                        order_id=f"paper-{next(self._ids)}", slippage_percent=est.slippage_percent)
 
+    @staticmethod
+    def _within_limit(levels, limit_price: float, side: str):
+        """지정가 안쪽 호가만 — FOK 는 이 범위의 물량으로 전량 채워져야 체결, 아니면 주문 전체가 취소"""
+        if side == "buy":
+            return [lv for lv in levels if lv[0] <= limit_price]
+        return [lv for lv in levels if lv[0] >= limit_price]
+
+    @staticmethod
+    def _nothing() -> LegFill:
+        """FOK 미체결 = 취소, 아무 일도 안 일어남 (브로커는 qty 0 을 '놓침' 으로 본다)"""
+        return LegFill(qty=0.0, avg_price=0.0, cost=0.0, fee=0.0, order_id="paper-fok-miss")
+
     def _done(self, cid: str, f: LegFill) -> LegFill:
         """추적번호로 결과를 기억해 둔다 (lookup 으로 되찾기 위해)"""
         self._by_cid[cid] = f
@@ -281,19 +293,37 @@ class PaperExecutor:
         return self._done(client_id, LegFill(f.qty, f.avg_price, f.cost, fee, f.order_id, f.slippage_percent))
 
     def buy_coin_with_krw(self, session: Session, quote: Quote, coin: str, krw: float,
-                          client_id: str = "") -> LegFill:
-        """진입 2단계: 원화로 코인 사기 (원화 −= 금액 + 수수료). 금액 지정 주문이다"""
+                          client_id: str = "", limit_price: Optional[float] = None) -> LegFill:
+        """
+        진입 2단계: 원화로 코인 사기 (원화 −= 금액 + 수수료). 금액 지정 주문이다
+
+        limit_price 가 있으면 지정가 FOK: 그 가격 이하 호가로 전량 채워지면 체결, 아니면 체결 0 (취소).
+        실거래와 같은 규칙 — 판단가보다 비싼 줄은 안 먹는다.
+        """
         ratio = self._check_fail("buy_coin_with_krw")
-        f = self._leg(estimate_fill_by_cost(quote.upbit.asks, krw * ratio), "업비트 코인 매수")
+        if limit_price is not None:
+            est = estimate_fill_by_cost(self._within_limit(quote.upbit.asks, limit_price, "buy"), krw * ratio)
+            if est is None or not est.is_complete:
+                return self._done(client_id, self._nothing())
+            f = self._leg(est, "업비트 코인 매수")
+        else:
+            f = self._leg(estimate_fill_by_cost(quote.upbit.asks, krw * ratio), "업비트 코인 매수")
         fee = f.cost * self.fees.upbit_trade_rate(coin)
         self._add(session, UPBIT_KRW, -(f.cost + fee))
         self._add(session, coin_key(coin), f.qty)
         return self._done(client_id, LegFill(f.qty, f.avg_price, f.cost, fee, f.order_id, f.slippage_percent))
 
-    def sell_coin(self, session: Session, quote: Quote, coin: str, qty: float, client_id: str = "") -> LegFill:
-        """청산 1단계: 코인을 팔아 원화 만들기"""
+    def sell_coin(self, session: Session, quote: Quote, coin: str, qty: float, client_id: str = "",
+                  limit_price: Optional[float] = None) -> LegFill:
+        """청산 1단계: 코인을 팔아 원화 만들기. limit_price 가 있으면 지정가 FOK (그 가격 이상 호가로 전량, 아니면 0)"""
         ratio = self._check_fail("sell_coin")
-        f = self._leg(estimate_fill(quote.upbit.bids, qty * ratio), "업비트 코인 매도")
+        if limit_price is not None:
+            est = estimate_fill(self._within_limit(quote.upbit.bids, limit_price, "sell"), qty * ratio)
+            if est is None or not est.is_complete:
+                return self._done(client_id, self._nothing())
+            f = self._leg(est, "업비트 코인 매도")
+        else:
+            f = self._leg(estimate_fill(quote.upbit.bids, qty * ratio), "업비트 코인 매도")
         fee = f.cost * self.fees.upbit_trade_rate(coin)
         self._add(session, coin_key(coin), -f.qty)
         self._add(session, UPBIT_KRW, f.cost - fee)

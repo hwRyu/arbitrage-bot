@@ -6,17 +6,21 @@
 진입 (세 단계, 페이퍼도 실거래도 이 순서)
 ------------------------------------------------------------------
   0) 계산만 먼저: 그 순간 호가로 체결 계산(EntryPlan) → 호가 충분? 너무 밀리지 않나? 양쪽 돈 충분?
-  1) 바이비트 숏 bybit_qty 개              → 실제 숏 금액 N USDT
-  2) 업비트 USDT N 개 매도                  → 원화 (수수료 빼고)
-  3) 그 원화 ÷ (1 + 수수료율) 로 코인 매수   (살 때 수수료는 원화에서 따로 빠짐)
+  1) 업비트 USDT N 개 매도 (N = 계획한 숏 금액)  → 원화 (수수료 빼고). USDT 호가는 깊어서 밀림 0
+  2) 그 원화 ÷ (1 + 수수료율) 로 코인 매수      (살 때 수수료는 원화에서 따로 빠짐)
+       UPBIT_COIN_ORDER_TYPE=fok 면 판단한 가격에 지정가 '전량 즉시 체결 아니면 취소'.
+       취소(놓침)면 숏이 아직 없으니 판 USDT 만 되사고 끝 (ABORTED / ENTRY_MISSED, 비용 ≈ USDT 왕복 수수료)
+  3) 바이비트 숏: 실제로 산 코인 개수만큼       → 산 만큼만 숏을 쳐서 크기 맞추기가 거의 필요 없다
   포지션은 0) 다음 OPENING 으로 먼저 저장하고, 단계마다 체결(Fill)을 바로 저장한다.
   → 중간에 프로그램이 꺼져도 어디까지 했는지 남아 있다.
+  (2026-10-26 까지는 숏 → USDT → 코인 순서였다. 코인 매수가 맨 뒤라 숏과 0.75초 벌어졌고, 코인을 못 사면 숏까지
+   되돌려야 했다. 지정가로 바꾸며 코인을 먼저 사고 그 개수로 숏을 치는 순서로 — 두 가격 다리 사이가 0.2초로 준다)
 
   4) 양쪽 크기 맞추기: 부분 체결로 금액이 1% 넘게 다르면 큰 쪽을 줄인다 (비용은 이 포지션 진입 비용으로)
 
   중간 실패 → 끝난 단계를 거꾸로 되돌린다 (ABORTED)
-    2) 실패: 숏 닫기
-    3) 실패: 받은 원화로 USDT 되사기 + 숏 닫기
+    2) 실패: 받은 원화로 USDT 되사기
+    3) 실패: 코인 팔기 + 받은 원화로 USDT 되사기
   되돌리기도 실패 → ERROR (사람이 거래소에서 정리, 신규 진입 중단, 긴급 알림)
 
 주문마다 추적번호 (레그 리스크 대비)
@@ -27,6 +31,8 @@
 청산 (세 단계)
 ------------------------------------------------------------------
   1) 업비트 코인 매도 → 2) 받은 원화로 USDT 매수 → 3) 바이비트 숏 닫기 (강제청산이면 3 대신 '강제청산됨' 기록)
+  익절 + UPBIT_COIN_ORDER_TYPE=fok: 1) 을 판단가 지정가 FOK 로 먼저 낸다. 전량 체결 안 되면 포지션을 OPEN 으로
+  되돌리고 ExitDeferred (엔진이 잠시 뒤 다시 판단). 손절·강제청산·수동 청산은 시장가 그대로.
   CLOSING 으로 바꾸고 시작. 단계마다 '목표 양에 닿을 때까지' 남은 양만 다시 주문 (일부 체결 대비, 최대 3번).
   그래도 남거나 실패하면 CLOSING 그대로 두고, 다음 스캔(sync)에서 남은 양만 이어서.
   손익은 '실제 체결값' 으로 계산한다 (kimp/pnl.compute_pnl).
@@ -87,7 +93,7 @@ from kimp.executor import (
     new_client_id,
 )
 from kimp.pnl import EntryLegs, ExitLegs, PnLBreakdown, compute_pnl, liquidation_price, liquidation_price_from_margin
-from kimp.premium import ExitPlan, Quote, premium_percent
+from kimp.premium import ExitPlan, Quote, premium_percent, upbit_limit_price
 from kimp.safety import Safety, kst_midnight_utc
 
 # 송금 금액 소수점 자리수 상한. 거래소마다 다르다 — 둘 중 작은 쪽에 맞춘다
@@ -124,6 +130,14 @@ logger = logging.getLogger(__name__)
 
 class EntryRejected(Exception):
     """진입 못 함 (호가 부족, 잔고 부족, 너무 많이 밀림, 주문 실패 후 되돌림 등)"""
+
+
+class EntryMissed(EntryRejected):
+    """지정가(FOK) 코인 매수가 전량 체결되지 않아 진입을 접음. 판 USDT 는 되삼 (비용은 USDT 왕복 수수료 정도)"""
+
+
+class ExitDeferred(Exception):
+    """익절 지정가(FOK) 매도가 체결되지 않아 이번에는 청산하지 않음. 포지션은 OPEN 그대로, 엔진이 잠시 뒤 다시 판단"""
 
 
 class InsufficientBalance(EntryRejected):
@@ -224,11 +238,13 @@ class HedgeBroker:
                  mmr: float = 0.005, now_fn: Callable[[], datetime] = utcnow, safety: Optional[Safety] = None,
                  auto_transfer: Optional[bool] = None, network: str = "PAPER", transfer_min_usdt: float = 0.0,
                  transfer_max_usdt_per_day: Optional[float] = None, transfer_alert_minutes: float = 60.0,
-                 reconcile_interval_sec: float = 600.0, hedge_tolerance_percent: float = 1.0):
+                 reconcile_interval_sec: float = 600.0, hedge_tolerance_percent: float = 1.0,
+                 coin_order_type: str = "market"):
         """
         Args:
             executor: 실행기 (PaperExecutor / DryRunExecutor / LiveExecutor)
             max_slippage_percent: 진입할 때 맨 앞 호가보다 이 % 이상 밀리면 진입 안 함
+            coin_order_type: 업비트 코인 주문 방식 'market'(시장가) / 'fok'(판단가 지정가, 전량 즉시 체결 아니면 취소)
             leverage / mmr: 바이비트 레버리지, 유지증거금률 (증거금·강제청산 가격 계산)
             now_fn: 시각 (시뮬레이션은 과거 시각)
             safety: 안전장치 (없으면 막지 않음)
@@ -248,6 +264,7 @@ class HedgeBroker:
         self.transfer_alert_minutes = transfer_alert_minutes
         self.reconcile_interval_sec = reconcile_interval_sec
         self.hedge_tolerance_percent = hedge_tolerance_percent
+        self.coin_order_type = coin_order_type
         self._last_reconcile = -1e18
         self._last_repeat: Dict[str, float] = {}   # 반복 알림 억제용 {키: 마지막으로 알린 시각}
 
@@ -478,12 +495,44 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     # 진입
     # ------------------------------------------------------------------
+    def _coin_limit(self, price: Optional[float], side: str) -> Optional[float]:
+        """
+        업비트 코인 주문에 쓸 지정가. market 모드면 None (= 시장가)
+
+        판단 때 호가 소진 계산으로 나온 평균가를 호가 단위에 맞춘다 — 살 때 내림, 팔 때 올림 (판단보다 나쁘게 안 되게).
+        예) 매수 판단 140.0원 → 140원 / 매도 판단 93.47원 → 93.5원
+        """
+        if self.coin_order_type != "fok" or not price:
+            return None
+        return upbit_limit_price(price, side)
+
+    def _abort_missed_entry(self, session: Session, pos: Position, quote: Optional[Quote], limit: float) -> None:
+        """
+        지정가 코인 매수가 전량 체결되지 않음(놓침): 숏은 아직 없으니 판 USDT 만 되산다 → ABORTED / ENTRY_MISSED
+
+        비용 = 되산 USDT − 판 USDT (USDT 왕복 수수료 0.1% + USDT 호가 한 칸 정도, 20 USDT 면 약 0.03 USDT).
+        되사는 주문의 결과를 모르면 OPENING 으로 두고 다음 스캔 sync 가 추적번호로 채운 뒤 되돌리기를 이어서 한다.
+        """
+        try:
+            self._return_leftover_krw(session, pos, quote)
+        except OrderUnknown as exc:
+            self._order_unknown(session, pos, exc)
+            raise EntryRejected(f"진입 놓침 뒤 USDT 되사기 결과 모름 → 다음 스캔에 조회: {exc}") from exc
+        sums = self._sums(session, pos)
+        net = sums.get("trim_buy_usdt", LegSum()).qty - sums["sell_usdt"].qty
+        pos.status, pos.closed_at, pos.exit_reason = PositionStatus.ABORTED, self._now(), "ENTRY_MISSED"
+        pos.net_pnl_usdt = net
+        session.commit()
+        logger.info("[진입 놓침] #%d %s | 지정가 %g원에 전량 체결 안 됨 (호가가 비껴감) → 판 USDT 되삼 | 비용 %+.4f USDT",
+                    pos.id, pos.coin, limit, net)
+
     def open_hedge(self, session: Session, quote: Quote, bybit_qty: float) -> Position:
         """
         진입 (파일 맨 위 설명 순서) → 양쪽 크기 맞추기 → OPEN
 
         Raises:
             InsufficientBalance: 한쪽 USDT 가 모자람 (아무 주문도 안 냄)
+            EntryMissed: fok 모드에서 코인 매수가 전량 체결 안 됨 → 판 USDT 되삼 (ABORTED / ENTRY_MISSED)
             EntryRejected: 호가 부족 / 너무 밀림 (아무 주문도 안 냄), 주문 실패 후 되돌림 (ABORTED),
                            주문 결과 모름 (OPENING 으로 남고 다음 스캔에 이어서)
         """
@@ -526,20 +575,24 @@ class HedgeBroker:
         session.commit()
 
         coin, ex = quote.coin, self.ex
+        limit = self._coin_limit(plan.upbit.avg_price, "buy")   # fok 면 판단가 (호가 단위 내림), market 이면 None
         try:
-            # 1)+2) 숏 열기와 USDT 매도는 서로 독립 → 동시에 낸다 (실거래). USDT 는 계획한 숏 금액만큼 팔고,
-            #       실제 숏 체결이 그와 다르면 4) 크기 맞추기가 잡는다 (1% 안쪽 차이는 그대로 둔다)
-            fills = self._legs_parallel(session, pos, [
-                ("open_short", lambda cid: ex.open_short(session, quote, coin, bybit_qty, client_id=cid),
-                 plan.bybit.avg_price),
-                ("sell_usdt", lambda cid: ex.sell_usdt(session, quote, plan.usdt_sold, client_id=cid),
-                 plan.usdt.avg_price),
-            ])
-            usdt = fills["sell_usdt"]
-            krw_for_coin = (usdt.cost - usdt.fee) / (1 + rate)  # 3)
-            self._leg(session, pos, "buy",
-                      lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid),
-                      expected_price=plan.upbit.avg_price)
+            # 1) USDT 매도 (호가가 깊어 밀림 0) → 2) 그 원화로 코인 매수 → 3) 실제로 산 개수만큼 숏.
+            #    코인이 먼저라 가격이 정해지는 두 다리(코인·숏) 사이가 0.2초 안팎이고, 코인을 못 사면 되돌릴 게 USDT 뿐이다.
+            usdt = self._leg(session, pos, "sell_usdt",
+                             lambda cid: ex.sell_usdt(session, quote, plan.usdt_sold, client_id=cid),
+                             expected_price=plan.usdt.avg_price)
+            krw_for_coin = (usdt.cost - usdt.fee) / (1 + rate)  # 2)
+            bought = self._leg(session, pos, "buy",
+                               lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid,
+                                                                limit_price=limit),
+                               expected_price=plan.upbit.avg_price)
+            if bought.qty <= 0:   # 지정가 FOK 취소 (시장가는 체결 0 이면 OrderFailed 로 아래 되돌리기 경로)
+                self._abort_missed_entry(session, pos, quote, limit or 0.0)
+                raise EntryMissed(f"지정가 {limit:g}원에 전량 체결 안 됨 → 판 USDT 되삼")
+            self._leg(session, pos, "open_short",   # 3) 산 만큼 숏 (거래소 주문 단위로 맞춰진다)
+                      lambda cid: ex.open_short(session, quote, coin, bought.qty, client_id=cid),
+                      expected_price=plan.bybit.avg_price)
         except OrderUnknown as exc:
             self._order_unknown(session, pos, exc)
             raise EntryRejected(f"주문 결과 모름 → 다음 스캔에 조회: {exc}") from exc
@@ -571,50 +624,44 @@ class HedgeBroker:
 
     def _balance_hedge(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
         """
-        진입 뒤 양쪽 금액 맞추기 (부분 체결 대비)
+        양쪽 크기 맞추기 (진입 직후): 코인 개수와 숏 개수가 HEDGE_TOLERANCE_PERCENT(1%) 넘게 다르면 큰 쪽을 줄인다
 
-        업비트 코인 값(USDT) = 코인 개수 × 업비트 매수 호가 ÷ USDT 가격
-        바이비트 숏 금액     = 숏 개수 × 바이비트 가격
-        차이가 HEDGE_TOLERANCE_PERCENT(1%) 보다 크면 큰 쪽을 줄인다
-          - 숏이 크면: 남는 만큼 숏 닫기 (trim_short)
-          - 코인이 많으면: 남는 코인 팔기 (trim_coin) → 남은 원화는 _return_leftover_krw 가 USDT 로
+        **개수**로 비교한다 (금액이 아니라). 헷지는 '코인 N개 ↔ 숏 N개' 라야 가격이 어디로 가든 손익이 0 이다.
+        금액으로 비교하면 김프 −1% 로 진입한 정상 헷지도 1% 어긋난 것으로 보인다 (업비트 쪽이 1% 싸니까).
+          - 숏이 많으면: 남는 숏 닫기 (trim_short) — 숏이 부분 체결보다 많이 들어갈 일은 거의 없지만 주문 단위 반올림용
+          - 코인이 많으면: 남는 코인 팔기 (trim_coin) — 숏이 일부만 체결됐을 때. 남은 원화는 _return_leftover_krw 가 USDT 로
         맞추는 비용은 이 포지션 진입 비용에 들어간다 (_finish_entry). 실패하면 그대로 두고 긴급 알림.
-        예) 숏 100 USDT, 코인 80 USDT 어치 → 숏 20 USDT 닫기 (수수료 0.011 + 호가 간격 ≈ 0.02 USDT)
+        예) 코인 50개 샀는데 숏이 40개만 체결 → 코인 10개 팔기 (수수료 0.05% + 호가 한 칸)
+        보통은 숏을 '산 코인 개수' 로 치니 여기 올 일이 거의 없다 (2026-10-26 순서 변경 전에는 숏이 먼저라 늘 0.2% 쯤 달랐다)
         """
-        if quote is None:
-            return
-        rate = self.fees.upbit_trade_rate(pos.coin)
         sums = self._sums(session, pos)
         o = sums["open_short"]
         short_qty = o.qty - sums.get("trim_short", LegSum()).qty
         coin_qty = sums["buy"].qty - sums.get("trim_coin", LegSum()).qty
-        px, coin_bid, usdt_px = quote.bybit.mid or o.avg, quote.upbit.best_bid, quote.usdt_krw
-        if not (px and coin_bid and usdt_px):
+        if short_qty <= 0:
             return
-        short_usdt = short_qty * px
-        coin_usdt = coin_qty * coin_bid / usdt_px
-        diff = short_usdt - coin_usdt
-        if abs(diff) <= short_usdt * self.hedge_tolerance_percent / 100:
+        diff = short_qty - coin_qty
+        if abs(diff) <= short_qty * self.hedge_tolerance_percent / 100:
             return
-        logger.warning("[크기 맞추기] #%d %s | 차이 %.2f%% (숏 %.2f / 코인 %.2f USDT) | 큰 쪽을 줄입니다",
-                       pos.id, pos.coin, abs(diff) / short_usdt * 100, short_usdt, coin_usdt)
+        logger.warning("[크기 맞추기] #%d %s | 코인 %g개 / 숏 %g개 (차이 %.2f%%) | 큰 쪽을 줄입니다",
+                       pos.id, pos.coin, coin_qty, short_qty, abs(diff) / short_qty * 100)
         try:
             if diff > 0:
-                qty = diff / px
                 self._leg(session, pos, "trim_short", lambda cid: self.ex.close_short(
-                    session, quote, pos.coin, qty, o.avg, qty * o.avg / self.leverage, client_id=cid))
+                    session, quote, pos.coin, diff, o.avg, diff * o.avg / self.leverage, client_id=cid))
             else:
-                qty = -diff * usdt_px / coin_bid
-                if qty * coin_bid < self.ex.min_order_krw(pos.coin):
-                    return  # 업비트 최소 주문보다 작아서 못 팖 (그대로 둠)
+                qty = -diff
+                coin_bid = quote.upbit.best_bid if quote else None
+                if coin_bid is None or qty * coin_bid < self.ex.min_order_krw(pos.coin):
+                    return  # 업비트 최소 주문보다 작아서 못 팖 (그대로 둠) / 시세가 없어 금액을 모름
                 self._leg(session, pos, "trim_coin",
                           lambda cid: self.ex.sell_coin(session, quote, pos.coin, qty, client_id=cid))
         except OrderUnknown:
             raise  # 결과를 모르면 추측하지 않는다 → 부르는 쪽이 OPENING 으로 두고 다음 스캔에 조회
         except OrderFailed as exc:
             self.safety.record_failure(f"{pos.coin} 크기 맞추기: {exc}")
-            logger.critical("[크기 맞추기 실패] #%d %s | 차이 %.2f USDT 그대로 관리 (청산은 정상) | %s",
-                            pos.id, pos.coin, diff, exc)
+            logger.critical("[크기 맞추기 실패] #%d %s | 코인 %g개 / 숏 %g개 그대로 OPEN | %s", pos.id, pos.coin,
+                            coin_qty, short_qty, exc)
 
     def _return_leftover_krw(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
         """
@@ -805,7 +852,19 @@ class HedgeBroker:
         exp_usdt = plan.usdt.avg_price if plan else None
         exp_short = plan.bybit.avg_price if plan else None
         done = False
+        # 익절 + fok: 코인 매도를 판단가 지정가 FOK 로 먼저 낸다 (아직 아무것도 안 판 상태에서만).
+        # 전량 체결 안 되면 포지션을 OPEN 으로 되돌리고 ExitDeferred — 다른 다리는 손대지 않았으니 되돌릴 게 없다.
+        # sync 로 이어서 하는 청산(plan 없음)·손절·강제청산·수동 청산은 아래 시장가 경로 그대로.
+        limit = self._coin_limit(exp_sell, "sell") if pos.exit_reason == ExitReason.TAKE_PROFIT else None
         try:
+            if limit is not None and not s("sell", self._sums(session, pos)).qty:
+                left = min(pos.upbit_qty, self.balance(session, coin_key(pos.coin)))
+                sold = self._leg(session, pos, "sell", lambda cid: self.ex.sell_coin(
+                    session, quote, pos.coin, left, client_id=cid, limit_price=limit), expected_price=exp_sell)
+                if sold.qty <= 0:
+                    pos.status, pos.exit_reason = PositionStatus.OPEN, None
+                    session.commit()
+                    raise ExitDeferred(f"익절 지정가 {limit:g}원에 전량 체결 안 됨 (호가가 비껴감)")
             for _ in range(MAX_LEG_RETRIES):
                 sums = self._sums(session, pos)
                 left = pos.upbit_qty - s("sell", sums).qty
@@ -1180,7 +1239,8 @@ def broker_kwargs(settings, safety: Optional[Safety] = None) -> dict:
                 transfer_max_usdt_per_day=settings.transfer_max_usdt_per_day,
                 transfer_alert_minutes=settings.transfer_alert_minutes,
                 reconcile_interval_sec=settings.reconcile_interval_sec,
-                hedge_tolerance_percent=settings.hedge_tolerance_percent)
+                hedge_tolerance_percent=settings.hedge_tolerance_percent,
+                coin_order_type=settings.upbit_coin_order_type)
 
 
 class PaperBroker(HedgeBroker):

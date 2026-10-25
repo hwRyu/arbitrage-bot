@@ -300,7 +300,8 @@ class EngineTest(unittest.TestCase):
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
         [pos] = self._positions()
-        self.assertEqual(pos.bybit_qty, 500.0)
+        self.assertAlmostEqual(pos.bybit_qty, pos.upbit_qty, places=6)   # 숏 = 실제로 산 코인 개수 (1:1 헷지)
+        self.assertGreater(pos.bybit_qty, 500.0)                           # 김프 -1% 라 500 USDT 어치가 500개보다 많다
 
         self.market.quotes = {"XRP": make_quote(0.2)}  # 1.2%p 올랐지만 비용 빼면 1% 안 됨
         self.engine.step()
@@ -423,7 +424,8 @@ class EngineTest(unittest.TestCase):
         self.engine.step()
         with self.sf() as s:
             self.assertEqual(s.query(FundingEvent).count(), 1)
-            self.assertAlmostEqual(s.query(Position).one().funding_usdt, 500 * 1.0 * 0.0001, delta=1e-4)
+            pos = s.query(Position).one()
+            self.assertAlmostEqual(pos.funding_usdt, pos.bybit_qty * 1.0 * 0.0001, delta=1e-4)   # 숏 개수 × 가격 × 비율
 
     def test_snapshot_has_bot_and_site_premium(self):
         """김프 기록에 봇 김프(코인 몫)와 사이트식 김프·테더 프리미엄이 같이 남는다"""
@@ -490,7 +492,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """가드 구간인데 목표(1%)까지 0.3%p 이내 → 증거금을 넣고 들고 간다"""
         market, engine, sf, broker, pos = self._guard_setup()
         liq0, margin0 = pos.liquidation_price, pos.bybit_margin_usdt
-        quote = make_quote(0.15, bybit_price=1.22)      # 순손익 ≈ +0.85% (목표 1% 코앞), 강제청산까지 8.8%
+        quote = make_quote(0.4, bybit_price=1.22)       # 순손익 ≈ +0.88% (목표 1% 코앞), 강제청산까지 8.8% (1:1 헷지 기준)
         with sf() as s:
             net = broker.value_exit(pos, quote).pnl.net_percent
         self.assertTrue(1.0 - 0.3 <= net < 1.0, net)
@@ -542,7 +544,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
     def test_liq_guard_closes_when_topup_cap_is_zero(self):
         """추가 회차 0 이면 목표가 코앞이어도 정리"""
         market, engine, sf, broker, pos = self._guard_setup(liq_guard_topup_max_rounds=0)
-        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
         engine.step()
         with sf() as s:
             pos = s.query(Position).one()
@@ -551,7 +553,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
     def test_liq_guard_uses_only_the_margin_buffer(self):
         """여유분이 0% 면 넣을 돈이 0 → 목표가 코앞이어도 넣지 않고 정리 (자리 몫은 절대 안 건드린다)"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=0.0)
-        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
         with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
             engine.step()
         self.assertTrue(any("[증거금 추가 불가]" in m and "여유분 0.00 USDT" in m for m in logs.output))
@@ -564,7 +566,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """여유분이 1단위보다 작으면 남은 만큼만 넣는다 — 자본 10,000 × 1%/4.01 ≈ 25 USDT < 1단위 167"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=1.0)
         margin0 = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
         engine.step()
         with sf() as s:
             pos = s.query(Position).one()
@@ -577,7 +579,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0, liq_guard_topup_unit_ratio=0.5,
                                                             liq_guard_topup_max_rounds=2)
         margin0 = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
         engine.step()                                     # 1차: 0.5단위
         with sf() as s:
             pos = s.query(Position).one()
@@ -598,7 +600,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """여유분이 넉넉하면 한 번에 '원래 증거금 1단위' 를 넣는다 (1배면 청산가 2배 → 3배)"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0)
         margin0 = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
         engine.step()
         with sf() as s:
             pos = s.query(Position).one()
@@ -610,7 +612,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """회차 한도(1회)를 다 쓰면 다음 가드 구간에서는 정리"""
         market, engine, sf, broker, pos = self._guard_setup(liq_guard_topup_max_rounds=1, bybit_margin_buffer_percent=300.0)
         initial = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.15, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
         engine.step()                                     # 1차: 1단위
         with sf() as s:
             pos = s.query(Position).one()
@@ -751,7 +753,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         with sf() as s:
             pos = s.query(Position).one()
         expected = 10_000 * settings.upbit_target_share() * 0.9 / 3
-        self.assertAlmostEqual(pos.bybit_qty * pos.entry_bybit_price_usdt, expected, delta=1)
+        self.assertAlmostEqual(pos.usdt_sold, expected, delta=1)           # 크기 = 판 USDT (숏은 산 코인 개수만큼)
 
 
 class CoinParamsEngineTest(unittest.TestCase):
@@ -780,7 +782,7 @@ class CoinParamsEngineTest(unittest.TestCase):
         self.market.quotes = {"XRP": make_quote(-1.0), "SOL": make_quote(-2.5, coin="SOL")}
         self.engine.step()
         sol = self._open()["SOL"]
-        self.assertAlmostEqual(sol.bybit_qty * sol.entry_bybit_price_usdt, 200, delta=1)
+        self.assertAlmostEqual(sol.usdt_sold, 200, delta=1)   # 크기 = 판 USDT (숏은 산 코인 개수만큼)
 
     def test_per_coin_target(self):
         """SOL 은 목표 0.5% (비용: 수수료 0.31 + 전송 1/200 = 0.5 + 호가 → 약 0.85%)"""

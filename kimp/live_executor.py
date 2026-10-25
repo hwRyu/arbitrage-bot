@@ -405,12 +405,14 @@ class LiveExecutor:
         fee = sum(float(f.get("cost") or 0.0) for f in fees if (f.get("currency") or fee_ccy) == fee_ccy)
         return LegFill(qty=qty, avg_price=avg, cost=cost, fee=fee, order_id=str(order.get("id") or ""))
 
-    def _order(self, ex, symbol: str, what: str, place, fee_ccy: str, client_id: str) -> LegFill:
+    def _order(self, ex, symbol: str, what: str, place, fee_ccy: str, client_id: str,
+               allow_empty: bool = False) -> LegFill:
         """
         주문 → 끝날 때까지 조회 → 체결값
 
         주문 요청이 오류로 끝나면 추적번호로 조회해서 실제로 들어갔는지 확인한다 (응답만 끊겼을 수 있음).
           있음 → 그 주문 결과로 진행 / 없음 → 실패 (OrderFailed) / 조회도 실패 → 모름 (OrderUnknown)
+        allow_empty: 체결 0 을 실패가 아니라 '아무 일 없음'(qty 0) 으로 돌려준다 — 지정가 FOK 가 취소된 경우
         """
         try:
             order = place()
@@ -432,7 +434,14 @@ class LiveExecutor:
             order = found
         done = self._wait(ex, order, symbol)
         self.refresh()
-        fill = self._fill(done, fee_ccy, what)
+        try:
+            fill = self._fill(done, fee_ccy, what)
+        except OrderFailed:
+            if not allow_empty:
+                raise
+            logger.info("[지정가 미체결] %s | 전량 즉시 체결이 안 돼 취소됨 (상태 %s, 주문 %s)", what, done.get("status"),
+                        done.get("id"))
+            return self._nothing()
         logger.info("[주문 체결] %s %g개 평균 %.8g (금액 %.8g, 수수료 %.8g %s, 주문 %s)",
                     what, fill.qty, fill.avg_price, fill.cost, fill.fee, fee_ccy, fill.order_id)
         return fill
@@ -497,6 +506,25 @@ class LiveExecutor:
         return self._order(self.up, sym, what, lambda: self.up.create_order(
             sym, "market", "sell", amount, None, {"identifier": cid}), "KRW", cid)
 
+    def _upbit_limit_fok(self, sym: str, side: str, qty: float, price: float, what: str, client_id: str) -> LegFill:
+        """
+        업비트 지정가 FOK (전량 즉시 체결 아니면 취소) — 코인 사기·팔기 공통
+
+        업비트 API: ord_type=limit + time_in_force=fok. 그 가격(또는 더 좋은 가격)에 전량이 지금 있으면 체결,
+        아니면 주문 전체가 취소된다 (체결 0). 취소는 실패가 아니라 '놓침' 이라 qty 0 으로 돌려준다.
+        가격은 부르는 쪽(브로커)이 호가 단위에 맞춰 준다 (kimp.premium.upbit_limit_price).
+        """
+        cid = client_id or new_client_id()
+        try:
+            amount = float(self.up.amount_to_precision(sym, qty))
+        except Exception:
+            return self._nothing()
+        if amount <= 0 or price <= 0:
+            return self._nothing()
+        return self._order(self.up, sym, what, lambda: self.up.create_order(
+            sym, "limit", side, amount, price, {"identifier": cid, "time_in_force": "fok"}), "KRW", cid,
+            allow_empty=True)
+
     def _upbit_buy_cost(self, sym: str, krw: float, what: str, client_id: str) -> LegFill:
         """
         업비트 시장가 매수 (**원화 금액** 지정) — 코인 사기와 USDT 사기가 같은 모양
@@ -519,12 +547,23 @@ class LiveExecutor:
         return self._upbit_sell(USDT_KRW_SYMBOL, amount_usdt, "업비트 USDT 매도", client_id)
 
     def buy_coin_with_krw(self, session: Session, quote: Quote, coin: str, krw: float,
-                          client_id: str = "") -> LegFill:
-        """진입 2단계: 그 원화로 코인 사기 (바이비트 숏 금액과 같은 금액)"""
+                          client_id: str = "", limit_price: Optional[float] = None) -> LegFill:
+        """
+        진입 2단계: 그 원화로 코인 사기 (바이비트 숏 금액과 같은 금액)
+
+        limit_price 가 있으면 지정가 FOK: 개수 = 원화 ÷ 지정가, 그 가격에 전량 즉시 체결 아니면 취소(qty 0)
+        """
+        if limit_price is not None:
+            return self._upbit_limit_fok(upbit_symbol(coin), "buy", krw / limit_price, limit_price,
+                                         f"업비트 {coin} 지정가 매수 {limit_price:g}원", client_id)
         return self._upbit_buy_cost(upbit_symbol(coin), krw, f"업비트 {coin} 매수", client_id)
 
-    def sell_coin(self, session: Session, quote: Quote, coin: str, qty: float, client_id: str = "") -> LegFill:
-        """청산 1단계: 코인을 팔아 원화 만들기"""
+    def sell_coin(self, session: Session, quote: Quote, coin: str, qty: float, client_id: str = "",
+                  limit_price: Optional[float] = None) -> LegFill:
+        """청산 1단계: 코인을 팔아 원화 만들기. limit_price 가 있으면 지정가 FOK (전량 즉시 체결 아니면 취소)"""
+        if limit_price is not None:
+            return self._upbit_limit_fok(upbit_symbol(coin), "sell", qty, limit_price,
+                                         f"업비트 {coin} 지정가 매도 {limit_price:g}원", client_id)
         return self._upbit_sell(upbit_symbol(coin), qty, f"업비트 {coin} 매도", client_id)
 
     def buy_usdt_with_krw(self, session: Session, quote: Quote, krw: float, client_id: str = "") -> LegFill:
@@ -694,12 +733,15 @@ class DryRunExecutor(PaperExecutor):
         return self._say(f"업비트 USDT {amount_usdt:,.4f}개 시장가 매도",
                          super().sell_usdt(session, quote, amount_usdt, client_id))
 
-    def buy_coin_with_krw(self, session, quote, coin, krw, client_id=""):
-        return self._say(f"업비트 {coin} {krw:,.0f}원어치 시장가 매수",
-                         super().buy_coin_with_krw(session, quote, coin, krw, client_id))
+    def buy_coin_with_krw(self, session, quote, coin, krw, client_id="", limit_price=None):
+        how = f"지정가 FOK {limit_price:g}원" if limit_price is not None else "시장가"
+        return self._say(f"업비트 {coin} {krw:,.0f}원어치 {how} 매수",
+                         super().buy_coin_with_krw(session, quote, coin, krw, client_id, limit_price))
 
-    def sell_coin(self, session, quote, coin, qty, client_id=""):
-        return self._say(f"업비트 {coin} {qty:g}개 시장가 매도", super().sell_coin(session, quote, coin, qty, client_id))
+    def sell_coin(self, session, quote, coin, qty, client_id="", limit_price=None):
+        how = f"지정가 FOK {limit_price:g}원" if limit_price is not None else "시장가"
+        return self._say(f"업비트 {coin} {qty:g}개 {how} 매도",
+                         super().sell_coin(session, quote, coin, qty, client_id, limit_price))
 
     def buy_usdt_with_krw(self, session, quote, krw, client_id=""):
         return self._say(f"업비트 USDT {krw:,.0f}원어치 시장가 매수",

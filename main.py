@@ -349,6 +349,8 @@ def startup_text(settings: Settings, open_positions) -> str:
     else:
         lines.append("자동 송금 꺼짐 (재분배는 알림만)")
     lines.append(("시세 웹소켓 (없거나 묵으면 REST)" if s.quote_source == "ws" else "시세 REST") + f" · 스캔 {s.scan_interval_sec:g}초")
+    lines.append("업비트 코인 주문 " + ("지정가 FOK (판단가에 전량 아니면 취소, 손절·가드는 시장가)"
+                                  if s.upbit_coin_order_type == "fok" else "시장가"))
     if open_positions:
         lines.append("이어받은 포지션 " + ", ".join(f"#{p.id} {p.coin}" for p in open_positions))
     for coin in s.coins:

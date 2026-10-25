@@ -25,11 +25,43 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
 # 호가 한 줄: (가격, 수량)
 Level = Tuple[float, float]
+
+# ----------------------------------------------------------------------
+# 업비트 원화 마켓 호가 단위 (한 칸)
+# ----------------------------------------------------------------------
+# 가격대별 한 칸. 실거래로 확인한 값: CAP 140 → 141원 (1원), PYTH 100 → 101원 (1원), ZAMA 93.5원은 0.1원.
+# (상한, 한 칸) — 가격이 상한 '미만' 이면 그 칸. 예) 99.9원 → 0.1원, 100원 → 1원, 999원 → 1원, 1,000원 → 5원
+_UPBIT_KRW_TICKS = ((0.1, 0.0001), (1, 0.001), (10, 0.01), (100, 0.1), (1_000, 1), (10_000, 5),
+                    (100_000, 10), (500_000, 50), (1_000_000, 100), (2_000_000, 500))
+
+
+def upbit_krw_tick(price: float) -> float:
+    """업비트 원화 마켓에서 이 가격의 호가 한 칸 (원). 예) 140원 → 1원 (= 0.71%), 93.5원 → 0.1원 (= 0.11%)"""
+    for upper, tick in _UPBIT_KRW_TICKS:
+        if price < upper:
+            return tick
+    return 1_000.0
+
+
+def upbit_limit_price(price: float, side: str) -> float:
+    """
+    지정가를 호가 단위에 맞춘다 — 판단한 가격보다 나쁘게는 절대 안 되게
+
+        사는 쪽("buy")  : 내림. 140.37원으로 판단했으면 140원 (141원에 사면 판단보다 0.7% 비싸다)
+        파는 쪽("sell") : 올림. 140.37원이면 141원
+
+    판단가는 실제 호가 줄의 평균이라 보통 이미 한 칸 위에 있고, 그때는 그대로 나온다 (부동소수점 오차만 정리).
+    """
+    tick = upbit_krw_tick(price)
+    n = price / tick
+    k = math.floor(n + 1e-9) if side == "buy" else math.ceil(n - 1e-9)
+    return round(k * tick, 10)
 
 
 @dataclass(frozen=True)

@@ -271,6 +271,14 @@ class Settings:
     # 맨 앞 호가보다 평균 체결가가 이 % 넘게 밀리면 진입하지 않는다 (호가가 얇은 코인 거르기)
     max_slippage_percent: float = 0.3
 
+    # ★ 업비트 코인 주문 방식 (USDT 사고팔기·바이비트 숏은 늘 시장가)
+    #   market = 시장가. 판단 뒤 1초 사이 호가가 한 칸 비껴도 그 가격에 잡힌다
+    #            (CAP #12 2026-10-25: 140원 판단 → 141원 체결, 한 칸 0.71% = 목표 0.2% 의 3.5배)
+    #   fok    = 판단한 가격에 지정가, '전량 즉시 체결 아니면 취소' (Fill or Kill). 판단가보다 나쁘게는 절대 안 잡힌다.
+    #            진입 놓침 → 판 USDT 를 되삼 (비용은 USDT 왕복 수수료 약 0.1%), 익절 놓침 → 포지션 그대로, 잠시 뒤 다시
+    #            손절·강제청산 가드·수동 청산·되돌리기는 fok 여도 시장가 (빠져나오는 게 우선)
+    upbit_coin_order_type: str = "market"
+
     # ------------------------------------------------------------------
     # 바이비트 레버리지 / 자본 비율 / 리밸런싱 (docs/concept.md 7번)
     # ------------------------------------------------------------------
@@ -636,6 +644,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         max_open_positions=_env_int("MAX_OPEN_POSITIONS", d.max_open_positions),
         reentry_cooldown_sec=_env_float("REENTRY_COOLDOWN_SEC", d.reentry_cooldown_sec),
         max_slippage_percent=_env_float("MAX_SLIPPAGE_PERCENT", d.max_slippage_percent),
+        upbit_coin_order_type=_env_str("UPBIT_COIN_ORDER_TYPE", d.upbit_coin_order_type).strip().lower(),
         bybit_leverage=_env_float("BYBIT_LEVERAGE", d.bybit_leverage),
         bybit_margin_buffer_percent=_env_float("BYBIT_MARGIN_BUFFER_PERCENT", d.bybit_margin_buffer_percent),
         bybit_mmr=_env_float("BYBIT_MMR", d.bybit_mmr),
@@ -816,6 +825,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("REENTRY_COOLDOWN_SEC 는 0 이상이어야 합니다")
     if s.max_slippage_percent < 0:
         errors.append("MAX_SLIPPAGE_PERCENT 는 0 이상이어야 합니다")
+    if s.upbit_coin_order_type not in ("market", "fok"):
+        errors.append("UPBIT_COIN_ORDER_TYPE 는 market(시장가) 또는 fok(판단가 지정가, 전량 즉시 체결 아니면 취소) 여야 합니다")
     if s.entry_max_spread_percent < 0:
         errors.append("ENTRY_MAX_SPREAD_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
     if s.tp_stress_qty_multiplier < 1:
