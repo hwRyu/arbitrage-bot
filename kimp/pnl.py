@@ -125,14 +125,14 @@ class PnLBreakdown:
         return self.net_usdt / self.notional_usdt * 100
 
 
-def upbit_fee_krw(cost_krw: float, fees: FeeSettings) -> float:
-    """업비트 수수료 (원) = 거래 금액 × 수수료율.  예) 1,333,000원 × 0.05% = 666.5원"""
-    return cost_krw * fees.upbit_trade_fee_rate
+def upbit_fee_krw(cost_krw: float, fees: FeeSettings, coin: Optional[str] = None) -> float:
+    """업비트 수수료 (원) = 거래 금액 × 그 코인의 수수료율 (USDT/KRW 매매는 coin 없이 → 공통값)"""
+    return cost_krw * fees.upbit_trade_rate(coin)
 
 
-def bybit_fee_usdt(price_usdt: float, qty: float, fees: FeeSettings) -> float:
-    """바이비트 수수료 (USDT) = 거래 금액 × 수수료율.  예) 1,000 USDT × 0.055% = 0.55 USDT"""
-    return price_usdt * qty * fees.bybit_taker_fee_rate
+def bybit_fee_usdt(price_usdt: float, qty: float, fees: FeeSettings, coin: Optional[str] = None) -> float:
+    """바이비트 수수료 (USDT) = 거래 금액 × 그 코인의 수수료율.  예) 1,000 USDT × 0.055% = 0.55 USDT"""
+    return price_usdt * qty * fees.bybit_taker_rate(coin)
 
 
 def compute_pnl(entry: EntryLegs, exit_: ExitLegs, funding_usdt: float, fees: FeeSettings,
@@ -216,7 +216,8 @@ def liquidation_price_from_margin(entry_price_usdt: float, qty: float, margin_us
 
 
 def estimated_exit_premium(entry_premium: float, target_net_profit_percent: float, notional_usdt: float,
-                           funding_usdt: float, fees: FeeSettings, usdt_spread_percent: float = 0.0) -> float:
+                           funding_usdt: float, fees: FeeSettings, usdt_spread_percent: float = 0.0,
+                           coin: Optional[str] = None) -> float:
     """
     "코인 몫 김프가 대략 몇 % 까지 올라야 목표 수익이 나나?" 추정 (로그에 보여주는 용도)
 
@@ -228,6 +229,6 @@ def estimated_exit_premium(entry_premium: float, target_net_profit_percent: floa
     """
     if notional_usdt <= 0:
         raise ValueError("포지션 크기는 0 보다 커야 합니다")
-    return (entry_premium + target_net_profit_percent + fees.round_trip_trade_fee_percent()
+    return (entry_premium + target_net_profit_percent + fees.round_trip_trade_fee_percent(coin)
             + fees.transfer_fee_usdt_per_cycle / notional_usdt * 100 + usdt_spread_percent
             + fees.slippage_buffer_percent - funding_usdt / notional_usdt * 100)

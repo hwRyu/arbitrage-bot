@@ -137,8 +137,10 @@ def cost_items(settings: Settings, coin: str, series: Sequence[Dict[str, Any]],
     funding_8h = _median([r.get("funding") for r in series])
 
     items = [
-        CostItem("fee", "왕복 거래 수수료", f.round_trip_trade_fee_percent(),
-                 f"업비트 {f.upbit_trade_fee_rate * 100:.3f}%×4 + 바이비트 {f.bybit_taker_fee_rate * 100:.3f}%×2"),
+        CostItem("fee", "왕복 거래 수수료", f.round_trip_trade_fee_percent(coin),
+                 f"업비트 USDT {f.upbit_trade_fee_rate * 100:.3f}%×2 + 코인 {f.upbit_trade_rate(coin) * 100:.3f}%×2 "
+                 f"+ 바이비트 {f.bybit_taker_rate(coin) * 100:.3f}%×2"
+                 + (" (이 코인은 바이비트 2배 요율)" if f.bybit_taker_rate(coin) > f.bybit_taker_fee_rate * 1.5 else "")),
         CostItem("coin_spread", "코인 호가 간격", spread,
                  f"{spread_source} — 사자마자 팔면 날아가는 폭"),
         CostItem("usdt_spread", "USDT 호가 간격",

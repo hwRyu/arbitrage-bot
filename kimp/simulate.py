@@ -690,6 +690,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from kimp.slippage import resolve as resolve_slippage
     slip = resolve_slippage(args.exec_slippage, settings.fees.slippage_buffer_percent, settings.live_db_path)
     print(slip.describe())
+    from kimp.fees import with_bybit_fee_rates
+    settings = with_bybit_fee_rates(settings, coins)   # 페이퍼 체결 수수료가 코인별 실제 요율을 쓰게
     clock = SimClock(start_ms / 1000)
     market = HistoricalMarket(
         clock=clock, precision=md, upbit=upbit, bybit=bybit, usdt_krw=usdt,

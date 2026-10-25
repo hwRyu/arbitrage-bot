@@ -358,6 +358,9 @@ def startup_text(settings: Settings, open_positions) -> str:
             item += f" · 손절 {p.stop_loss_percent:.0f}%"
         if p.position_size_usdt:
             item += f" · 크기 {p.position_size_usdt:,.0f} USDT"
+        fee_u, fee_b = s.fees.upbit_trade_rate(coin), s.fees.bybit_taker_rate(coin)
+        if fee_u != s.fees.upbit_trade_fee_rate or fee_b != s.fees.bybit_taker_fee_rate:
+            item += f" · 수수료 업비트 {fee_u * 100:.3f}% / 바이비트 {fee_b * 100:.3f}% (왕복 {s.fees.round_trip_trade_fee_percent(coin):.2f}%)"
         lines += [f"[{coin}]", item]
     return LF.join(lines)
 
@@ -489,6 +492,10 @@ def main() -> int:
         logger.error("운용 가능한 코인이 없습니다 (COINS 확인)")
         return 2
     market.feed = start_quote_feed(settings, coins)   # QUOTE_SOURCE=ws 일 때만 켜진다
+    # 수수료는 코인마다 다르다 (바이비트 소형 코인 2배, .env 코인별 덮어쓰기). 거래소 조회값을 설정에 채운다 —
+    # 익절 판단·필요 김프·시작 메시지가 이걸 쓴다
+    from kimp.fees import with_bybit_fee_rates
+    settings = with_bybit_fee_rates(settings, coins)
 
     # 코인별로 실제로 쓰는 값 보여주기. 코인별로 따로 정한 값에는 * 표시
     logger.info("코인별 적용값 (* = 코인별 설정):")

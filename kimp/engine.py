@@ -829,10 +829,9 @@ class Engine:
         slots = self.s.max_open_positions - len(open_positions) - len(busy - set(open_positions))
         if slots <= 0:
             return
-        fee_rate = self.s.fees.upbit_trade_fee_rate
-
         candidates = []
         for coin, quote in quotes.items():
+            fee_rate = self.s.fees.upbit_trade_rate(coin)   # 코인별 업비트 요율 (진입 김프 계산에)
             if coin in open_positions or coin in busy or self._clock() < self._reentry_allowed_at.get(coin, 0.0):
                 continue
             if coin not in self.s.coins:
@@ -954,7 +953,7 @@ class Engine:
                                bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id, now=self._now_utc())
             notional = pos.bybit_qty * pos.entry_bybit_price_usdt
             target = estimated_exit_premium(pos.entry_premium, params.target_net_profit_percent, notional, 0.0,
-                                            self.s.fees, quote.usdt_spread_percent or 0.0)
+                                            self.s.fees, quote.usdt_spread_percent or 0.0, coin=coin)
             logger.info(
                 "[진입] #%d %s | 김프 %+.3f%% (기준 %+.2f%%, 판단 %+.3f%%) | 목표 %.2f%% → 김프 약 %+.2f%% 필요 | "
                 "업비트 USDT %.2f개 매도 (%.1f원) → %.6g개 매수 (%s원) | 바이비트 %g개 숏 (%.6f USDT, %.0f배) | "

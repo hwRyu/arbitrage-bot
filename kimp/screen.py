@@ -465,6 +465,9 @@ class CoinScore:
     flags: List[str] = field(default_factory=list)
     cycle_good_hours: float = CYCLE_GOOD_HOURS
     timeframe: str = ""  # 이 점수를 어떤 봉으로 계산했는지 (2단계에서 1분봉으로 다시 본 코인 구분)
+    fee_percent: float = 0.0           # 왕복 거래 수수료 (%) — 코인별 요율 반영 (업비트 4번 + 바이비트 2번)
+    upbit_fee_percent: float = 0.0     # 이 코인의 업비트 요율 (%)
+    bybit_fee_percent: float = 0.0     # 이 코인의 바이비트 taker 요율 (%) — 소형 코인은 0.11
 
     @property
     def abnormal(self) -> bool:
@@ -659,7 +662,7 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
         f"{'순위':>3} {'코인':<7}{'봉':>4}{'점수':>7} {'전체/월':>7} {'검증/월':>7} {'거래':>4} {'승':>3} {'검증거래':>7} {'승':>3} "
         f"{'진입기준':>7} {'보유h':>5} {'주기h':>5} {'점유':>5} {'가중':>4} │ {'중간값':>6} {'범위(5~95%)':>13} {'횡보':>4} "
         f"{'띠이동':>5} {'반감h':>5} "
-        f"│ {'호가':>5} {'비용':>5} {'업비트(억)':>9} {'바이비트(M$)':>11} {'펀딩/8h':>7}  경고",
+        f"│ {'호가':>5} {'수수료':>5} {'비용':>5} {'업비트(억)':>9} {'바이비트(M$)':>11} {'펀딩/8h':>7}  경고",
     ]
     for i, s in enumerate(ranked[:top], 1):
         f = s.full
@@ -672,7 +675,7 @@ def format_table(ranked: Sequence[CoinScore], top: int, settings_note: str) -> s
             f"{s.occupancy * 100:>4.0f}% {s.weight:>4.2f} │ "
             f"{s.stats.median:>+6.2f} {s.stats.p5:>+6.2f}~{s.stats.p95:>+6.2f} "
             f"{s.stats.sideways_share * 100:>3.0f}% {s.stats.band_shift:>5.2f} {_hl(s.stats.half_life_h):>5} │ "
-            f"{s.spread_percent:>5.2f} {s.cost_percent:>5.2f} {s.live.upbit_krw_24h / 1e8:>9,.0f} "
+            f"{s.spread_percent:>5.2f} {s.fee_percent:>5.2f} {s.cost_percent:>5.2f} {s.live.upbit_krw_24h / 1e8:>9,.0f} "
             f"{s.live.bybit_usdt_24h / 1e6:>11,.1f} {s.funding_8h:>+7.4f}  {','.join(s.flags)}"
         )
     return "\n".join(lines)
@@ -815,19 +818,25 @@ def load_series(store: HistoryStore, md, coins: Sequence[str], timeframe: str, s
 def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, float], usdt_spread: float,
                  fixed: float, target: float, stop: float, live: Dict[str, CoinLive],
                  size: float, cycle_hours: float, recent_days: float = 0.0,
-                 entry_threshold: Optional[float] = None, exec_slippage=None) -> List[CoinScore]:
+                 entry_threshold: Optional[float] = None, exec_slippage=None, fees=None) -> List[CoinScore]:
     """받아둔 종가로 코인마다 점수 계산 (호가 간격은 미리 정해둔 resolved 값 사용)"""
     bar_ms = TIMEFRAME_MS[timeframe]
     scores = []
     for c, (up, by, funding) in data.items():
         floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
         spread = max(resolved.get(c, 0.0), floor)
-        # 체결 밀림 가정(kimp/slippage.py)은 거래당 고정 비용으로 — 청산 때 판단 호가보다 불리하게 체결되는 몫
+        # 체결 밀림 가정(kimp/slippage.py)은 거래당 고정 비용으로 — 청산 때 판단 호가보다 불리하게 체결되는 몫.
+        # fixed 는 코인별 dict(수수료가 코인마다 달라서)일 수도, 하나의 숫자일 수도 있다
         slip = exec_slippage.for_coin(c) if exec_slippage is not None else 0.0
+        fixed_c = fixed[c] if isinstance(fixed, dict) else fixed
         s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, days, spread, usdt_spread,
-                          fixed + slip, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold)
+                          fixed_c + slip, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold)
         if s:
             s.timeframe = timeframe
+            if fees is not None:   # 표에 보여줄 수수료 (코인별 요율)
+                s.fee_percent = fees.round_trip_trade_fee_percent(c)
+                s.upbit_fee_percent = fees.upbit_trade_rate(c) * 100
+                s.bybit_fee_percent = fees.bybit_taker_rate(c) * 100
             scores.append(s)
     return scores
 
@@ -852,6 +861,7 @@ def save_json(ranked: Sequence[CoinScore], top: int, note: str, snippet: str, pa
             "holding_hours": _stat.fmean(f.holding_hours) if f and f.holding_hours else 0.0,
             "cycle_hours": s.cycle_hours, "occupancy": s.occupancy,
             "spread_percent": s.spread_percent, "cost_percent": s.cost_percent,
+            "fee_percent": s.fee_percent, "upbit_fee_percent": s.upbit_fee_percent, "bybit_fee_percent": s.bybit_fee_percent,
             "funding_8h": s.funding_8h, "median": s.stats.median, "band_shift": s.stats.band_shift,
             "upbit_krw_24h": s.live.upbit_krw_24h, "bybit_usdt_24h": s.live.bybit_usdt_24h,
             "flags": list(s.flags),
@@ -974,9 +984,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for c in data:
         live[c].spread_percent, live[c].depth_usdt = books.get(c, (None, None))
 
+    # 수수료는 코인마다 다르다 (바이비트 소형 코인 2배, .env 코인별 덮어쓰기) → 거래소 조회 + 설정으로 코인별 거래당 비용
+    from kimp.fees import with_bybit_fee_rates
+    settings = with_bybit_fee_rates(settings, coins)
+    transfer_pct = settings.fees.transfer_fee_usdt_per_cycle / size * 100
+    fixed = {c: settings.fees.round_trip_trade_fee_percent(c) + transfer_pct for c in coins}
     scores = evaluate_all(data, usdt, args.timeframe, args.days, resolved, usdt_spread, fixed, target,
                           settings.stop_loss_percent, live, size, args.cycle_hours, args.recent_days,
-                          args.entry_threshold, exec_slippage=slip)
+                          args.entry_threshold, exec_slippage=slip, fees=settings.fees)
 
     # 2단계: 1단계 상위 코인만 더 짧은 봉으로 다시 평가 (시뮬레이션과 같은 기준으로 맞추기)
     refined_timeframe = None
@@ -995,7 +1010,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if r_data:
                 refined = evaluate_all(r_data, r_usdt, refined_timeframe, args.days, resolved, r_usdt_spread,
                                        fixed, target, settings.stop_loss_percent, live, size,
-                                       args.cycle_hours, args.recent_days, args.entry_threshold, exec_slippage=slip)
+                                       args.cycle_hours, args.recent_days, args.entry_threshold, exec_slippage=slip,
+                                       fees=settings.fees)
                 done = {x.coin for x in refined}
                 scores = refined + [x for x in scores if x.coin not in done]
                 usdt_spread = r_usdt_spread
@@ -1011,7 +1027,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                   else "진입 기준 코인별 최적 · ")
     note = (f"{'~' + args.end + ' ' if args.end else '최근 '}{args.days:g}일 · {bars} · {len(scores)}개 코인 · 목표 순이익 {target:g}% · "
             f"{entry_note}손절 {settings.stop_loss_percent:g}% · 포지션 {size:,.0f} USDT · "
-            f"수수료+전송비 {fixed:.2f}% · USDT 호가 {usdt_spread:.3f}% · {slip.describe()}\n"
+            f"수수료+전송비 {min(fixed.values()):.2f}~{max(fixed.values()):.2f}% (코인별 요율, 표의 '수수료' 열) · "
+            f"USDT 호가 {usdt_spread:.3f}% · {slip.describe()}\n"
             f"코인 호가 간격 출처: {', '.join(f'{k} {v}개' for k, v in used.most_common())} "
             f"(호가 단위보다 좁으면 호가 단위로 올림)")
     print()

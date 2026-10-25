@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -77,10 +77,10 @@ class FeeSettings:
     # 업비트 기본 0.05%. 살 때는 주문 금액과 별도로 원화에서 더 빠지고, 팔 때는 받는 원화에서 빠진다.
     upbit_trade_fee_rate: float = 0.0005
 
-    # 바이비트 USDT 무기한 Taker 수수료율 (시장가 주문). 숏 열 때 1번, 닫을 때 1번.
-    # 공식 기본은 0.055% 인데 2026-10-25 실거래 체결 20건 중 18건이 0.11% 로 찍혔다 (계정 등급·프로모션에 따라 다르다).
-    # 판단 순손익은 이 값으로 바이비트 닫기 수수료를 추정하므로, 실제보다 낮게 잡으면 거래당 그 차이만큼 낙관적이 된다.
-    # → 실거래 fills.fee ÷ cost 로 확인해서 .env 에 맞춰 둘 것
+    # 바이비트 USDT 무기한 Taker 수수료율 (시장가 주문). 숏 열 때 1번, 닫을 때 1번. 기본 0.055%
+    # 바이비트는 **코인마다** 다르다 — 일부 소형 코인 무기한은 2배(0.11%): 2026-10-25 조회 CAP 0.11% / MINA·BTC 0.055%.
+    # 그래서 시작할 때 코인별 요율을 거래소에서 받아 아래 bybit_taker_fee_rates 에 채운다 (kimp/fees.py).
+    # 이 값은 조회가 안 된 코인의 기본값. 판단 순손익은 이 요율로 닫기 수수료를 추정하므로 낮게 잡으면 낙관적이 된다
     bybit_taker_fee_rate: float = 0.00055
 
     # (선택) 사이클(진입 → 청산 1번)마다 손익에서 미리 떼어두는 전송비 (USDT). 기본 0
@@ -96,15 +96,32 @@ class FeeSettings:
     # 세 도구는 --exec-slippage 숫자|auto 로 실행마다 바꿀 수 있다 (auto = 실거래 체결 기록 중앙값, kimp/slippage.py)
     slippage_buffer_percent: float = 0.05
 
-    def round_trip_trade_fee_percent(self) -> float:
-        """
-        들어갔다 나오는 한 바퀴의 거래 수수료 합계 (%)
+    # ---- 코인별 요율 (맨 뒤: 위 항목들은 위치 인자로 만드는 코드가 있어 순서를 지킨다) ----
+    # 업비트: .env <코인>_UPBIT_TRADE_FEE_RATE. 코인 매매에만 쓰고 USDT/KRW 매매는 공통값
+    upbit_trade_fee_rates: Mapping[str, float] = field(default_factory=dict, compare=False, hash=False)
+    # 바이비트 taker: .env <코인>_BYBIT_TAKER_FEE_RATE > 거래소 조회값(kimp/fees.py) > 기본값. 비교·해시에서는 뺀다
+    bybit_taker_fee_rates: Mapping[str, float] = field(default_factory=dict, compare=False, hash=False)
 
-        업비트 USDT 매도 + 코인 매수 + 코인 매도 + USDT 매수 = 업비트 4번
-        바이비트 숏 열기 + 닫기 = 바이비트 2번
-        → 4 × 0.05% + 2 × 0.055% = 0.31%
+    def upbit_trade_rate(self, coin: Optional[str] = None) -> float:
+        """이 코인의 업비트 요율 (코인별 설정, 없으면 공통값). USDT/KRW 매매는 coin 없이 불러 공통값"""
+        if coin:
+            return self.upbit_trade_fee_rates.get(coin, self.upbit_trade_fee_rate)
+        return self.upbit_trade_fee_rate
+
+    def bybit_taker_rate(self, coin: Optional[str] = None) -> float:
+        """이 코인의 바이비트 taker 요율 (코인별 설정 또는 거래소 조회값, 없으면 기본값)"""
+        if coin:
+            return self.bybit_taker_fee_rates.get(coin, self.bybit_taker_fee_rate)
+        return self.bybit_taker_fee_rate
+
+    def round_trip_trade_fee_percent(self, coin: Optional[str] = None) -> float:
         """
-        return (4 * self.upbit_trade_fee_rate + 2 * self.bybit_taker_fee_rate) * 100
+        들어갔다 나오는 한 바퀴의 거래 수수료 합계 (%). coin 을 주면 그 코인의 바이비트 요율로
+
+        업비트 USDT 매도·매수 2번(공통 요율) + 코인 매수·매도 2번(코인별 요율) + 바이비트 숏 열기·닫기 2번(코인별 요율)
+        → 4 × 0.05% + 2 × 0.055% = 0.31%  (바이비트 0.11% 코인이면 0.42%)
+        """
+        return (2 * self.upbit_trade_fee_rate + 2 * self.upbit_trade_rate(coin) + 2 * self.bybit_taker_rate(coin)) * 100
 
 
 # 코인별로 덮어쓸 수 있는 설정 항목: (CoinParams 필드 이름, .env 키 뒷부분)
@@ -576,6 +593,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     fees = FeeSettings(
         upbit_trade_fee_rate=_env_float("UPBIT_TRADE_FEE_RATE", fd.upbit_trade_fee_rate),
         bybit_taker_fee_rate=_env_float("BYBIT_TAKER_FEE_RATE", fd.bybit_taker_fee_rate),
+        upbit_trade_fee_rates=_coin_fee_overrides("UPBIT_TRADE_FEE_RATE"),
+        bybit_taker_fee_rates=_coin_fee_overrides("BYBIT_TAKER_FEE_RATE"),
         transfer_fee_usdt_per_cycle=_env_float("TRANSFER_FEE_USDT_PER_CYCLE", fd.transfer_fee_usdt_per_cycle),
         slippage_buffer_percent=_env_float("SLIPPAGE_BUFFER_PERCENT", fd.slippage_buffer_percent),
     )
@@ -727,6 +746,22 @@ def _find_old_keys() -> List[str]:
 NOT_COIN_PREFIXES = ("CARRY",)
 
 
+def _coin_fee_overrides(suffix: str) -> Dict[str, float]:
+    """
+    .env 의 코인별 수수료 덮어쓰기: <코인>_UPBIT_TRADE_FEE_RATE / <코인>_BYBIT_TAKER_FEE_RATE → {코인: 요율}
+
+    다른 코인별 설정과 달리 COINS 에 없는 코인도 받는다 — 추천(screen)·시뮬레이션이 그 코인을 평가할 때 쓰기 때문.
+    (CARRY_ 같은 전략 접두어는 코인이 아니다)
+    """
+    pattern = re.compile(rf"^([A-Z0-9]+)_{suffix}$")
+    out: Dict[str, float] = {}
+    for key, value in os.environ.items():
+        match = pattern.match(key)
+        if match and match.group(1) not in NOT_COIN_PREFIXES and value.strip():
+            out[match.group(1)] = float(value)
+    return out
+
+
 def _find_unused_coin_keys(coins: List[str]) -> List[str]:
     """COINS 에 없는 코인의 개별 설정 키를 찾아 경고로 돌려준다 (오타 방지. 실행은 막지 않음)"""
     suffixes = "|".join(suffix for _, suffix in COIN_OVERRIDE_FIELDS)
@@ -803,6 +838,10 @@ def validate_settings(s: Settings) -> None:
         errors.append("PAPER_INITIAL_TOTAL_USDT 는 0 보다 커야 합니다")
 
     f = s.fees
+    for coin, rate in {**{f"{c}_UPBIT_TRADE_FEE_RATE": r for c, r in f.upbit_trade_fee_rates.items()},
+                       **{f"{c}_BYBIT_TAKER_FEE_RATE": r for c, r in f.bybit_taker_fee_rates.items()}}.items():
+        if not 0 <= rate < 0.01:
+            errors.append(f"{coin} 는 0 이상 1% 미만의 소수여야 합니다 (예: 0.0011 = 0.11%)")
     for name, value in (("UPBIT_TRADE_FEE_RATE", f.upbit_trade_fee_rate), ("BYBIT_TAKER_FEE_RATE", f.bybit_taker_fee_rate)):
         # 수수료율은 소수로. 0.05 처럼 % 로 잘못 넣는 실수를 잡는다
         if not 0 <= value < 0.01:

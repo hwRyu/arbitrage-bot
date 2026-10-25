@@ -223,7 +223,7 @@ class PaperExecutor:
         """
         ratio = self._check_fail("open_short")
         f = self._leg(estimate_fill(quote.bybit.bids, qty * ratio), "바이비트 숏")
-        fee = f.cost * self.fees.bybit_taker_fee_rate
+        fee = f.cost * self.fees.bybit_taker_rate(coin)
         self._add(session, BYBIT_USDT, -(f.cost / self.leverage + fee))
         self._add(session, short_key(coin), f.qty)
         return self._done(client_id, LegFill(f.qty, f.avg_price, f.cost, fee, f.order_id, f.slippage_percent))
@@ -242,7 +242,7 @@ class PaperExecutor:
         """
         ratio = self._check_fail("close_short")
         f = self._leg(estimate_fill(quote.bybit.asks, qty * ratio), "바이비트 숏 닫기")
-        fee = f.cost * self.fees.bybit_taker_fee_rate
+        fee = f.cost * self.fees.bybit_taker_rate(coin)
         released = margin_usdt * (f.qty / qty) if qty else 0.0
         self._add(session, BYBIT_USDT, released + (entry_price - f.avg_price) * f.qty - fee)
         self._add(session, short_key(coin), -f.qty)
@@ -285,7 +285,7 @@ class PaperExecutor:
         """진입 2단계: 원화로 코인 사기 (원화 −= 금액 + 수수료). 금액 지정 주문이다"""
         ratio = self._check_fail("buy_coin_with_krw")
         f = self._leg(estimate_fill_by_cost(quote.upbit.asks, krw * ratio), "업비트 코인 매수")
-        fee = f.cost * self.fees.upbit_trade_fee_rate
+        fee = f.cost * self.fees.upbit_trade_rate(coin)
         self._add(session, UPBIT_KRW, -(f.cost + fee))
         self._add(session, coin_key(coin), f.qty)
         return self._done(client_id, LegFill(f.qty, f.avg_price, f.cost, fee, f.order_id, f.slippage_percent))
@@ -294,7 +294,7 @@ class PaperExecutor:
         """청산 1단계: 코인을 팔아 원화 만들기"""
         ratio = self._check_fail("sell_coin")
         f = self._leg(estimate_fill(quote.upbit.bids, qty * ratio), "업비트 코인 매도")
-        fee = f.cost * self.fees.upbit_trade_fee_rate
+        fee = f.cost * self.fees.upbit_trade_rate(coin)
         self._add(session, coin_key(coin), -f.qty)
         self._add(session, UPBIT_KRW, f.cost - fee)
         return self._done(client_id, LegFill(f.qty, f.avg_price, f.cost, fee, f.order_id, f.slippage_percent))

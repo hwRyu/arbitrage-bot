@@ -297,7 +297,7 @@ class HedgeBroker:
         bybit = self.balance(session, BYBIT_USDT)
         for pos in positions:
             quote = quotes.get(pos.coin)
-            plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_fee_rate) if quote else None
+            plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_rate(pos.coin)) if quote else None
             upbit += plan.usdt_bought if plan else pos.usdt_sold
             short_pnl = (pos.entry_bybit_price_usdt - plan.bybit.avg_price) * pos.bybit_qty if plan else 0.0
             bybit += pos.bybit_margin_usdt + short_pnl
@@ -487,7 +487,7 @@ class HedgeBroker:
             EntryRejected: 호가 부족 / 너무 밀림 (아무 주문도 안 냄), 주문 실패 후 되돌림 (ABORTED),
                            주문 결과 모름 (OPENING 으로 남고 다음 스캔에 이어서)
         """
-        rate = self.fees.upbit_trade_fee_rate
+        rate = self.fees.upbit_trade_rate(quote.coin)   # 코인별 업비트 요율 (USDT/KRW 매매는 공통값)
         plan = quote.entry_plan(bybit_qty, rate)
         if plan is None or not plan.bybit.is_complete:
             raise EntryRejected("바이비트 매수 호가가 모자람")
@@ -500,7 +500,7 @@ class HedgeBroker:
                 raise EntryRejected(f"{name}에서 너무 밀림 {fill.slippage_percent:.3f}%")
 
         margin = plan.bybit.cost / self.leverage
-        by_fee = plan.bybit.cost * self.fees.bybit_taker_fee_rate
+        by_fee = plan.bybit.cost * self.fees.bybit_taker_rate(quote.coin)   # 코인별 요율
         upbit_have = self.balance(session, UPBIT_USDT)
         bybit_have = self.balance(session, BYBIT_USDT)
         if upbit_have < plan.usdt_sold:
@@ -583,7 +583,7 @@ class HedgeBroker:
         """
         if quote is None:
             return
-        rate = self.fees.upbit_trade_fee_rate
+        rate = self.fees.upbit_trade_rate(pos.coin)
         sums = self._sums(session, pos)
         o = sums["open_short"]
         short_qty = o.qty - sums.get("trim_short", LegSum()).qty
@@ -624,7 +624,7 @@ class HedgeBroker:
             → 그 원화로 USDT 를 되사고, '판 USDT' 에서 되산 만큼 뺀다 (손익 기록이 실제 잔고와 맞게)
         업비트 최소 주문 금액(기본 5,000원) 미만 자투리는 그냥 둔다.
         """
-        rate = self.fees.upbit_trade_fee_rate
+        rate = self.fees.upbit_trade_rate(pos.coin)
         sums = self._sums(session, pos)
         s = lambda k: sums.get(k, LegSum())  # noqa: E731
         krw_in = sum(s(k).cost - s(k).fee for k in ("sell_usdt", "trim_coin"))
@@ -678,7 +678,7 @@ class HedgeBroker:
         Returns:
             끝났으면 True (ABORTED 또는 ERROR). 결과를 몰라 멈췄으면 False (OPENING 유지)
         """
-        rate = self.fees.upbit_trade_fee_rate
+        rate = self.fees.upbit_trade_rate(pos.coin)
         s = lambda k, sums: sums.get(k, LegSum())  # noqa: E731
         try:
             sums = self._sums(session, pos)
@@ -735,10 +735,10 @@ class HedgeBroker:
         Returns:
             ExitValuation. 호가가 모자라서 다 못 팔면 None
         """
-        plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_fee_rate)
+        plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_rate(pos.coin))
         if plan is None or not plan.is_complete:
             return None
-        by_fee = plan.bybit.cost * self.fees.bybit_taker_fee_rate
+        by_fee = plan.bybit.cost * self.fees.bybit_taker_rate(pos.coin)   # 코인별 요율 (CAP 0.11% / MINA 0.055%)
         legs = ExitLegs(upbit_price_krw=plan.upbit.avg_price, upbit_fee_krw=plan.coin_fee_krw,
                         usdt_price_krw=plan.usdt.avg_price, usdt_fee_krw=plan.usdt_fee_krw,
                         usdt_bought=plan.usdt_bought, bybit_price_usdt=plan.bybit.avg_price, bybit_fee_usdt=by_fee)
@@ -752,7 +752,7 @@ class HedgeBroker:
 
         바이비트: 증거금을 전부 잃는다 (숏 손익 = −증거금) / 업비트: 남은 코인을 지금 팔아 USDT 로 되산다
         """
-        plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_fee_rate)
+        plan = quote.exit_plan(pos.upbit_qty, pos.bybit_qty, self.fees.upbit_trade_rate(pos.coin))
         if plan is None or not plan.upbit.is_complete or not plan.usdt.is_complete:
             return None
         legs = ExitLegs(upbit_price_krw=plan.upbit.avg_price, upbit_fee_krw=plan.coin_fee_krw,
@@ -790,7 +790,7 @@ class HedgeBroker:
         """
         if not self._resolve_sent(session, pos):
             return None
-        rate = self.fees.upbit_trade_fee_rate
+        rate = self.fees.upbit_trade_rate(pos.coin)
         liquidated = pos.exit_reason == ExitReason.LIQUIDATION
         if liquidated and not self.ex.short_liquidated(session, pos.coin):
             # 봇 계산으로는 강제청산 가격인데 거래소에서는 아직 숏이 살아 있음 (실거래) → 시장가로 바로 닫는다
