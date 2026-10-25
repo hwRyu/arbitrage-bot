@@ -7,3 +7,6 @@ data/
 logs/
 *.db
 .DS_Store
+
+# Claude Code 개인 설정 (프로젝트 공용 .claude/agents 는 커밋)
+.claude/settings.local.json

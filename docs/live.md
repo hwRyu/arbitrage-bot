@@ -141,6 +141,13 @@
 - 거래소에서 **손으로 주문하지 말 것** (대조 불일치로 신규 진입이 멈춘다). 봇이 들고 있는 코인 말고 다른 코인은 괜찮다.
 - 끄기: Ctrl+C (또는 `systemctl stop`). 열린 포지션은 DB 에 남아서 다시 켜면 이어서 관리한다.
 
+### 감시 에이전트 (Claude Code 서브에이전트 `bot-monitor`)
+- 정의 파일 [`.claude/agents/bot-monitor.md`](../.claude/agents/bot-monitor.md) — Claude Code 표준 서브에이전트 형식(머리말 `name`·`description`·`tools`·`model`, 본문이 시스템 프롬프트). 모델 `sonnet`, 도구는 읽기 계열 + `Monitor` 만, `Edit`/`Write` 는 금지 목록.
+- 하는 일: `logs/bot.log` 를 꼬리 따라가며 진입·청산·오류·웹소켓 끊김을 보고, `tools/monitor/resource_watch.sh` 로 1분마다 메모리·스레드·핸들을 `logs/resource_watch.csv` 에 적는다. 청산이 나면 DB 에서 **판단 순손익 대비 실제**, 다리별 밀림, `판단 → 전송 ms` 를 뽑아 보고한다.
+- 부르기: Claude Code 에서 "봇 모니터링 붙여줘" / "bot-monitor 서브에이전트로 감시해" 라고 하면 된다. 사건이 나거나 정한 시간(기본 6시간)이 지나면 보고하고 끝나므로 계속 보려면 다시 띄운다.
+- 하지 않는 일: 봇 중단·재기동, 파일 수정, 거래소 API 호출. 조치는 사람이(또는 메인 Claude 가) 한다.
+- 자원 감시만 따로 보려면 터미널에서 `bash tools/monitor/resource_watch.sh` (윈도우 Git Bash 전용, 봇과 별개 프로세스).
+
 ## 7. 아직 안 된 것 / 주의
 - 펀딩비는 실거래에서도 '예고 비율 × 숏 금액' 추정으로 기록한다 (실제 잔고에는 거래소가 반영하므로 비율 계산은 맞음).
 - 실제 키로만 확인 가능한 것: 업비트 출금 `net_type`·허용 주소, 바이비트 계좌 이동·출금, 트래블룰, 격리 마진 설정 응답, 실제 체결값
