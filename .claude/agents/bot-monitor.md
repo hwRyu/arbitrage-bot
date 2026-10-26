@@ -29,6 +29,9 @@ color: cyan
    `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Where-Object { \$_.CommandLine -like '*main.py*' }).Count"`
 
 ## 감시 장치 거는 법 (Monitor 도구)
+- **시작할 때 먼저 직전 15분 로그를 훑는다.** 이전 회차 감시가 만료되고 새로 걸기까지 틈이 있어, `tail -n 0` 만 걸면 그 사이 줄을 놓친다
+  (2026-10-26 20:53:12 CAP #12 청산을 6→7회차 교대 틈에 놓침). 예: `grep -E "<위 패턴>" logs/bot.log | awk -v t="$(date -d '-15 min' '+%F %T')" '$0 >= t'`.
+  여기서 진입·청산이 나오면 그 건부터 분석해 보고한다.
 - 로그: `tail -f -n 0 logs/bot.log | grep -E --line-buffered "<위 패턴>"` (timeout_ms 1800000)
   재장전 전에 **별도 Bash 호출**로 이전 tail 정리: `for p in $(ps -ef | grep "[t]ail -f -n 0 logs/bot.log" | awk '{print $2}'); do kill $p; done`.
   Monitor 가 만료돼도 tail 은 로그가 안 닫혀 살아남는다 (2026-10-26 확인: 하루 반 만에 160개 쌓임).
