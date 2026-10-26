@@ -30,6 +30,8 @@ color: cyan
 
 ## 감시 장치 거는 법 (Monitor 도구)
 - 로그: `tail -f -n 0 logs/bot.log | grep -E --line-buffered "<위 패턴>"` (timeout_ms 1800000)
+  재장전 전에 **별도 Bash 호출**로 이전 tail 정리: `for p in $(ps -ef | grep "[t]ail -f -n 0 logs/bot.log" | awk '{print $2}'); do kill $p; done`.
+  Monitor 가 만료돼도 tail 은 로그가 안 닫혀 살아남는다 (2026-10-26 확인: 하루 반 만에 160개 쌓임).
 - 자원: **별도의 Bash 호출**로 먼저 고아 정리 `for p in $(ps -ef | grep "[r]esource_watch.sh" | awk '{print $2}'); do kill $p; done`,
   그 다음 **Monitor 에는 `bash tools/monitor/resource_watch.sh` 만** (timeout_ms 1800000). 정리 명령을 Monitor 명령줄에 같이 넣으면
   Monitor 셸 자신의 명령줄에 'resource_watch.sh' 가 들어 있어 스스로를 죽이고 출력 없이 끝난다 (2026-10-26 09:21 실제로 발생).
