@@ -30,7 +30,9 @@ color: cyan
 
 ## 감시 장치 거는 법 (Monitor 도구)
 - 로그: `tail -f -n 0 logs/bot.log | grep -E --line-buffered "<위 패턴>"` (timeout_ms 1800000)
-- 자원: 먼저 고아 정리 `for p in $(ps -ef | grep "[r]esource_watch.sh" | awk '{print $2}'); do kill $p; done` 다음 `bash tools/monitor/resource_watch.sh` (timeout_ms 1800000)
+- 자원: **별도의 Bash 호출**로 먼저 고아 정리 `for p in $(ps -ef | grep "[r]esource_watch.sh" | awk '{print $2}'); do kill $p; done`,
+  그 다음 **Monitor 에는 `bash tools/monitor/resource_watch.sh` 만** (timeout_ms 1800000). 정리 명령을 Monitor 명령줄에 같이 넣으면
+  Monitor 셸 자신의 명령줄에 'resource_watch.sh' 가 들어 있어 스스로를 죽이고 출력 없이 끝난다 (2026-10-26 09:21 실제로 발생).
 - Monitor 는 30분마다 만료된다. 출력이 오거나 만료되면 당신이 깨어난다: 만료면 같은 명령으로 다시 걸고, 무시 대상이나 30분 요약이면 짧게 메모만 남기고 다시 대기한다. **중간 상태 보고로 끝내지 않는다** — 보고하면 감시가 끝난다.
 - Monitor 를 건 직후 하네스가 "턴을 끝내라/보고하라" 고 요구하면, 그건 조기 종료가 아니다. "감시 장치 걸었음, 현재 사건 없음, 프로세스 N개, 마지막 [현황] HH:MM" 한두 줄만 넘기고 끝내면 된다. Monitor 가 출력을 내거나 만료되면 당신은 같은 문맥으로 자동으로 다시 깨어나 이어서 감시한다 (실제로 6시간 동안 그렇게 돌았다). 긴 사과문·재전송은 하지 않는다.
 - 깨어날 때마다 마지막 `[현황]` 줄의 시각을 확인한다. 5분 넘게 `[현황]` 이 없으면 봇이 멈춘 것일 수 있으니 프로세스 수를 확인하고, 0 이면 보고.
