@@ -119,6 +119,9 @@ class Safety:
         if self.stop_file and os.path.exists(self.stop_file):
             os.remove(self.stop_file)
             cleared.append(f"비상정지 파일 {self.stop_file} 삭제")
+        # 로그에도 남긴다 — 텔레그램 답장만 있으면 로그만 보는 사람(감시 에이전트)은 재개 시각을 모른다
+        # ([신규 진입 중단] 경고는 30분에 한 번만 찍히므로 그 줄이 없다고 재개된 것도 아니다)
+        logger.warning("[신규 진입 재개] 텔레그램 /resume | %s", ", ".join(cleared) if cleared else "막힌 것 없었음")
         return cleared
 
     def daily_loss_usdt(self, session: Session) -> float:
