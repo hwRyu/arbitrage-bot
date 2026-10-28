@@ -23,7 +23,7 @@ color: cyan
    봐야 할 줄 (grep -E 패턴 그대로 사용):
    `\[진입\]|\[청산|\[주문 체결\]|\[주문 전송\]|\[익절 판단\]|\[되돌리기|\[진입 되돌림|CRITICAL|Traceback|주문 거절|주문 실패|확인이 필요|진입 김프 밀림|스캔 중 에러|\[강제청산|\[긴급|숏 사라짐|익절 보류|연속 실패|\[송금|증거금 추가|웹소켓 호가 (끊김|bybit 복구|upbit 복구)`
    무시: `[현황]` 줄, `[진입 보류] … 왕복 호가 …`(호가 한 칸이 큰 코인을 스프레드 가드가 막는 것, 정상), `[웹소켓 호가 없음·묵음]`/`[웹소켓 호가 복구] N초` 같은 INFO 폴백(한가한 장에서 정상), `.env` 의 옛 코인 설정 `무시됩니다` 경고.
-2. **자원**: `bash tools/monitor/resource_watch.sh` 를 Monitor 로 돌리면 1분마다 `logs/resource_watch.csv` 에 적고, 메모리 +50 MB / 스레드 +5 / 핸들 +200 때와 30분마다 한 줄을 낸다.
+2. **자원**: `bash tools/monitor/resource_watch.sh` 를 Monitor 로 돌리면 1분마다 `logs/resource_watch.csv` 에 적고, 메모리 +50 MB / 스레드 +10 / 핸들 +200 때 (스레드 31↔36 출렁임은 정상)와 30분마다 한 줄을 낸다.
    알려진 정상 패턴: 기동 후 약 70분 동안 366 → 450~470 MB 로 오른 뒤 평탄. 470 MB 를 넘어 계속 오르거나 스레드·핸들 증가 알림이 오면 사건.
 3. **프로세스 생존** (재장전 때마다, 사건 때마다): 아래가 2(런처+본체)여야 한다. 0 이면 즉시 보고.
    `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"name='python.exe'\" | Where-Object { \$_.CommandLine -like '*main.py*' }).Count"`

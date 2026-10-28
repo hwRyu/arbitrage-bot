@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 봇 본체 자원 감시 (윈도우 · Git Bash): 1분마다 logs/resource_watch.csv 에 한 줄 적고,
 # 기준선보다 튀면 stdout 으로 알린다 → Claude 의 Monitor 도구나 터미널에서 그대로 본다.
-#   알림 기준: 메모리(WorkingSet) +50 MB, 스레드 +5, 핸들 +200 이상 / 30분마다 요약 한 줄
+#   알림 기준: 메모리(WorkingSet) +50 MB, 스레드 +10, 핸들 +200 이상 / 30분마다 요약 한 줄
+#   (스레드는 잔고·호가 조회 때 31 → 33~36 으로 잠깐 떴다가 1분 안에 돌아온다. +5 는 이 출렁임에 걸려 2026-10-28 오경보)
 #   알려진 정상 패턴: 기동 후 약 70분 동안 366 → 450~470 MB 로 오른 뒤 평탄 (파이썬 객체 수는 안 늘어남, 누수 아님)
 #   실행:  bash tools/monitor/resource_watch.sh      (멈추려면 Ctrl+C — 봇과는 무관한 별도 프로세스)
 HERE="$(cd "$(dirname "$0")" && pwd)"; ROOT="$(cd "$HERE/../.." && pwd)"
@@ -24,7 +25,7 @@ while true; do
     echo "$ts 기준선 PID $pid: 메모리 ${ws} MB (커밋 ${priv} MB) · 스레드 $th · 핸들 $h"
   fi
   dws=$(awk "BEGIN{printf \"%.1f\", $ws-$base_ws}"); dth=$((th-base_th)); dh=$((h-base_h))
-  if awk "BEGIN{exit !($dws>=50)}" || [ $dth -ge 5 ] || [ $dh -ge 200 ]; then
+  if awk "BEGIN{exit !($dws>=50)}" || [ $dth -ge 10 ] || [ $dh -ge 200 ]; then
     echo "$ts [자원 증가] 메모리 ${ws} MB (+${dws}) · 커밋 ${priv} MB · 스레드 $th (+$dth) · 핸들 $h (+$dh) · DB ${db_mb} MB · 로그 ${lg_mb} MB"
     base_ws=$ws; base_th=$th; base_h=$h   # 다시 알리려면 그 위에서 또 그만큼 늘어야 한다
   fi
