@@ -8,6 +8,17 @@ import unittest
 from kimp.config import FeeSettings
 from kimp.fees import fetch_bybit_taker_rates, with_bybit_fee_rates
 from test_engine import make_settings
+from support_ticks import continuous_upbit_ticks
+
+_TICKS = continuous_upbit_ticks()   # 가짜 시세가 호가 단위 밖이라 지정가 단위 맞춤을 끈다 (tests/support_ticks.py)
+
+
+def setUpModule():
+    _TICKS.start()
+
+
+def tearDownModule():
+    _TICKS.stop()
 
 
 class FakeBybitFees:

@@ -1,5 +1,5 @@
 """
-업비트 코인 주문 지정가 FOK (UPBIT_COIN_ORDER_TYPE=fok) — 호가 단위, 설정, 페이퍼·실거래 실행기, 브로커 흐름, 엔진 재시도
+업비트 코인 주문 지정가 FOK (진입 매수·익절 매도, 2026-10-29 부터 유일한 방식) — 호가 단위, 페이퍼·실거래 실행기, 브로커 흐름, 엔진 재시도
 
 왜 이 기능이 있나: 시장가는 판단 뒤 1초 사이 호가가 한 칸 비껴도 그 가격에 잡힌다 (CAP #12 2026-10-25: 140원 판단
 → 141원 체결, 한 칸 0.71%). FOK 는 판단한 가격에 전량 즉시 체결 아니면 취소라 판단보다 나쁘게는 절대 안 잡힌다.
@@ -9,18 +9,16 @@
 실행: python -m unittest discover -s tests -v
 """
 import logging
-import os
 import unittest
-from unittest import mock
 
 from kimp.broker import EntryMissed, ExitDeferred, HedgeBroker, PaperBroker
-from kimp.config import load_settings
 from kimp.db import ExitReason, Fill, Position, PositionStatus, make_session_factory
 from kimp.engine import FOK_RETRY_SEC
 from kimp.executor import PaperExecutor
 from kimp.live_executor import LiveExecutor
 from kimp.premium import OrderBook, Quote, upbit_krw_tick, upbit_limit_price
 from kimp.safety import Safety
+from support_ticks import continuous_upbit_ticks
 from test_live_broker import DEEP, FEES, FakeBybit, FakeUpbit, JumpyUpbit, Prices, settings
 
 
@@ -44,20 +42,6 @@ class TickTest(unittest.TestCase):
         self.assertEqual(upbit_limit_price(93.5, "buy"), 93.5)
         self.assertEqual(upbit_limit_price(2801.0, "buy"), 2800)   # 1,000~10,000원은 5원 칸
         self.assertEqual(upbit_limit_price(2801.0, "sell"), 2805)
-
-
-class ConfigTest(unittest.TestCase):
-    def _load(self, env):
-        with mock.patch.dict(os.environ, env, clear=True):
-            return load_settings(env_file=None)
-
-    def test_default_is_market_and_fok_is_accepted(self):
-        self.assertEqual(self._load({"COINS": "XRP"}).upbit_coin_order_type, "market")
-        self.assertEqual(self._load({"COINS": "XRP", "UPBIT_COIN_ORDER_TYPE": "FOK"}).upbit_coin_order_type, "fok")
-
-    def test_unknown_value_rejected(self):
-        with self.assertRaisesRegex(ValueError, "UPBIT_COIN_ORDER_TYPE"):
-            self._load({"COINS": "XRP", "UPBIT_COIN_ORDER_TYPE": "ioc"})
 
 
 class PaperFokTest(unittest.TestCase):
@@ -96,7 +80,7 @@ class PaperFokTest(unittest.TestCase):
 
     def test_paper_broker_round_trip_with_fok(self):
         """페이퍼 브로커 fok: 판단 호가가 곧 체결 호가라 진입·익절이 시장가와 같은 값으로 끝난다"""
-        broker = PaperBroker(FEES, 0.3, coin_order_type="fok")
+        broker = PaperBroker(FEES, 0.3)
         with self.sf() as s:
             broker.ex.ensure_initial(s, 10_000, 0.5)
             s.commit()
@@ -113,13 +97,12 @@ class PaperFokTest(unittest.TestCase):
 
 
 def make_fok_live(upbit_cls=FakeUpbit):
-    """실거래 흉내 + fok 브로커. 코인 호가를 5원 칸에 맞춘다 (2,800 / 2,805원) — 판단가가 곧 지정가가 되게"""
+    """실거래 흉내 + 브로커 (코인 호가는 Prices 기본값 2,800 / 2,805원 — 5원 칸, 판단가가 곧 지정가)"""
     prices = Prices()
     prices.coin_bid, prices.coin_ask = 2800.0, 2805.0
     up, by = upbit_cls(prices), FakeBybit(prices)
     ex = LiveExecutor(up, by, settings(), sleep=lambda _x: None, order_timeout_sec=0.01)
-    broker = HedgeBroker(ex, FEES, 0.3, leverage=1.0, safety=Safety(3), auto_transfer=True, network="TRX",
-                         coin_order_type="fok")
+    broker = HedgeBroker(ex, FEES, 0.3, leverage=1.0, safety=Safety(3), auto_transfer=True, network="TRX")
     return prices, up, by, broker, make_session_factory(":memory:")
 
 
@@ -255,6 +238,12 @@ class LiveFokExitTest(unittest.TestCase):
 
 class EngineRetryTest(unittest.TestCase):
     """엔진: 놓침 뒤 FOK_RETRY_SEC 동안은 같은 포지션·코인을 다시 시도하지 않는다 (초당 4번 판단해도 주문 도배 방지)"""
+
+    def setUp(self):
+        # 엔진 테스트의 가짜 시세(test_engine.make_quote)는 호가 단위 밖 가격이라 지정가 단위 맞춤을 끈다
+        ticks = continuous_upbit_ticks()
+        ticks.start()
+        self.addCleanup(ticks.stop)
 
     def test_tp_miss_then_retry_after_gap(self):
         from test_engine import FakeMarket, make_engine, make_quote, make_settings

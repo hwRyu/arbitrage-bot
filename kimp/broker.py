@@ -8,7 +8,7 @@
   0) 계산만 먼저: 그 순간 호가로 체결 계산(EntryPlan) → 호가 충분? 너무 밀리지 않나? 양쪽 돈 충분?
   1) 업비트 USDT N 개 매도 (N = 계획한 숏 금액)  → 원화 (수수료 빼고). USDT 호가는 깊어서 밀림 0
   2) 그 원화 ÷ (1 + 수수료율) 로 코인 매수      (살 때 수수료는 원화에서 따로 빠짐)
-       UPBIT_COIN_ORDER_TYPE=fok 면 판단한 가격에 지정가 '전량 즉시 체결 아니면 취소'.
+       판단한 가격에 지정가 '전량 즉시 체결 아니면 취소' (FOK). 판단보다 나쁘게는 안 잡힌다.
        취소(놓침)면 숏이 아직 없으니 판 USDT 만 되사고 끝 (ABORTED / ENTRY_MISSED, 비용 ≈ USDT 왕복 수수료)
   3) 바이비트 숏: 실제로 산 코인 개수만큼       → 산 만큼만 숏을 쳐서 크기 맞추기가 거의 필요 없다
   포지션은 0) 다음 OPENING 으로 먼저 저장하고, 단계마다 체결(Fill)을 바로 저장한다.
@@ -31,7 +31,7 @@
 청산 (세 단계)
 ------------------------------------------------------------------
   1) 업비트 코인 매도 → 2) 받은 원화로 USDT 매수 → 3) 바이비트 숏 닫기 (강제청산이면 3 대신 '강제청산됨' 기록)
-  익절 + UPBIT_COIN_ORDER_TYPE=fok: 1) 을 판단가 지정가 FOK 로 먼저 낸다. 전량 체결 안 되면 포지션을 OPEN 으로
+  익절: 1) 을 판단가 지정가 FOK 로 먼저 낸다. 전량 체결 안 되면 포지션을 OPEN 으로
   되돌리고 ExitDeferred (엔진이 잠시 뒤 다시 판단). 손절·강제청산·수동 청산은 시장가 그대로.
   CLOSING 으로 바꾸고 시작. 단계마다 '목표 양에 닿을 때까지' 남은 양만 다시 주문 (일부 체결 대비, 최대 3번).
   그래도 남거나 실패하면 CLOSING 그대로 두고, 다음 스캔(sync)에서 남은 양만 이어서.
@@ -239,13 +239,15 @@ class HedgeBroker:
                  auto_transfer: Optional[bool] = None, network: str = "PAPER", transfer_min_usdt: float = 0.0,
                  transfer_max_usdt_per_day: Optional[float] = None, transfer_alert_minutes: float = 60.0,
                  reconcile_interval_sec: float = 600.0, hedge_tolerance_percent: float = 1.0,
-                 coin_order_type: str = "market"):
+                 limit_on_tick: bool = True):
         """
         Args:
             executor: 실행기 (PaperExecutor / DryRunExecutor / LiveExecutor)
             max_slippage_percent: 진입할 때 맨 앞 호가보다 이 % 이상 밀리면 진입 안 함
-            coin_order_type: 업비트 코인 주문 방식 'market'(시장가) / 'fok'(판단가 지정가, 전량 즉시 체결 아니면 취소)
             leverage / mmr: 바이비트 레버리지, 유지증거금률 (증거금·강제청산 가격 계산)
+            limit_on_tick: 업비트 코인 지정가를 호가 단위에 맞출지. 실거래·페이퍼는 True.
+                시뮬레이션(kimp/simulate.py)만 False — 과거 1분봉에 호가 간격을 가정해 만든 가짜 호가는 단위 밖 가격이라
+                내림하면 매번 놓침이 된다. 시뮬레이션은 판단과 체결 사이에 호가가 안 움직이니 판단가 그대로 내면 된다
             now_fn: 시각 (시뮬레이션은 과거 시각)
             safety: 안전장치 (없으면 막지 않음)
             auto_transfer: 송금이 필요할 때 자동으로 보낼지. None 이면 엔진이 설정(PAPER_AUTO_REBALANCE)을 따른다
@@ -264,7 +266,7 @@ class HedgeBroker:
         self.transfer_alert_minutes = transfer_alert_minutes
         self.reconcile_interval_sec = reconcile_interval_sec
         self.hedge_tolerance_percent = hedge_tolerance_percent
-        self.coin_order_type = coin_order_type
+        self.limit_on_tick = limit_on_tick
         self._last_reconcile = -1e18
         self._last_repeat: Dict[str, float] = {}   # 반복 알림 억제용 {키: 마지막으로 알린 시각}
 
@@ -497,13 +499,18 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     def _coin_limit(self, price: Optional[float], side: str) -> Optional[float]:
         """
-        업비트 코인 주문에 쓸 지정가. market 모드면 None (= 시장가)
+        업비트 코인 진입 매수·익절 매도에 쓸 지정가 (FOK). 판단가가 없으면 None (= 시장가)
 
         판단 때 호가 소진 계산으로 나온 평균가를 호가 단위에 맞춘다 — 살 때 내림, 팔 때 올림 (판단보다 나쁘게 안 되게).
         예) 매수 판단 140.0원 → 140원 / 매도 판단 93.47원 → 93.5원
+        판단가가 없는 경우: sync 로 이어서 하는 청산(이미 정한 청산을 마저 끝내는 것)뿐이다.
+        (2026-10-29 시장가 모드 제거 — 업비트는 한 칸이 0.1~1% 라 시장가로 한 칸만 밀려도 목표 이익 0.2% 를 넘는다)
         """
-        if self.coin_order_type != "fok" or not price:
+        if not price:
             return None
+        if not self.limit_on_tick:
+            # 시뮬레이션: 판단가 그대로. 평균가 계산의 부동소수 오차로 같은 가격이 놓침이 되지 않게 아주 조금 바깥으로
+            return price * (1 + 1e-12) if side == "buy" else price * (1 - 1e-12)
         return upbit_limit_price(price, side)
 
     def _abort_missed_entry(self, session: Session, pos: Position, quote: Optional[Quote], limit: float) -> None:
@@ -532,7 +539,7 @@ class HedgeBroker:
 
         Raises:
             InsufficientBalance: 한쪽 USDT 가 모자람 (아무 주문도 안 냄)
-            EntryMissed: fok 모드에서 코인 매수가 전량 체결 안 됨 → 판 USDT 되삼 (ABORTED / ENTRY_MISSED)
+            EntryMissed: 코인 지정가 FOK 매수가 전량 체결 안 됨 → 판 USDT 되삼 (ABORTED / ENTRY_MISSED)
             EntryRejected: 호가 부족 / 너무 밀림 (아무 주문도 안 냄), 주문 실패 후 되돌림 (ABORTED),
                            주문 결과 모름 (OPENING 으로 남고 다음 스캔에 이어서)
         """
@@ -575,7 +582,7 @@ class HedgeBroker:
         session.commit()
 
         coin, ex = quote.coin, self.ex
-        limit = self._coin_limit(plan.upbit.avg_price, "buy")   # fok 면 판단가 (호가 단위 내림), market 이면 None
+        limit = self._coin_limit(plan.upbit.avg_price, "buy")   # 판단가 (호가 단위 내림) 지정가 FOK
         try:
             # 1) USDT 매도 (호가가 깊어 밀림 0) → 2) 그 원화로 코인 매수 → 3) 실제로 산 개수만큼 숏.
             #    코인이 먼저라 가격이 정해지는 두 다리(코인·숏) 사이가 0.2초 안팎이고, 코인을 못 사면 되돌릴 게 USDT 뿐이다.
@@ -852,7 +859,7 @@ class HedgeBroker:
         exp_usdt = plan.usdt.avg_price if plan else None
         exp_short = plan.bybit.avg_price if plan else None
         done = False
-        # 익절 + fok: 코인 매도를 판단가 지정가 FOK 로 먼저 낸다 (아직 아무것도 안 판 상태에서만).
+        # 익절: 코인 매도를 판단가 지정가 FOK 로 먼저 낸다 (아직 아무것도 안 판 상태에서만).
         # 전량 체결 안 되면 포지션을 OPEN 으로 되돌리고 ExitDeferred — 다른 다리는 손대지 않았으니 되돌릴 게 없다.
         # sync 로 이어서 하는 청산(plan 없음)·손절·강제청산·수동 청산은 아래 시장가 경로 그대로.
         limit = self._coin_limit(exp_sell, "sell") if pos.exit_reason == ExitReason.TAKE_PROFIT else None
@@ -1242,8 +1249,7 @@ def broker_kwargs(settings, safety: Optional[Safety] = None) -> dict:
                 transfer_max_usdt_per_day=settings.transfer_max_usdt_per_day,
                 transfer_alert_minutes=settings.transfer_alert_minutes,
                 reconcile_interval_sec=settings.reconcile_interval_sec,
-                hedge_tolerance_percent=settings.hedge_tolerance_percent,
-                coin_order_type=settings.upbit_coin_order_type)
+                hedge_tolerance_percent=settings.hedge_tolerance_percent)
 
 
 class PaperBroker(HedgeBroker):

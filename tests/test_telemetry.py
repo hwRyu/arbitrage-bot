@@ -16,6 +16,17 @@ from test_engine import FakeMarket, make_engine, make_quote, make_settings  # no
 from kimp.db import (Decision, EngineSnapshot, Event, ExitReason, Fill, Position, PositionSnapshot, Run,
                      make_session_factory)
 from kimp.telemetry import DbLogHandler, NEAR_MARGIN_PERCENT, end_run, settings_summary, start_run
+from support_ticks import continuous_upbit_ticks
+
+_TICKS = continuous_upbit_ticks()   # 가짜 시세가 호가 단위 밖이라 지정가 단위 맞춤을 끈다 (tests/support_ticks.py)
+
+
+def setUpModule():
+    _TICKS.start()
+
+
+def tearDownModule():
+    _TICKS.stop()
 
 
 class DecisionTest(unittest.TestCase):

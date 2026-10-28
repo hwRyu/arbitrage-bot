@@ -92,7 +92,7 @@ class FeeSettings:
 
     # 체결 밀림 가정 (%) — 추천·시뮬레이션·김프 차트 관리선·'필요 김프' 표시가 거래당 비용으로 쓰는 값.
     # 청산 때 판단한 호가보다 불리하게 체결되는 몫 (2026-10-24 실거래: 청산 다리 0.12~1.58%, 진입은 거의 0).
-    # 실거래 익절 판단은 이 값을 쓰지 않고 유동 여유(TP_EXEC_BUFFER, 그 순간 호가판)로 계산한다.
+    # 실거래 익절은 이 값을 쓰지 않는다 — 업비트 코인 매도가 판단가 지정가 FOK 라 판단보다 나쁘게 팔리지 않는다.
     # 세 도구는 --exec-slippage 숫자|auto 로 실행마다 바꿀 수 있다 (auto = 실거래 체결 기록 중앙값, kimp/slippage.py)
     slippage_buffer_percent: float = 0.05
 
@@ -242,13 +242,6 @@ class Settings:
     # 목표 순이익률 (%). 지금 청산하면 모든 비용을 빼고 이만큼 남을 때 청산한다.
     target_net_profit_percent: float = 1.0
 
-    # ★ 익절 실행 여유 (kimp/exec_buffer.py): 익절 조건을 '순손익 ≥ 목표 + 여유' 로. 고정값 없이 그 순간 호가판으로만 계산
-    #   여유 = 업비트 항 + 바이비트 항. 거래소 항 = "우리 앞에 우리만 한 주문이 (배수−1)개 먼저 체결된 뒤" 우리 평균가가
-    #   지금 평균가보다 얼마나 나쁜가 (%). 배수 2 = 앞에 하나, 1 = 아무도 없음(여유 0). 호가 한 칸·상수 같은 고정값 없음
-    #   BLEND #10 2026-10-24: 판단 +0.3% 익절 → 0.7초 사이 매수벽 3칸 빠져 −0.25% 체결. 끄면 여유 0 = 예전 동작
-    tp_exec_buffer_enabled: bool = True
-    tp_stress_qty_multiplier: float = 2.0
-
     # 손절 순손익률 (%, 음수). 이만큼 손해면 정리한다. 0 이면 손절 안 함.
     stop_loss_percent: float = -5.0
 
@@ -270,14 +263,6 @@ class Settings:
 
     # 맨 앞 호가보다 평균 체결가가 이 % 넘게 밀리면 진입하지 않는다 (호가가 얇은 코인 거르기)
     max_slippage_percent: float = 0.3
-
-    # ★ 업비트 코인 주문 방식 (USDT 사고팔기·바이비트 숏은 늘 시장가)
-    #   market = 시장가. 판단 뒤 1초 사이 호가가 한 칸 비껴도 그 가격에 잡힌다
-    #            (CAP #12 2026-10-25: 140원 판단 → 141원 체결, 한 칸 0.71% = 목표 0.2% 의 3.5배)
-    #   fok    = 판단한 가격에 지정가, '전량 즉시 체결 아니면 취소' (Fill or Kill). 판단가보다 나쁘게는 절대 안 잡힌다.
-    #            진입 놓침 → 판 USDT 를 되삼 (비용은 USDT 왕복 수수료 약 0.1%), 익절 놓침 → 포지션 그대로, 잠시 뒤 다시
-    #            손절·강제청산 가드·수동 청산·되돌리기는 fok 여도 시장가 (빠져나오는 게 우선)
-    upbit_coin_order_type: str = "market"
 
     # ------------------------------------------------------------------
     # 바이비트 레버리지 / 자본 비율 / 리밸런싱 (docs/concept.md 7번)
@@ -637,14 +622,11 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         entry_premium_threshold_percent=_env_float("ENTRY_PREMIUM_THRESHOLD_PERCENT", d.entry_premium_threshold_percent),
         target_net_profit_percent=_env_float("TARGET_NET_PROFIT_PERCENT", d.target_net_profit_percent),
         stop_loss_percent=_env_float("STOP_LOSS_PERCENT", d.stop_loss_percent),
-        tp_exec_buffer_enabled=_env_bool("TP_EXEC_BUFFER_ENABLED", d.tp_exec_buffer_enabled),
-        tp_stress_qty_multiplier=_env_float("TP_STRESS_QTY_MULTIPLIER", d.tp_stress_qty_multiplier),
         position_size_usdt=_env_optional_float("POSITION_SIZE_USDT"),
         capital_usage_percent=_env_float("CAPITAL_USAGE_PERCENT", d.capital_usage_percent),
         max_open_positions=_env_int("MAX_OPEN_POSITIONS", d.max_open_positions),
         reentry_cooldown_sec=_env_float("REENTRY_COOLDOWN_SEC", d.reentry_cooldown_sec),
         max_slippage_percent=_env_float("MAX_SLIPPAGE_PERCENT", d.max_slippage_percent),
-        upbit_coin_order_type=_env_str("UPBIT_COIN_ORDER_TYPE", d.upbit_coin_order_type).strip().lower(),
         bybit_leverage=_env_float("BYBIT_LEVERAGE", d.bybit_leverage),
         bybit_margin_buffer_percent=_env_float("BYBIT_MARGIN_BUFFER_PERCENT", d.bybit_margin_buffer_percent),
         bybit_mmr=_env_float("BYBIT_MMR", d.bybit_mmr),
@@ -825,12 +807,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("REENTRY_COOLDOWN_SEC 는 0 이상이어야 합니다")
     if s.max_slippage_percent < 0:
         errors.append("MAX_SLIPPAGE_PERCENT 는 0 이상이어야 합니다")
-    if s.upbit_coin_order_type not in ("market", "fok"):
-        errors.append("UPBIT_COIN_ORDER_TYPE 는 market(시장가) 또는 fok(판단가 지정가, 전량 즉시 체결 아니면 취소) 여야 합니다")
     if s.entry_max_spread_percent < 0:
         errors.append("ENTRY_MAX_SPREAD_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
-    if s.tp_stress_qty_multiplier < 1:
-        errors.append("TP_STRESS_QTY_MULTIPLIER 는 1 이상이어야 합니다 (1 = 앞에 아무도 없음 = 여유 0)")
     if s.scan_interval_sec < 1:
         errors.append("SCAN_INTERVAL_SEC 는 1 이상이어야 합니다 (거래소 요청 제한)")
     if s.orderbook_depth < 5:

@@ -14,6 +14,17 @@ from test_engine import FEES, FakeMarket, make_quote, make_settings
 from kimp.engine import Engine
 from kimp.db import make_session_factory as make_sf
 from kimp.paper_broker import PaperBroker
+from support_ticks import continuous_upbit_ticks
+
+_TICKS = continuous_upbit_ticks()   # 가짜 시세가 호가 단위 밖이라 지정가 단위 맞춤을 끈다 (tests/support_ticks.py)
+
+
+def setUpModule():
+    _TICKS.start()
+
+
+def tearDownModule():
+    _TICKS.stop()
 
 
 def make_one_shot_engine(market, **overrides):

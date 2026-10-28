@@ -175,7 +175,7 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
                        threshold = 목표 + 여유)
         tp_judge       익절 확정 (premium_top = 확인 순손익, threshold = 목표 + 여유, premium_depth = 여유 %p). 체결 뒤
                        fills.expected_price 와 비교하면 여유가 밀림을 얼마나 덮었는지 나온다
-        entry_miss     (UPBIT_COIN_ORDER_TYPE=fok) 코인 매수 지정가가 전량 체결 안 돼 취소 → 판 USDT 되삼 (note 에 지정가)
+        entry_miss     코인 매수 지정가 FOK 가 전량 체결 안 돼 취소 → 판 USDT 되삼 (note 에 지정가)
         tp_miss        (fok) 익절 매도 지정가가 전량 체결 안 돼 취소 → 포지션 그대로, FOK_RETRY_SEC 뒤 다시 (premium_top = 순손익)
     """
     # 조건이 유지되는 동안 매 판단마다 같은 줄이 쌓이는 단계(near·spread_block …)는 코인·단계별로

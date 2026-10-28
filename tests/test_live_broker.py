@@ -28,7 +28,7 @@ class Prices:
 
     def __init__(self):
         self.usdt_bid, self.usdt_ask = 1399.0, 1400.0  # 업비트 USDT/KRW
-        self.coin_bid, self.coin_ask = 2800.0, 2801.0  # 업비트 XRP/KRW
+        self.coin_bid, self.coin_ask = 2800.0, 2805.0  # 업비트 XRP/KRW (1,000~10,000원은 호가 한 칸 5원 — 실제처럼 칸에 맞춘다)
         self.perp_bid, self.perp_ask = 2.0, 2.0001  # 바이비트 XRP 무기한
 
     def quote(self) -> Quote:
@@ -372,7 +372,7 @@ class UnwindTest(unittest.TestCase):
     def test_coin_buy_fails_then_unwind(self):
         """코인 매수 실패 → 받은 원화로 USDT 되사기 + 숏 닫기 → ABORTED, 잔고 거의 원상태"""
         prices, up, by, broker, sf = make_live()
-        up.fail.add("buy XRP/KRW")
+        up.fail.add("buy XRP/KRW limit")
         with sf() as s:
             with self.assertRaises(EntryRejected):
                 broker.open_hedge(s, prices.quote(), 50.0)
@@ -408,8 +408,8 @@ class UnwindTest(unittest.TestCase):
             self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.5)
             self.assertAlmostEqual(up.bal["XRP"], 0.0, places=6)
             self.assertEqual(up.calls.count("sell USDT/KRW"), 1)
-            self.assertEqual(up.calls.count("buy XRP/KRW"), 1)
-            self.assertEqual(up.calls.count("sell XRP/KRW"), 1)
+            self.assertEqual(up.calls.count("buy XRP/KRW limit"), 1)   # 진입 매수는 지정가 FOK
+            self.assertEqual(up.calls.count("sell XRP/KRW"), 1)        # 되돌리기 되팔기는 시장가
             self.assertEqual(up.calls.count("buy USDT/KRW"), 1)
 
     def test_consecutive_failures_block(self):
@@ -491,7 +491,7 @@ class LegRiskTest(unittest.TestCase):
     def test_partial_coin_buy_shorts_only_what_was_bought(self):
         """코인이 80%만 사짐 → 숏은 산 개수만큼만 친다 (크기 맞추기 주문 없음), 남은 원화는 USDT 로"""
         prices, up, by, broker, sf = make_live()
-        up.partial["buy XRP/KRW"] = 0.8
+        up.partial["buy XRP/KRW limit"] = 0.8   # FOK 라 실제론 없지만, 거래소가 일부만 돌려줘도 산 만큼만 헷지하는지 (방어)
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             self.assertAlmostEqual(by.short, pos.upbit_qty)   # 1:1 헷지
@@ -533,12 +533,13 @@ class LegRiskTest(unittest.TestCase):
         prices, up, by, broker, sf = make_live()
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)
-            up.partial["sell XRP/KRW"] = 0.5
+            up.partial["sell XRP/KRW limit"] = 0.5   # 익절 FOK 매도가 절반만 (방어) → 남은 양은 시장가로 이어서
             val = broker.value_exit(pos, prices.quote())
             broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
             self.assertEqual(pos.status, PositionStatus.CLOSED)
             self.assertAlmostEqual(up.bal["XRP"], 0.0, places=6)
-            self.assertEqual(up.calls.count("sell XRP/KRW"), 2)
+            self.assertEqual(up.calls.count("sell XRP/KRW limit"), 1)
+            self.assertEqual(up.calls.count("sell XRP/KRW"), 1)
 
     def test_lost_response_but_order_went_in(self):
         """주문은 들어갔는데 응답만 끊김 → 추적번호로 찾아서 그대로 진행 (중복 주문 없음)"""
@@ -611,6 +612,19 @@ class LegRiskTest(unittest.TestCase):
             self.assertAlmostEqual(total - 1000, pnl.net_usdt, delta=0.01)
 
 
+class JumpyPerpUpbit(FakeUpbit):
+    """업비트 코인을 산 순간 바이비트 가격이 내려간다 — 코인 매수 → 숏 사이의 시간을 흉내 (업비트는 FOK 라 판단가 그대로)"""
+
+    drop = 0.99
+
+    def create_order(self, symbol, type_, side, amount, price=None, params=None):
+        r = super().create_order(symbol, type_, side, amount, price, params)
+        if symbol != "USDT/KRW" and side == "buy":
+            self.p.perp_bid *= self.drop
+            self.p.perp_ask *= self.drop
+        return r
+
+
 class JumpyUpbit(FakeUpbit):
     """USDT 를 판 순간(진입 첫 주문) 업비트 코인 가격이 뛴다 — 주문 세 개를 순서대로 내는 사이의 시간을 흉내"""
 
@@ -678,9 +692,10 @@ class HedgeGapTest(unittest.TestCase):
             self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.5)  # USDT 로 되돌아옴
 
     def test_entry_premium_drift_is_warned(self):
-        """주문 사이에 가격이 움직여 실제 진입 김프가 판단보다 MAX_SLIPPAGE 넘게 나빠지면 경고 (헷지는 유지)"""
+        """주문 사이에 가격이 움직여 실제 진입 김프가 판단보다 MAX_SLIPPAGE 넘게 나빠지면 경고 (헷지는 유지)
+        업비트 코인은 FOK 라 판단가 그대로 → 움직이는 쪽은 바이비트 (CAP #16 2026-10-27: 숏 0.21% 밀림)"""
         prices = Prices()
-        up, by = JumpyUpbit(prices), FakeBybit(prices)
+        up, by = JumpyPerpUpbit(prices), FakeBybit(prices)
         ex = LiveExecutor(up, by, settings(), sleep=lambda _x: None, order_timeout_sec=0.01)
         broker = HedgeBroker(ex, FEES, 0.3, leverage=1.0, safety=Safety(3), auto_transfer=True, network="TRX")
         sf = make_session_factory(":memory:")
@@ -696,8 +711,8 @@ class HedgeGapTest(unittest.TestCase):
     def test_small_drift_is_quiet(self):
         """0.3% 안쪽으로만 움직이면 경고하지 않는다"""
         prices = Prices()
-        up, by = JumpyUpbit(prices), FakeBybit(prices)
-        up.jump = 1.001
+        up, by = JumpyPerpUpbit(prices), FakeBybit(prices)
+        up.drop = 0.999
         ex = LiveExecutor(up, by, settings(), sleep=lambda _x: None, order_timeout_sec=0.01)
         broker = HedgeBroker(ex, FEES, 0.3, leverage=1.0, safety=Safety(3), auto_transfer=True, network="TRX")
         sf = make_session_factory(":memory:")
@@ -713,7 +728,7 @@ class HedgeGapTest(unittest.TestCase):
             val = broker.value_exit(pos, prices.quote())
             up.fail.add("sell XRP/KRW")
             with self.assertLogs("kimp.broker", level=logging.CRITICAL) as first:
-                broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+                broker.close_hedge(s, pos, val, ExitReason.STOP_LOSS)   # 시장가 경로 (익절은 FOK 가 먼저)
             self.assertEqual(sum("[청산 실패]" in m for m in first.output), 1)
             up.fail.add("sell XRP/KRW")              # 다음 스캔에도 막힘
             with self.assertNoLogs("kimp.broker", level=logging.CRITICAL):
@@ -829,7 +844,7 @@ class ParallelLegsTest(unittest.TestCase):
             t0 = time.monotonic()
             broker.mark_decided()                                   # 엔진이 '청산하기로 정한' 순간
             with self.assertLogs("kimp.broker", level=logging.INFO) as logs:
-                pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+                pnl = broker.close_hedge(s, pos, val, ExitReason.STOP_LOSS)   # 동시 전송은 시장가 경로 (익절은 FOK 매도가 먼저)
             took = time.monotonic() - t0
             self.assertIsNotNone(pnl)
             self.assertEqual(pos.status, PositionStatus.CLOSED)
@@ -846,7 +861,7 @@ class ParallelLegsTest(unittest.TestCase):
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             up.fail.add("sell XRP/KRW")
             val = broker.value_exit(pos, prices.quote())
-            self.assertIsNone(broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT))
+            self.assertIsNone(broker.close_hedge(s, pos, val, ExitReason.STOP_LOSS))   # 동시 전송은 시장가 경로
             self.assertEqual(pos.status, PositionStatus.CLOSING)
             self.assertEqual(by.short, 0.0)                       # 숏은 이미 닫힘
             self.assertGreater(up.bal["XRP"], 0)                  # 코인은 아직

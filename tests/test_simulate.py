@@ -146,7 +146,7 @@ class SimulationTest(unittest.TestCase):
         bybit = {"DOGE": {START + i * MINUTE_MS: bybit_price for i in range(n)}}
         # 익절 실행 여유는 끈다 — 이 테스트는 '호가 간격 가정' 하나의 효과만 본다
         st = settings(coins=["DOGE"], entry_premium_threshold_percent=0.0, target_net_profit_percent=0.3,
-                      reentry_cooldown_sec=0, tp_exec_buffer_enabled=False)
+                      reentry_cooldown_sec=0)
 
         def run(spread):
             usdt = {START + i * MINUTE_MS: fx for i in range(n)}

@@ -333,7 +333,9 @@ def run_simulation(
     safety = Safety(settings.max_consecutive_failures, settings.daily_loss_limit_usdt, None, clock)
     broker = PaperBroker(settings.fees, settings.max_slippage_percent, leverage=settings.bybit_leverage,
                          mmr=settings.bybit_mmr, now_fn=lambda: datetime.fromtimestamp(clock(), timezone.utc),
-                         upbit_min_order_krw=settings.upbit_min_order_krw, **broker_kwargs(settings, safety))
+                         upbit_min_order_krw=settings.upbit_min_order_krw,
+                         limit_on_tick=False,   # 가짜 호가(1분봉 + 가정 간격)는 호가 단위 밖 가격 → 판단가 그대로 지정가
+                         **broker_kwargs(settings, safety))
     engine = Engine(sim_settings, market, fx, broker, session_factory, list(coins), clock=clock)
 
     # 첫 봉이 '막 끝난' 시각에서 시작한다. 봉 시작 시각으로 두면 아직 안 끝난 봉의 종가를
