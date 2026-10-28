@@ -175,6 +175,52 @@ class LiveFokExitTest(unittest.TestCase):
         self.assertEqual(by.short, 0.0)
         self.assertGreater(pnl.net_usdt, 0)
 
+    def test_take_profit_closes_short_without_rest_after_fok(self):
+        """
+        익절 FOK 매도가 다 체결되면 숏 닫기를 바로 낸다 — 그 사이에 잔고·포지션 REST 조회가 없어야 한다
+
+        CAP #16 (2026-10-28 22:40): 주문마다 두 거래소 기억을 다 비워서, FOK 매도 뒤 업비트 잔고·바이비트 잔고·
+        바이비트 포지션을 차례로 다시 받느라 숏 닫기가 1.1초 늦었고 바이비트 다리가 0.40% 밀렸다 (docs/issues.md #2)
+        """
+        prices, up, by, broker, s, pos = self._open()
+        prices.coin_bid, prices.coin_ask = 2850.0, 2855.0
+        val = broker.value_exit(pos, prices.quote())
+        broker.ex.refresh()
+        broker.ex.prefetch([pos.coin])            # 엔진처럼 스캔 앞에서 미리 받아 둔다
+        seq = []
+        for obj, name, tag in ((up, "fetch_balance", "upbit 잔고"), (by, "fetch_balance", "bybit 잔고"),
+                               (by, "fetch_positions", "bybit 포지션"),
+                               (up, "create_order", "upbit 주문"), (by, "create_order", "bybit 주문")):
+            orig = getattr(obj, name)
+            def wrapped(*a, _orig=orig, _tag=tag, **k):
+                seq.append(_tag)
+                return _orig(*a, **k)
+            setattr(obj, name, wrapped)
+        broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
+        self.assertEqual(pos.status, PositionStatus.CLOSED)
+        first_up = seq.index("upbit 주문")                    # FOK 매도
+        first_by = seq.index("bybit 주문")                    # 숏 닫기
+        self.assertLess(first_up, first_by)
+        self.assertEqual(seq[first_up + 1:first_by], [])      # 둘 사이에 거래소 조회 없음
+
+    def test_upbit_order_keeps_bybit_cache(self):
+        """업비트 주문 뒤에는 업비트 기억만 비운다. 바이비트 주문 뒤에는 바이비트 기억만"""
+        prices, up, by, broker, s, pos = self._open()
+        ex = broker.ex
+        ex.refresh()
+        ex.prefetch([pos.coin])
+        self.assertIsNotNone(ex._by_bal)
+        self.assertIn(pos.coin, ex._shorts)
+        ex.sell_coin(s, prices.quote(), pos.coin, 1.0)
+        self.assertIsNone(ex._up_bal)
+        self.assertIsNotNone(ex._by_bal)
+        self.assertIn(pos.coin, ex._shorts)
+        ex.free(s, "upbit:USDT")                               # 업비트 다시 받기
+        ex.close_short(s, prices.quote(), pos.coin, 1.0, pos.entry_bybit_price_usdt, 1.0)
+        self.assertIsNotNone(ex._up_bal)
+        self.assertIsNone(ex._by_bal)
+        self.assertNotIn(pos.coin, ex._shorts)
+
     def test_take_profit_miss_keeps_position_open(self):
         """판단 뒤 매수호가가 빠지면 FOK 취소 → ExitDeferred, 포지션 OPEN 그대로, 숏·코인 그대로 → 돌아오면 청산"""
         prices, up, by, broker, s, pos = self._open()

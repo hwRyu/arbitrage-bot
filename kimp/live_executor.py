@@ -144,6 +144,22 @@ class LiveExecutor:
         self._shorts = {}
         self._liq = {}
 
+    def _refresh_after_order(self, ex) -> None:
+        """
+        주문이 끝난 거래소 쪽 기억만 비운다 (다른 거래소 것은 그대로 둔다)
+
+        업비트 주문은 바이비트 잔고·숏을 바꾸지 못하고, 그 반대도 마찬가지다. 예전엔 주문마다 refresh() 로
+        둘 다 비워서, 익절 FOK 매도 직후 숏 닫기 전에 업비트 잔고 + 바이비트 잔고 + 바이비트 포지션을
+        REST 로 차례로 다시 받느라 숏 닫기가 1.1초 늦게 나갔다 (CAP #16 2026-10-28 22:40: 바이비트 다리 +0.40% 밀림,
+        docs/issues.md #2). 비우는 쪽은 그대로 다음 조회 때 새로 받으므로 주문 뒤 값이 낡을 일은 없다.
+        """
+        if ex is self.up:
+            self._up_bal = None
+        else:
+            self._by_bal = None
+            self._shorts = {}
+            self._liq = {}
+
     def prefetch(self, coins: Iterable[str]) -> None:
         """
         캐시를 비운 직후(판단 전) 잔고와 숏을 미리 받아 둔다 — 주문 경로가 REST 를 기다리지 않게
@@ -433,7 +449,7 @@ class LiveExecutor:
             logger.warning("%s: 주문 요청은 오류였지만 추적번호 %s 로 조회하니 들어가 있음 → 그대로 진행", what, client_id)
             order = found
         done = self._wait(ex, order, symbol)
-        self.refresh()
+        self._refresh_after_order(ex)
         try:
             fill = self._fill(done, fee_ccy, what)
         except OrderFailed:
@@ -587,7 +603,7 @@ class LiveExecutor:
         if order is None:
             return None
         done = self._wait(ex, order, sym)
-        self.refresh()
+        self._refresh_after_order(ex)
         if not float(done.get("filled") or 0.0):
             return None
         return self._fill(done, ccy, f"{side} 조회")

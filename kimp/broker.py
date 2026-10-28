@@ -870,7 +870,10 @@ class HedgeBroker:
                 left = pos.upbit_qty - s("sell", sums).qty
                 # 실제로 가진 것보다 많이 팔 수는 없다. 수수료가 코인으로 떼이거나
                 # 대조가 어긋난 경우 진입 수량보다 적게 남아 있을 수 있다.
-                left = min(left, self.balance(session, coin_key(pos.coin)))
+                # 이미 다 팔았으면(익절 FOK 직후) 잔고를 묻지 않는다 — 주문 직후라 기억이 비어 있어 REST 를
+                # 기다리게 되고, 그만큼 숏 닫기가 늦게 나간다 (docs/issues.md #2)
+                if left > pos.upbit_qty * 1e-9:
+                    left = min(left, self.balance(session, coin_key(pos.coin)))
                 coin_done = left <= pos.upbit_qty * 1e-9 or (coin_bid is not None and
                                                               left * coin_bid < self.ex.min_order_krw(pos.coin))
                 short_left = pos.bybit_qty - s("close_short", sums).qty
