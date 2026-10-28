@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -35,6 +35,7 @@ from kimp.config import Settings
 from kimp.broker import EntryMissed, EntryRejected, ExitDeferred, ExitValuation, HedgeBroker, InsufficientBalance
 from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
+from kimp.fok_trace import classify_miss
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium
 from kimp.premium import Quote
@@ -468,6 +469,21 @@ class Engine:
             logger.warning("%s 확인 시세 조회 실패 (이번 스캔은 주문 안 함): %s", coin, exc)
             return None
 
+    def _miss_reason(self, coin: str, judged) -> Tuple[str, str]:
+        """
+        지정가 FOK 를 놓친 이유 (kimp/fok_trace.py) — 주문 때 본 호가와 지금 호가를 비교한다
+
+        지금 호가는 확인 시세를 한 번 더 받아서 본다 (웹소켓이면 바로, 아니면 REST 한 번). 놓친 뒤에만 부르니
+        주문 속도에는 영향이 없다. 매수를 놓쳤으면 매도호가, 매도를 놓쳤으면 매수호가를 본다.
+        """
+        if judged is None:
+            return classify_miss(None, None)
+        fresh = self._fresh_quote(coin)
+        now_levels = None
+        if fresh is not None:
+            now_levels = fresh.upbit.asks if judged.side == "buy" else fresh.upbit.bids
+        return classify_miss(judged, now_levels)
+
     def _now_utc(self):
         """지금 시각 (UTC)"""
         from datetime import datetime, timezone
@@ -480,9 +496,11 @@ class Engine:
             final = self.broker.close_hedge(session, pos, valuation, reason, liquidated=liquidated)
         except ExitDeferred as exc:
             self._tp_retry_at[pos.id] = self._clock() + FOK_RETRY_SEC
-            logger.info("[익절 보류] #%d %s | %s | %g초 뒤 다시 판단", pos.id, pos.coin, exc, FOK_RETRY_SEC)
+            why, detail = self._miss_reason(pos.coin, exc.fok)
+            logger.info("[익절 보류] #%d %s | %s | 이유: %s — %s | %g초 뒤 다시 판단",
+                        pos.id, pos.coin, exc, why, detail, FOK_RETRY_SEC)
             telemetry.decision(session, pos.coin, "tp_miss", valuation.pnl.net_percent, 0.0, position_id=pos.id,
-                               note=str(exc), now=self._now_utc())
+                               note=f"{why} | {exc} | {detail}", now=self._now_utc())
             return
         self._reentry_allowed_at[pos.coin] = self._clock() + self.s.reentry_cooldown_sec
         if final is None:
@@ -944,9 +962,11 @@ class Engine:
             except EntryMissed as exc:
                 # 지정가가 비껴가 못 삼. 판 USDT 는 되샀고 숏은 없었다 → 잠시 뒤 다시 (호가가 돌아오면 그때)
                 self._reentry_allowed_at[coin] = self._clock() + FOK_RETRY_SEC
-                logger.info("[진입 놓침] %s | %s | %g초 뒤 다시", coin, exc, FOK_RETRY_SEC)
+                why, detail = self._miss_reason(coin, exc.fok)
+                logger.info("[진입 놓침] %s | %s | 이유: %s — %s | %g초 뒤 다시", coin, exc, why, detail, FOK_RETRY_SEC)
                 telemetry.decision(session, coin, "entry_miss", top, threshold, premium_depth=depth, size_usdt=size,
-                                   bybit_qty=bybit_qty, funding_8h=funding, note=str(exc), now=self._now_utc())
+                                   bybit_qty=bybit_qty, funding_8h=funding, note=f"{why} | {exc} | {detail}",
+                                   now=self._now_utc())
                 continue
             except EntryRejected as exc:
                 self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")

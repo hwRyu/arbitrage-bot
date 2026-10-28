@@ -93,6 +93,7 @@ from kimp.executor import (
     new_client_id,
 )
 from kimp.pnl import EntryLegs, ExitLegs, PnLBreakdown, compute_pnl, liquidation_price, liquidation_price_from_margin
+from kimp.fok_trace import FokBook, snapshot as fok_snapshot
 from kimp.premium import ExitPlan, Quote, premium_percent, upbit_limit_price
 from kimp.safety import Safety, kst_midnight_utc
 
@@ -133,11 +134,25 @@ class EntryRejected(Exception):
 
 
 class EntryMissed(EntryRejected):
-    """지정가(FOK) 코인 매수가 전량 체결되지 않아 진입을 접음. 판 USDT 는 되삼 (비용은 USDT 왕복 수수료 정도)"""
+    """지정가(FOK) 코인 매수가 전량 체결되지 않아 진입을 접음. 판 USDT 는 되삼 (비용은 USDT 왕복 수수료 정도)
+
+    fok: 주문 때 본 호가 (kimp.fok_trace.FokBook) — 엔진이 놓친 직후 호가와 비교해 이유를 남긴다
+    """
+
+    def __init__(self, message: str, fok: Optional[FokBook] = None):
+        super().__init__(message)
+        self.fok = fok
 
 
 class ExitDeferred(Exception):
-    """익절 지정가(FOK) 매도가 체결되지 않아 이번에는 청산하지 않음. 포지션은 OPEN 그대로, 엔진이 잠시 뒤 다시 판단"""
+    """익절 지정가(FOK) 매도가 체결되지 않아 이번에는 청산하지 않음. 포지션은 OPEN 그대로, 엔진이 잠시 뒤 다시 판단
+
+    fok: 주문 때 본 호가 (kimp.fok_trace.FokBook) — 엔진이 놓친 직후 호가와 비교해 이유를 남긴다
+    """
+
+    def __init__(self, message: str, fok: Optional[FokBook] = None):
+        super().__init__(message)
+        self.fok = fok
 
 
 class InsufficientBalance(EntryRejected):
@@ -583,6 +598,8 @@ class HedgeBroker:
 
         coin, ex = quote.coin, self.ex
         limit = self._coin_limit(plan.upbit.avg_price, "buy")   # 판단가 (호가 단위 내림) 지정가 FOK
+        # 놓친 이유를 가리려고 주문 때 본 매도호가를 찍어 둔다 (로그는 주문이 끝난 뒤 — 주문 속도에 안 얹히게)
+        fok = fok_snapshot(quote.upbit.asks, "buy", limit, plan.upbit.filled_qty) if limit is not None else None
         try:
             # 1) USDT 매도 (호가가 깊어 밀림 0) → 2) 그 원화로 코인 매수 → 3) 실제로 산 개수만큼 숏.
             #    코인이 먼저라 가격이 정해지는 두 다리(코인·숏) 사이가 0.2초 안팎이고, 코인을 못 사면 되돌릴 게 USDT 뿐이다.
@@ -594,9 +611,12 @@ class HedgeBroker:
                                lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid,
                                                                 limit_price=limit),
                                expected_price=plan.upbit.avg_price)
+            if fok is not None:
+                logger.info("[지정가 주문] #%d %s | %s | %s", pos.id, coin, fok.describe(),
+                            "체결" if bought.qty > 0 else "미체결")
             if bought.qty <= 0:   # 지정가 FOK 취소 (시장가는 체결 0 이면 OrderFailed 로 아래 되돌리기 경로)
                 self._abort_missed_entry(session, pos, quote, limit or 0.0)
-                raise EntryMissed(f"지정가 {limit:g}원에 전량 체결 안 됨 → 판 USDT 되삼")
+                raise EntryMissed(f"지정가 {limit:g}원에 전량 체결 안 됨 → 판 USDT 되삼", fok=fok)
             self._leg(session, pos, "open_short",   # 3) 산 만큼 숏 (거래소 주문 단위로 맞춰진다)
                       lambda cid: ex.open_short(session, quote, coin, bought.qty, client_id=cid),
                       expected_price=plan.bybit.avg_price)
@@ -866,12 +886,16 @@ class HedgeBroker:
         try:
             if limit is not None and not s("sell", self._sums(session, pos)).qty:
                 left = min(pos.upbit_qty, self.balance(session, coin_key(pos.coin)))
+                fok = fok_snapshot(quote.upbit.bids, "sell", limit, left) if quote else None   # 놓친 이유 분석용
                 sold = self._leg(session, pos, "sell", lambda cid: self.ex.sell_coin(
                     session, quote, pos.coin, left, client_id=cid, limit_price=limit), expected_price=exp_sell)
+                if fok is not None:
+                    logger.info("[지정가 주문] #%d %s | %s | %s", pos.id, pos.coin, fok.describe(),
+                                "체결" if sold.qty > 0 else "미체결")
                 if sold.qty <= 0:
                     pos.status, pos.exit_reason = PositionStatus.OPEN, None
                     session.commit()
-                    raise ExitDeferred(f"익절 지정가 {limit:g}원에 전량 체결 안 됨 (호가가 비껴감)")
+                    raise ExitDeferred(f"익절 지정가 {limit:g}원에 전량 체결 안 됨", fok=fok)
             for _ in range(MAX_LEG_RETRIES):
                 sums = self._sums(session, pos)
                 left = pos.upbit_qty - s("sell", sums).qty

@@ -298,7 +298,7 @@ class EngineRetryTest(unittest.TestCase):
         market.quotes = {"XRP": make_quote(-1.0)}
         with self.assertLogs("kimp.engine", level=logging.INFO) as logs:
             engine.step()
-        self.assertTrue(any("[진입 놓침]" in m for m in logs.output))
+        self.assertTrue(any("[진입 놓침]" in m and "이유:" in m for m in logs.output))   # 놓친 이유가 로그에 남는다
         engine._clock = lambda: t0 + FOK_RETRY_SEC / 2
         engine.step()
         self.assertEqual(len(calls), 1)                       # 대기 중
