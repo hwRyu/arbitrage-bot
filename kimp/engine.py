@@ -26,7 +26,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -126,6 +127,7 @@ class Engine:
         self._last_log: Dict[str, float] = {}
         self._reentry_allowed_at: Dict[str, float] = {}
         self._tp_retry_at: Dict[int, float] = {}   # 익절 지정가가 놓친 포지션 → 이 시각까지 익절 판단 쉼
+        self._miss_times: Dict[str, Deque[float]] = {}   # 코인별 최근 진입 놓침 시각 (연속 놓침 쉬기, N1)
         # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
         self._bybit_range = RangeTracker()
         self._last_status_log = 0.0
@@ -1035,12 +1037,23 @@ class Engine:
                     pos = self.broker.open_hedge(session, quote, bybit_qty)
             except EntryMissed as exc:
                 # 지정가가 비껴가 못 삼. 판 USDT 는 되샀고 숏은 없었다 → 잠시 뒤 다시 (호가가 돌아오면 그때)
-                self._reentry_allowed_at[coin] = self._clock() + FOK_RETRY_SEC
                 why, detail = self._miss_reason(coin, exc.fok)
-                logger.info("[진입 놓침] %s | %s | 이유: %s — %s | %g초 뒤 다시", coin, exc, why, detail, FOK_RETRY_SEC)
                 telemetry.decision(session, coin, "entry_miss", top, threshold, premium_depth=depth, size_usdt=size,
                                    bybit_qty=bybit_qty, funding_8h=funding, note=f"{why} | {exc} | {detail}",
                                    now=self._now_utc())
+                streak = self._note_entry_miss(coin)
+                if streak is None:
+                    self._reentry_allowed_at[coin] = self._clock() + FOK_RETRY_SEC
+                    logger.info("[진입 놓침] %s | %s | 이유: %s — %s | %g초 뒤 다시", coin, exc, why, detail, FOK_RETRY_SEC)
+                else:
+                    # 연속 놓침 쉬기 (N1): 순간 신호가 켜졌다 꺼지는 장에서 2초마다 USDT 왕복 비용만 쌓이는 반복을 끊는다
+                    self._reentry_allowed_at[coin] = self._clock() + self.s.entry_miss_cooldown_sec
+                    logger.warning("[진입 놓침] %s | %s | 이유: %s — %s | %g초 안 %d번째 놓침 → %g분 동안 %s 진입 쉼",
+                                   coin, exc, why, detail, self.s.entry_miss_window_sec, streak,
+                                   self.s.entry_miss_cooldown_sec / 60, coin)
+                    telemetry.decision(session, coin, "miss_cooldown", top, threshold, premium_depth=depth,
+                                       note=f"{self.s.entry_miss_window_sec:g}초 안 {streak}번 놓침 → "
+                                            f"{self.s.entry_miss_cooldown_sec:g}초 쉼", now=self._now_utc())
                 continue
             except EntryRejected as exc:
                 self._log_throttled(f"reject-{coin}", logging.INFO, f"{coin} 진입 보류: {exc}")
@@ -1076,6 +1089,29 @@ class Engine:
                 logger.warning("[한 번만 돌리기] #%d %s | 포지션을 잡았습니다 | 더 진입하지 않고 청산까지 봅니다",
                                pos.id, coin)
                 return  # 여러 코인이 동시에 조건을 만족해도 하나만 잡는다
+
+    def _note_entry_miss(self, coin: str) -> Optional[int]:
+        """
+        진입 놓침 한 번 세기 (연속 놓침 쉬기, docs/issues.md N1)
+
+        Returns:
+            창(ENTRY_MISS_WINDOW_SEC) 안 놓침이 한도(ENTRY_MISS_STREAK_LIMIT)에 닿았으면 그 횟수 → 쉬어야 한다.
+            아직이면 None. 한도가 0 이면 끔(늘 None). 쉬기 시작하면 기록을 비워 쉬고 난 뒤 처음부터 센다
+        """
+        limit = self.s.entry_miss_streak_limit
+        if limit <= 0:
+            return None
+        now = self._clock()
+        q = self._miss_times.setdefault(coin, deque())
+        q.append(now)
+        edge = now - self.s.entry_miss_window_sec
+        while q and q[0] < edge:
+            q.popleft()
+        if len(q) >= limit:
+            count = len(q)
+            q.clear()
+            return count
+        return None
 
     def _fit_entry(self, coin: str, quote: Quote, bybit_qty: float, threshold: float, fee_rate: float) -> EntryFit:
         """업비트 지정가 FOK 진입 크기·안전 확인 (kimp/fok_sizing.py). 숏 개수는 바이비트 주문 단위로 내린다"""

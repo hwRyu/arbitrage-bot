@@ -261,6 +261,14 @@ class Settings:
     # 청산 후 같은 코인을 다시 진입하기 전 기다리는 시간 (초)
     reentry_cooldown_sec: float = 300.0
 
+    # ★ 연속 놓침 쉬기 (docs/issues.md 놓침 후보 N1): 같은 코인의 지정가 FOK 진입 놓침이 ENTRY_MISS_WINDOW_SEC 안에
+    #   ENTRY_MISS_STREAK_LIMIT 번이 되면 그 코인은 ENTRY_MISS_COOLDOWN_SEC 동안 진입하지 않는다 (limit 0 = 끔).
+    #   놓침 한 번에 USDT 왕복 약 0.1~0.2%(20 USDT 에 0.035 USDT)가 들고, 순간 신호가 켜졌다 꺼지는 장에서는 2초마다
+    #   반복된다 (XPL 2026-10-30 07:04~07:06 151초에 4번, CAP 06:04~06:05 47초에 4번). 그 반복을 끊는다
+    entry_miss_streak_limit: int = 2
+    entry_miss_window_sec: float = 300.0
+    entry_miss_cooldown_sec: float = 600.0
+
     # 맨 앞 호가보다 평균 체결가가 이 % 넘게 밀리면 진입하지 않는다 (호가가 얇은 코인 거르기)
     max_slippage_percent: float = 0.3
 
@@ -639,6 +647,9 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         capital_usage_percent=_env_float("CAPITAL_USAGE_PERCENT", d.capital_usage_percent),
         max_open_positions=_env_int("MAX_OPEN_POSITIONS", d.max_open_positions),
         reentry_cooldown_sec=_env_float("REENTRY_COOLDOWN_SEC", d.reentry_cooldown_sec),
+        entry_miss_streak_limit=_env_int("ENTRY_MISS_STREAK_LIMIT", d.entry_miss_streak_limit),
+        entry_miss_window_sec=_env_float("ENTRY_MISS_WINDOW_SEC", d.entry_miss_window_sec),
+        entry_miss_cooldown_sec=_env_float("ENTRY_MISS_COOLDOWN_SEC", d.entry_miss_cooldown_sec),
         max_slippage_percent=_env_float("MAX_SLIPPAGE_PERCENT", d.max_slippage_percent),
         bybit_leverage=_env_float("BYBIT_LEVERAGE", d.bybit_leverage),
         bybit_margin_buffer_percent=_env_float("BYBIT_MARGIN_BUFFER_PERCENT", d.bybit_margin_buffer_percent),
@@ -819,6 +830,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT / TRANSFER_FEE_BYBIT_TO_UPBIT_USDT 는 0 이상이어야 합니다")
     if s.rebalance_threshold_percent <= 0:
         errors.append("REBALANCE_THRESHOLD_PERCENT 는 0 보다 커야 합니다")
+    if s.entry_miss_streak_limit < 0 or s.entry_miss_window_sec < 0 or s.entry_miss_cooldown_sec < 0:
+        errors.append("ENTRY_MISS_STREAK_LIMIT / ENTRY_MISS_WINDOW_SEC / ENTRY_MISS_COOLDOWN_SEC 는 0 이상이어야 합니다")
     if s.reentry_cooldown_sec < 0:
         errors.append("REENTRY_COOLDOWN_SEC 는 0 이상이어야 합니다")
     if s.max_slippage_percent < 0:

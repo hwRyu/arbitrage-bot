@@ -311,3 +311,59 @@ class EngineRetryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MissCooldownTest(unittest.TestCase):
+    """연속 놓침 쉬기 (N1): 같은 코인이 창 안에 한도만큼 놓치면 쿨다운 동안 진입하지 않는다 (XPL 2026-10-30 151초에 4번)"""
+
+    def setUp(self):
+        ticks = continuous_upbit_ticks()   # 엔진 가짜 시세는 호가 단위 밖 가격
+        ticks.start()
+        self.addCleanup(ticks.stop)
+
+    def _engine(self, **over):
+        from test_engine import FakeMarket, make_engine, make_quote, make_settings
+        market = FakeMarket()
+        cfg = dict(entry_miss_streak_limit=2, entry_miss_window_sec=300, entry_miss_cooldown_sec=600)
+        cfg.update(over)
+        engine, sf, broker = make_engine(make_settings(**cfg), market)
+        calls = []
+        real = broker.open_hedge
+
+        def always_miss(session, quote, qty):
+            calls.append(qty)
+            raise EntryMissed("테스트: 지정가 미체결")
+
+        broker.open_hedge = always_miss
+        market.quotes = {"XRP": make_quote(-1.0)}
+        return engine, sf, calls, real, broker, market, make_quote
+
+    def test_second_miss_starts_cooldown(self):
+        engine, sf, calls, real, broker, market, make_quote = self._engine()
+        t0 = engine._clock()
+        with self.assertLogs("kimp.engine", level=logging.INFO):
+            engine.step()                                              # 1번째 놓침 → 2초 뒤 다시
+        self.assertEqual(len(calls), 1)
+        engine._clock = lambda: t0 + FOK_RETRY_SEC + 0.1
+        with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
+            engine.step()                                              # 2번째 놓침 → 쿨다운
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(any("진입 쉼" in m for m in logs.output), logs.output)
+        engine._clock = lambda: t0 + 60
+        engine.step()                                                  # 쿨다운 중 → 시도 안 함
+        self.assertEqual(len(calls), 2)
+        engine._clock = lambda: t0 + FOK_RETRY_SEC + 0.1 + 600 + 1   # 2번째 놓침 시각 + 쿨다운 600초 뒤
+        broker.open_hedge = real                                       # 쿨다운 끝 → 다시 시도, 이번엔 체결
+        engine.step()
+        with sf() as s:
+            from kimp.db import Decision
+            self.assertEqual(s.query(Position).filter_by(status=PositionStatus.OPEN).count(), 1)
+            self.assertIn("miss_cooldown", [d.stage for d in s.query(Decision)])
+
+    def test_limit_zero_turns_it_off(self):
+        engine, sf, calls, real, broker, market, make_quote = self._engine(entry_miss_streak_limit=0)
+        t0 = engine._clock()
+        for i in range(4):
+            engine._clock = lambda i=i: t0 + i * (FOK_RETRY_SEC + 0.1)
+            engine.step()
+        self.assertEqual(len(calls), 4)                                # 끄면 2초마다 계속 시도
