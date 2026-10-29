@@ -35,6 +35,7 @@ from kimp.config import Settings
 from kimp.broker import EntryMissed, EntryRejected, ExitDeferred, ExitValuation, HedgeBroker, InsufficientBalance
 from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
 from kimp.executor import BYBIT_USDT, UPBIT_USDT
+from kimp.fok_sizing import EntryFit, fit_entry
 from kimp.fok_trace import classify_miss
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium
@@ -381,9 +382,23 @@ class Engine:
                     valuation, pnl = confirmed, confirmed.pnl   # 한순간 튄 값이 아니라 확인된 값으로 기록한다
             else:
                 valuation, pnl = confirmed, confirmed.pnl       # 더 새 시세로 주문한다
-                logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%%", pos.id, pos.coin, pnl.net_percent, target)
-                telemetry.decision(session, pos.coin, "tp_judge", pnl.net_percent, target,
-                                   position_id=pos.id, now=self._now_utc())
+                # 안전 확인 (docs/issues.md #3 A): 익절 지정가는 우리 수량이 닿는 가장 싼 매수 호가 줄이다.
+                # 앞쪽 비싼 줄이 먼저 팔려 나가면 전부 그 가격에 팔릴 수 있으니, 그때도 목표를 넘을 때만 판다
+                worst = self._worst_exit_percent(pos, confirmed)
+                if worst is not None and worst < target:
+                    self._log_throttled(
+                        f"tp-worst-{pos.coin}", logging.INFO,
+                        f"[익절 보류] #{pos.id} {pos.coin} | 평균 순손익 {pnl.net_percent:+.3f}% ≥ 목표 {target:.2f}% 이지만 "
+                        f"전부 마지막 매수 호가 줄({confirmed.plan.upbit.worst_price:g})에 팔면 {worst:+.3f}% | 다음 스캔에 다시")
+                    telemetry.decision(session, pos.coin, "tp_worst_fail", pnl.net_percent, target,
+                                       premium_depth=worst, position_id=pos.id, now=self._now_utc())
+                    reason = None
+                else:
+                    worst_text = "?" if worst is None else f"{worst:+.3f}%"
+                    logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%% (전부 마지막 줄 가격이면 %s)",
+                                pos.id, pos.coin, pnl.net_percent, target, worst_text)
+                    telemetry.decision(session, pos.coin, "tp_judge", pnl.net_percent, target,
+                                       premium_depth=worst, position_id=pos.id, now=self._now_utc())
 
         # 기록은 확인 시세 판정이 끝난 값으로 (가짜 꼭대기가 최고점·평가 기록에 남지 않게)
         pos.last_net_percent = pnl.net_percent
@@ -468,6 +483,19 @@ class Engine:
         except Exception as exc:
             logger.warning("%s 확인 시세 조회 실패 (이번 스캔은 주문 안 함): %s", coin, exc)
             return None
+
+    def _worst_exit_percent(self, pos: Position, valuation: ExitValuation) -> Optional[float]:
+        """
+        코인을 전부 마지막으로 닿는 매수 호가 줄 가격에 팔았을 때의 순손익 (%) — 익절 안전 확인용
+
+        그 줄 하나로 호가를 바꾼 시세로 손익을 다시 계산한다 (바이비트·USDT 는 그대로). 계산이 안 되면 None
+        """
+        worst_price = valuation.plan.upbit.worst_price
+        quote = getattr(valuation, "quote", None)
+        if not worst_price or quote is None:
+            return None
+        flat = self.broker.value_exit(pos, quote.with_flat_upbit("bids", worst_price))
+        return flat.pnl.net_percent if flat else None
 
     def _miss_reason(self, coin: str, judged) -> Tuple[str, str]:
         """
@@ -904,14 +932,29 @@ class Engine:
                 continue
             # 2차: 실제 주문 수량만큼 호가를 소진한 평균 체결가로 다시 계산한다.
             # 수량이 크면 호가가 밀려서 1차는 통과했어도 여기서 떨어질 수 있다 — 그게 맞는 동작이다.
-            premium = quote.entry_premium_for(bybit_qty, fee_rate)
-            if premium is None:
+            # 업비트 지정가 FOK 크기·안전 확인도 여기서 (kimp/fok_sizing.py, docs/issues.md #3 A·B):
+            # 지정가 안쪽 물량의 일정 비율로 숏 개수를 줄이고, 전부 마지막 줄 가격에 사도 기준을 넘는지 본다
+            fit = self._fit_entry(coin, quote, bybit_qty, threshold, fee_rate)
+            premium = fit.premium
+            if fit.status == "depth_reject":
                 self._log_throttled(f"reject-{coin}", logging.INFO,
                                     f"{coin} 진입 보류: 호가가 모자라서 정한 크기를 다 못 채움")
                 telemetry.decision(session, coin, "depth_reject", top, threshold, size_usdt=size,
                                    bybit_qty=bybit_qty, funding_8h=funding, now=now_utc)
                 continue
-            if premium <= threshold:
+            if fit.status == "ok" and fit.shrunk and not self._min_order_ok(coin, quote, fit.bybit_qty):
+                telemetry.decision(session, coin, "size_reject", top, threshold, premium_depth=premium,
+                                   size_usdt=size, bybit_qty=fit.bybit_qty, funding_8h=funding,
+                                   note="지정가 안쪽 물량에 맞춰 줄였더니 최소 주문보다 작음", now=now_utc)
+                continue
+            if fit.status == "worst_fail":
+                telemetry.decision(session, coin, "worst_fail", top, threshold, premium_depth=fit.worst_premium,
+                                   size_usdt=size, bybit_qty=fit.bybit_qty, funding_8h=funding,
+                                   note="평균 김프는 기준 안, 전부 마지막 줄 가격이면 기준 밖", now=now_utc)
+                continue
+            if fit.status == "ok":
+                bybit_qty = fit.bybit_qty
+            if fit.status == "ok" and premium <= threshold:
                 # 정렬 기준으로 '기준보다 얼마나 더 낮은가'(음수, 작을수록 좋음)를 맨 앞에 둔다.
                 # 김프 절댓값으로 줄 세우면 기준이 느슨한 코인이 늘 이긴다 — 코인마다 기준이
                 # 다르므로 '자기 기준 대비 얼마나 유리한가' 로 비교해야 공평하다.
@@ -932,8 +975,11 @@ class Engine:
             depth = _margin + threshold
             # 주문 직전 확인 시세: 스캔 시작 때 값이 한순간 튄 것이면 여기서 걸러진다
             fresh = self._fresh_quote(coin)
-            again = fresh.entry_premium_for(bybit_qty, fee_rate) if fresh else None
-            if again is None or again > threshold:
+            fit = self._fit_entry(coin, fresh, bybit_qty, threshold, fee_rate) if fresh else None
+            again = fit.premium if fit else None
+            if fit is not None and fit.status == "ok" and fit.shrunk and not self._min_order_ok(coin, fresh, fit.bybit_qty):
+                fit = None
+            if fit is None or fit.status != "ok" or again is None or again > threshold:
                 self._log_throttled(
                     f"entry-confirm-{coin}", logging.INFO,
                     f"[진입 보류] {coin} | 스캔 시세 {depth:+.3f}% → 확인 시세 "
@@ -942,6 +988,11 @@ class Engine:
                                    size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, now=self._now_utc())
                 continue
             quote, depth = fresh, again   # 더 새 시세로 주문한다
+            planned = self.market.round_qty(coin, size / quote.bybit.best_bid) if quote.bybit.best_bid else bybit_qty
+            if fit.bybit_qty < planned * (1 - 1e-9):   # 스캔 단계에서 줄였든 확인 시세에서 더 줄였든 한 번만 남긴다
+                logger.info("[진입 크기 줄임] %s | 숏 %g → %g개 (지정가 안쪽 물량의 %g%%) | %s", coin, planned,
+                            fit.bybit_qty, self.s.entry_max_depth_share_percent, fit.describe())
+            bybit_qty = fit.bybit_qty
             self.broker.mark_decided()    # 진입 판단 → 주문 전송 ms 측정
             self._account_dirty = True    # 주문이 나가니 다음 스캔엔 잔고를 새로 받는다 (성공하든 거절되든)
             try:
@@ -1001,6 +1052,31 @@ class Engine:
                                pos.id, coin)
                 return  # 여러 코인이 동시에 조건을 만족해도 하나만 잡는다
 
+    def _fit_entry(self, coin: str, quote: Quote, bybit_qty: float, threshold: float, fee_rate: float) -> EntryFit:
+        """업비트 지정가 FOK 진입 크기·안전 확인 (kimp/fok_sizing.py). 숏 개수는 바이비트 주문 단위로 내린다"""
+        return fit_entry(quote, bybit_qty, fee_rate, threshold, self.s.entry_max_depth_share_percent,
+                         lambda q: self.market.round_qty(coin, q))
+
+    def _min_order_ok(self, coin: str, quote: Quote, qty: float) -> bool:
+        """숏 개수가 거래소 최소 주문(바이비트 개수·금액, 업비트 금액)을 넘나. 아니면 사유를 로그로 남기고 False"""
+        best_bid = quote.bybit.best_bid
+        min_qty = self.market.min_qty(coin)
+        if not best_bid or qty <= 0 or qty < min_qty:
+            self._log_throttled(f"reject-{coin}", logging.INFO,
+                                f"{coin} 진입 보류: 개수 {qty} 가 바이비트 최소 {min_qty} 보다 작음")
+            return False
+        min_usdt = getattr(self.market, "min_notional_usdt", lambda _c: 0.0)(coin)
+        if qty * best_bid < min_usdt:
+            self._log_throttled(f"reject-{coin}", logging.INFO,
+                                f"{coin} 진입 보류: 바이비트 주문 금액 {qty * best_bid:.2f} USDT 가 최소 {min_usdt:g} USDT 보다 작음")
+            return False
+        min_krw = self.broker.ex.min_order_krw(coin)
+        if quote.usdt_krw and qty * best_bid * quote.usdt_krw < min_krw:
+            self._log_throttled(f"reject-{coin}", logging.INFO,
+                                f"{coin} 진입 보류: 업비트 주문 금액이 최소 {min_krw:,.0f}원보다 작음")
+            return False
+        return True
+
     def _plan_bybit_qty(self, coin: str, quote: Quote, size_usdt: float) -> Optional[float]:
         """
         바이비트 숏 개수 = 포지션 크기(USDT) ÷ 바이비트 맨 앞 매수 호가 → 주문 단위로 내림
@@ -1016,22 +1092,7 @@ class Engine:
         if not best_bid or size_usdt <= 0:
             return None
         qty = self.market.round_qty(coin, size_usdt / best_bid)
-        min_qty = self.market.min_qty(coin)
-        if qty <= 0 or qty < min_qty:
-            self._log_throttled(f"reject-{coin}", logging.INFO,
-                                f"{coin} 진입 보류: 개수 {qty} 가 바이비트 최소 {min_qty} 보다 작음")
-            return None
-        min_usdt = getattr(self.market, "min_notional_usdt", lambda _c: 0.0)(coin)
-        if qty * best_bid < min_usdt:
-            self._log_throttled(f"reject-{coin}", logging.INFO,
-                                f"{coin} 진입 보류: 바이비트 주문 금액 {qty * best_bid:.2f} USDT 가 최소 {min_usdt:g} USDT 보다 작음")
-            return None
-        min_krw = self.broker.ex.min_order_krw(coin)
-        if quote.usdt_krw and qty * best_bid * quote.usdt_krw < min_krw:
-            self._log_throttled(f"reject-{coin}", logging.INFO,
-                                f"{coin} 진입 보류: 업비트 주문 금액이 최소 {min_krw:,.0f}원보다 작음")
-            return None
-        return qty
+        return qty if self._min_order_ok(coin, quote, qty) else None
 
     # ------------------------------------------------------------------
     # 기록 / 로그

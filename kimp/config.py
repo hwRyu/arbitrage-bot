@@ -347,6 +347,12 @@ class Settings:
     #   들어가 −4.05 USDT. 스크리너는 그때그때 가격을 모르므로 엔진이 봐야 한다.
     entry_max_spread_percent: float = 0.8
 
+    # ★ 업비트 지정가 FOK 진입 크기 상한 (%, docs/issues.md #3 B, kimp/fok_sizing.py)
+    #   '지정가 안쪽 물량' = 전부 그 가격에 사도 진입 기준을 넘는 가장 비싼 매도 호가 줄까지의 물량 합.
+    #   사려는 코인 개수가 그 합의 이 % 를 넘으면 숏 개수를 줄인다. 남이 0.5초 사이 일부를 먼저 사 가도
+    #   남은 물량으로 전량 체결될 여유. 100 = 안쪽 물량을 넘지만 않게 (안전 확인만). 낮을수록 놓침은 줄고 포지션은 작아진다
+    entry_max_depth_share_percent: float = 50.0
+
     # ★ 한 번만 돌리기 (첫 실거래 점검용)
     # true 면 포지션을 **딱 하나만** 잡고, 그 포지션이 청산되면 봇이 스스로 종료한다.
     # 처음 실제 주문을 내볼 때 "한 바퀴가 제대로 도는지"만 확인하려고 쓴다.
@@ -644,6 +650,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
                                       else d.entry_min_funding_8h_percent),
         max_funding_cost_percent=_env_float("MAX_FUNDING_COST_PERCENT", d.max_funding_cost_percent),
         entry_max_spread_percent=_env_float("ENTRY_MAX_SPREAD_PERCENT", d.entry_max_spread_percent),
+        entry_max_depth_share_percent=_env_float("ENTRY_MAX_DEPTH_SHARE_PERCENT", d.entry_max_depth_share_percent),
         one_shot=_env_bool("ONE_SHOT", d.one_shot),
         one_shot_max_hours=_env_float("ONE_SHOT_MAX_HOURS", d.one_shot_max_hours),
         transfer_fee_upbit_to_bybit_usdt=_env_float("TRANSFER_FEE_UPBIT_TO_BYBIT_USDT",
@@ -807,6 +814,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("REENTRY_COOLDOWN_SEC 는 0 이상이어야 합니다")
     if s.max_slippage_percent < 0:
         errors.append("MAX_SLIPPAGE_PERCENT 는 0 이상이어야 합니다")
+    if not 0 < s.entry_max_depth_share_percent <= 100:
+        errors.append("ENTRY_MAX_DEPTH_SHARE_PERCENT 는 0 보다 크고 100 이하여야 합니다 (지정가 안쪽 물량 중 살 비율 %)")
     if s.entry_max_spread_percent < 0:
         errors.append("ENTRY_MAX_SPREAD_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
     if s.scan_interval_sec < 1:

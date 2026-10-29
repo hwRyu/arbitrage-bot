@@ -21,7 +21,7 @@ color: cyan
 ## 무엇을 보나
 1. **봇 로그** `logs/bot.log` (봇이 콘솔과 같은 내용을 UTF-8 로 적는다. 자정에 `bot.log.YYYY-MM-DD` 로 넘어가니 날짜가 바뀌면 다시 건다).
    봐야 할 줄 (grep -E 패턴 그대로 사용):
-   `\[진입\]|\[청산|\[주문 체결\]|\[주문 전송\]|\[익절 판단\]|\[되돌리기|\[진입 되돌림|CRITICAL|Traceback|주문 거절|주문 실패|확인이 필요|진입 김프 밀림|스캔 중 에러|\[강제청산|\[긴급|숏 사라짐|익절 보류|연속 실패|\[송금|증거금 추가|웹소켓 호가 (끊김|bybit 복구|upbit 복구)`
+   `\[진입\]|\[청산|\[주문 체결\]|\[주문 전송\]|\[익절 판단\]|\[진입 놓침\]|\[지정가 주문\]|\[진입 크기 줄임\]|\[되돌리기|\[진입 되돌림|CRITICAL|Traceback|주문 거절|주문 실패|확인이 필요|진입 김프 밀림|스캔 중 에러|\[강제청산|\[긴급|숏 사라짐|익절 보류|연속 실패|\[송금|증거금 추가|웹소켓 호가 (끊김|bybit 복구|upbit 복구)`
    무시: `[현황]` 줄, `[진입 보류] … 왕복 호가 …`(호가 한 칸이 큰 코인을 스프레드 가드가 막는 것, 정상), `[웹소켓 호가 없음·묵음]`/`[웹소켓 호가 복구] N초` 같은 INFO 폴백(한가한 장에서 정상), `.env` 의 옛 코인 설정 `무시됩니다` 경고.
 2. **자원**: `bash tools/monitor/resource_watch.sh` 를 Monitor 로 돌리면 1분마다 `logs/resource_watch.csv` 에 적고, 메모리 +50 MB / 스레드 +10 / 핸들 +200 때 (스레드 31↔36 출렁임은 정상)와 30분마다 한 줄을 낸다.
    알려진 정상 패턴: 기동 후 약 70분 동안 366 → 450~470 MB 로 오른 뒤 평탄. 470 MB 를 넘어 계속 오르거나 스레드·핸들 증가 알림이 오면 사건.
@@ -55,7 +55,7 @@ sf = make_session_factory(DB)
 with sf() as s:
     p = s.get(Position, POS)
     d = s.scalars(select(Decision).where(Decision.position_id == POS, Decision.stage == "tp_judge").order_by(Decision.id.desc())).first()
-    judged = f"판단 순손익 {d.premium_top:+.3f}% (조건 {d.threshold_percent:.2f}%, 여유 {d.premium_depth})" if d else "판단 기록 없음(손절·강제청산 경로)"
+    judged = f"판단 순손익 {d.premium_top:+.3f}% (목표 {d.threshold_percent:.2f}%, 전부 마지막 매수 호가 줄이면 {d.premium_depth})" if d else "판단 기록 없음(손절·강제청산 경로)"
     print(f"#{POS} {p.coin}: {judged} → 실제 {p.net_pnl_percent:+.3f}% ({p.net_pnl_usdt:+.3f} USDT) | 보유 {(p.closed_at - p.opened_at).total_seconds()/3600:.1f}h | 진입 김프 {p.entry_premium:+.3f} → 청산 {p.exit_premium:+.3f}")
     for f in s.scalars(select(Fill).where(Fill.position_id == POS, Fill.side.in_(("sell", "close_short", "buy_usdt"))).order_by(Fill.id)):
         print(f"  {f.exchange:<6}{f.side:<12} 기대 {f.expected_price:<10g} 체결 {f.avg_price:<10g} 밀림 {leg_adverse_percent(f.side, f.expected_price, f.avg_price):+.3f}%")

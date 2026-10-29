@@ -165,18 +165,21 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
         funding_block  김프는 됐는데 펀딩비가 너무 불리해서 보류
         size_reject    주문 크기가 거래소 최소 미만
         depth_reject   수량만큼 호가를 소진하니 다 못 채움 (호가 부족)
-        depth_fail     맨 앞 호가는 통과했는데 수량 소진 평균가로는 기준 못 넘음 (호가 밀림)
+        depth_fail     맨 앞 호가는 통과했는데 수량 소진 평균가로는 기준 못 넘음 (호가 밀림). 크기를 지정가 안쪽 물량에 맞춘 뒤 본다
+        worst_fail     평균 김프는 기준 안, 전부 마지막 매도 호가 줄 가격이면 기준 밖 (지정가 FOK 안전 확인, premium_depth = 그 김프)
         no_slot        조건은 됐지만 자리(최대 포지션 수·한 번만 돌리기)가 없어 다른 코인에 밀림
         balance_block  한쪽 USDT 가 모자람
         rejected       주문 단계에서 거절·되돌림 (note 에 이유)
         entered        진입함 (position_id)
         confirm_fail   조건은 됐는데 주문 직전 확인 시세에서는 기준을 못 넘음 (한순간 튄 값. premium_depth = 확인 시세 김프)
         tp_confirm_fail 익절 조건이 됐는데 확인 시세에서는 목표 미달 (premium_top = 처음 순손익, premium_depth = 확인 순손익,
-                       threshold = 목표 + 여유)
-        tp_judge       익절 확정 (premium_top = 확인 순손익, threshold = 목표 + 여유, premium_depth = 여유 %p). 체결 뒤
-                       fills.expected_price 와 비교하면 여유가 밀림을 얼마나 덮었는지 나온다
-        entry_miss     코인 매수 지정가 FOK 가 전량 체결 안 돼 취소 → 판 USDT 되삼 (note 에 지정가)
-        tp_miss        (fok) 익절 매도 지정가가 전량 체결 안 돼 취소 → 포지션 그대로, FOK_RETRY_SEC 뒤 다시 (premium_top = 순손익)
+                       threshold = 목표)
+        tp_worst_fail  평균 순손익은 목표 이상, 전부 마지막 매수 호가 줄에 팔면 목표 미만 → 안 팖 (premium_depth = 그 순손익)
+        tp_judge       익절 확정 (premium_top = 확인 순손익, threshold = 목표, premium_depth = 전부 마지막 매수 호가 줄에 팔 때
+                       순손익). 2026-10-29 전 기록의 premium_depth 는 유동 여유(%p)
+        entry_miss     코인 매수 지정가 FOK 가 전량 체결 안 돼 취소 → 판 USDT 되삼 (note 에 놓친 이유·지정가·호가)
+        tp_miss        익절 매도 지정가 FOK 가 전량 체결 안 돼 취소 → 포지션 그대로, FOK_RETRY_SEC 뒤 다시
+                       (premium_top = 순손익, note 에 놓친 이유·호가)
     """
     # 조건이 유지되는 동안 매 판단마다 같은 줄이 쌓이는 단계(near·spread_block …)는 코인·단계별로
     # REPEAT_COOLDOWN_SEC 에 한 번만 적는다. 소켓 시세로 0.25초마다 판단하면 그냥 두면 시간당 만 줄이 넘는다.

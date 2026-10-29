@@ -126,8 +126,8 @@ class HistoricalMarket:
         self._funding_times = {c: [ts for ts, _ in rows] for c, rows in funding.items()}
         self.spread_percent = spread_percent
         # 체결 밀림 가정 (kimp/slippage.py): 청산 다리 — 업비트 코인 매수호가 — 를 이만큼 낮춰서 체결·평가한다.
-        # 진입은 실측상 밀림이 거의 0 이라 그대로. 실거래의 유동 여유(호가판 두께)는 과거 데이터엔 호가판이
-        # 없어 재현할 수 없으니, 그 효과를 '청산이 이만큼 더 불리하다' 는 가정으로 대신한다
+        # 진입은 실측상 밀림이 거의 0 이라 그대로. 과거 데이터엔 호가판이 없어 실거래의 호가 두께(지정가 FOK 의
+        # 안쪽 물량·안전 확인)를 재현할 수 없으니, 그 효과를 '청산이 이만큼 더 불리하다' 는 가정으로 대신한다
         self.exit_slippage_percent = exit_slippage_percent or {}
         self.usdt_spread_percent = usdt_spread_percent
         self.bybit_high = bybit_high or {}

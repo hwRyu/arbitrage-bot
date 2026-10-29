@@ -514,10 +514,13 @@ class HedgeBroker:
     # ------------------------------------------------------------------
     def _coin_limit(self, price: Optional[float], side: str) -> Optional[float]:
         """
-        업비트 코인 진입 매수·익절 매도에 쓸 지정가 (FOK). 판단가가 없으면 None (= 시장가)
+        업비트 코인 진입 매수·익절 매도에 쓸 지정가 (FOK). 가격이 없으면 None (= 시장가)
 
-        판단 때 호가 소진 계산으로 나온 평균가를 호가 단위에 맞춘다 — 살 때 내림, 팔 때 올림 (판단보다 나쁘게 안 되게).
-        예) 매수 판단 140.0원 → 140원 / 매도 판단 93.47원 → 93.5원
+        price = 판단 때 호가 소진 계산에서 우리 수량이 닿는 마지막 줄 가격 (FillEstimate.worst_price, #3 A).
+        평균가가 아니다 — 평균가를 내림해 내면 두 줄에 걸칠 때 첫 줄 물량만 쓸 수 있어 늘 놓쳤다.
+        지정가는 상한이라 거래소는 싼 줄부터 채우고 체결 평균은 판단 평균 그대로다.
+        실제 호가 줄 가격은 이미 호가 단위 위라 단위 맞추기(살 때 내림, 팔 때 올림)는 부동소수 오차만 정리한다.
+        예) 매도 호가 88.0원 3,000개 / 88.1원 5,000개, 4,000개 매수 → 지정가 88.1원 (88.0원 3,000 + 88.1원 1,000)
         판단가가 없는 경우: sync 로 이어서 하는 청산(이미 정한 청산을 마저 끝내는 것)뿐이다.
         (2026-10-29 시장가 모드 제거 — 업비트는 한 칸이 0.1~1% 라 시장가로 한 칸만 밀려도 목표 이익 0.2% 를 넘는다)
         """
@@ -597,7 +600,8 @@ class HedgeBroker:
         session.commit()
 
         coin, ex = quote.coin, self.ex
-        limit = self._coin_limit(plan.upbit.avg_price, "buy")   # 판단가 (호가 단위 내림) 지정가 FOK
+        # 지정가 FOK = 우리 수량이 닿는 마지막 매도 호가 줄 (docs/issues.md #3 A). 체결 평균은 판단 평균 그대로
+        limit = self._coin_limit(plan.upbit.worst_price, "buy")
         # 놓친 이유를 가리려고 주문 때 본 매도호가를 찍어 둔다 (로그는 주문이 끝난 뒤 — 주문 속도에 안 얹히게)
         fok = fok_snapshot(quote.upbit.asks, "buy", limit, plan.upbit.filled_qty) if limit is not None else None
         try:
@@ -882,7 +886,9 @@ class HedgeBroker:
         # 익절: 코인 매도를 판단가 지정가 FOK 로 먼저 낸다 (아직 아무것도 안 판 상태에서만).
         # 전량 체결 안 되면 포지션을 OPEN 으로 되돌리고 ExitDeferred — 다른 다리는 손대지 않았으니 되돌릴 게 없다.
         # sync 로 이어서 하는 청산(plan 없음)·손절·강제청산·수동 청산은 아래 시장가 경로 그대로.
-        limit = self._coin_limit(exp_sell, "sell") if pos.exit_reason == ExitReason.TAKE_PROFIT else None
+        # 익절 지정가 = 우리 수량이 닿는 가장 싼 매수 호가 줄 (#3 A). 안전 확인은 엔진의 익절 판단에서 했다
+        worst_sell = plan.upbit.worst_price if plan else None
+        limit = self._coin_limit(worst_sell, "sell") if pos.exit_reason == ExitReason.TAKE_PROFIT else None
         try:
             if limit is not None and not s("sell", self._sums(session, pos)).qty:
                 left = min(pos.upbit_qty, self.balance(session, coin_key(pos.coin)))

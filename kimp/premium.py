@@ -139,12 +139,16 @@ class FillEstimate:
         filled_qty: 체결되는 코인 개수
         best_price: 맨 앞 호가 가격 (얼마나 밀렸는지 비교 기준)
         is_complete: 원하는 만큼 다 채워지는지 (호가가 모자라면 False)
+        worst_price: 마지막으로 닿은 호가 줄의 가격 (사면 가장 비싼 줄, 팔면 가장 싼 줄).
+            업비트 지정가 FOK 의 지정가로 쓴다 — 평균가로 내면 두 칸에 걸칠 때 첫 칸 물량만 쓸 수 있어 늘 놓친다
+            (docs/issues.md #3 A). 지정가는 상한이라 거래소는 싼 줄부터 채우고, 체결 평균은 avg_price 그대로다
     """
 
     avg_price: float
     filled_qty: float
     best_price: float
     is_complete: bool
+    worst_price: Optional[float] = None
 
     @property
     def cost(self) -> float:
@@ -185,13 +189,17 @@ def estimate_fill(levels: Sequence[Level], qty: float) -> Optional[FillEstimate]
     remaining = qty  # 아직 못 채운 개수
     cost = 0.0
     filled = 0.0
+    worst = None     # 마지막으로 가져간 줄의 가격
     for price, size in levels:
-        if remaining <= 0:
+        if remaining <= qty * _EPS:
             break
         take = min(size, remaining)  # 이 줄에서 가져갈 개수
+        if take <= 0:
+            continue
         cost += price * take
         filled += take
         remaining -= take
+        worst = price
 
     if filled <= 0:
         return None
@@ -200,6 +208,7 @@ def estimate_fill(levels: Sequence[Level], qty: float) -> Optional[FillEstimate]
         filled_qty=filled,
         best_price=levels[0][0],
         is_complete=filled >= qty * (1 - _EPS),
+        worst_price=worst,
     )
 
 
@@ -223,14 +232,18 @@ def estimate_fill_by_cost(levels: Sequence[Level], cost: float) -> Optional[Fill
     remaining = cost  # 아직 못 쓴 금액
     spent = 0.0
     filled = 0.0
+    worst = None      # 마지막으로 돈을 쓴 줄의 가격
     for price, size in levels:
-        if remaining <= 0:
+        if remaining <= cost * _EPS:
             break
         # 이 호가 줄을 전부 먹을 수도 있고(price x size), 남은 금액만큼만 먹을 수도 있다
         take_cost = min(price * size, remaining)  # 이 줄에서 쓸 금액
+        if take_cost <= 0:
+            continue
         filled += take_cost / price               # 금액 ÷ 그 줄의 가격 = 받는 개수
         spent += take_cost
         remaining -= take_cost
+        worst = price
 
     if filled <= 0:
         return None
@@ -240,6 +253,7 @@ def estimate_fill_by_cost(levels: Sequence[Level], cost: float) -> Optional[Fill
         best_price=levels[0][0],       # 맨 앞 호가 — 여기와 비교해 밀림(slippage)을 낸다
         # 부동소수 오차 때문에 딱 맞아도 cost 보다 조금 작게 나올 수 있어 _EPS 만큼 여유를 둔다
         is_complete=spent >= cost * (1 - _EPS),
+        worst_price=worst,
     )
 
 
@@ -401,6 +415,23 @@ class Quote:
         return self.bybit_high if self.bybit_high is not None else self.bybit.best_ask
 
     # ---------------- 실제 판단용 ----------------
+    def with_flat_upbit(self, side: str, price: float) -> "Quote":
+        """
+        업비트 코인 호가 한쪽을 '이 가격 한 줄, 물량 무한' 으로 바꾼 시세 — "전부 이 가격에 체결되면?" 계산용
+
+        업비트 지정가 FOK 안전 확인에 쓴다 (docs/issues.md #3 A). 지정가를 마지막으로 닿는 줄 가격으로 내면,
+        주문 직전에 앞쪽 싼 줄이 먼저 팔려 나갈 경우 전부 그 가격에 체결될 수 있다. 그 최악에서도
+        진입 김프·익절 순이익이 기준을 넘는지 이 시세로 다시 계산한다.
+
+        Args:
+            side: 'asks' (사는 쪽, 진입) / 'bids' (파는 쪽, 익절)
+        """
+        flat = [(price, float("inf"))]
+        upbit = (OrderBook(bids=self.upbit.bids, asks=flat, timestamp_ms=self.upbit.timestamp_ms) if side == "asks"
+                 else OrderBook(bids=flat, asks=self.upbit.asks, timestamp_ms=self.upbit.timestamp_ms))
+        return Quote(coin=self.coin, upbit=upbit, bybit=self.bybit, usdt=self.usdt, fx_krw=self.fx_krw,
+                     bybit_high=self.bybit_high, skew_ms=self.skew_ms)
+
     def entry_plan(self, bybit_qty: float, upbit_fee_rate: float) -> Optional[EntryPlan]:
         """
         진입하면 어떻게 체결될지 계산 (금액 헷징)

@@ -235,16 +235,20 @@ FROM premium_snapshots GROUP BY coin;
 | `near` | 기준 근처까지 왔지만 못 넘음 — **아깝게 놓친 순간** |
 | `spread_block` | 김프는 됐는데 **지금 왕복 호가**가 `ENTRY_MAX_SPREAD_PERCENT` 를 넘어 보류 (`premium_depth` = 왕복 호가 %). 가격이 호가 단위 경계를 넘은 코인 |
 | `funding_block` | 김프는 됐는데 펀딩비가 불리해서 보류 |
-| `size_reject` | 주문 크기가 거래소 최소 미만 |
+| `size_reject` | 주문 크기가 거래소 최소 미만 (지정가 안쪽 물량에 맞춰 줄였더니 최소 미만이면 `note` 에 그렇게 적는다) |
 | `depth_reject` | 수량만큼 호가가 없음 |
-| `depth_fail` | 맨 앞 호가는 통과, 수량 소진 평균가로는 못 넘음 — **호가가 얇아서 밀린 경우** |
+| `depth_fail` | 맨 앞 호가는 통과, 수량 소진 평균가로는 못 넘음 — **호가가 얇아서 밀린 경우**. 2026-10-29 부터는 크기를 먼저 지정가 안쪽 물량에 맞춘 뒤 본다 (`premium_depth` = 그 크기의 평균 김프) |
+| `worst_fail` | 평균 김프는 기준 안인데 **전부 마지막 매도 호가 줄 가격에 사면 기준 밖** (지정가 FOK 안전 확인, `premium_depth` = 그 최악 김프). 크기를 안쪽 물량에 맞추므로 드물다 |
 | `no_slot` | 조건은 됐지만 자리(최대 포지션 수·한 번만 돌리기)가 없어 다른 코인에 밀림 |
 | `balance_block` | 한쪽 USDT 부족 |
 | `rejected` | 주문 단계 거절·되돌림 (`note`) |
-| `confirm_fail` | 조건은 됐는데 **주문 직전 확인 시세**에서는 기준을 못 넘음 — 한순간 튄 값 (`premium_depth` = 확인 시세 김프) |
+| `confirm_fail` | 조건은 됐는데 **주문 직전 확인 시세**에서는 기준을 못 넘음 — 한순간 튄 값 (`premium_depth` = 확인 시세 김프). 확인 시세로 크기·안전 확인도 다시 하므로 거기서 떨어져도 여기 |
 | `entered` | 진입함 |
-| `tp_confirm_fail` | 익절 조건이 됐는데 확인 시세에서는 목표 미달 (`premium_top` = 처음 순손익, `premium_depth` = 확인 순손익, `threshold_percent` = 목표 + 여유, `position_id`) |
-| `tp_judge` | **익절 확정** (`premium_top` = 확인 순손익, `threshold_percent` = 목표 + 실행 여유, `premium_depth` = 여유 %p). 그 포지션의 청산 `fills.expected_price` 대 `avg_price` 와 비교하면 여유가 밀림을 얼마나 덮었는지 나온다 |
+| `entry_miss` | 지정가 FOK 매수가 전량 체결 안 돼 취소 → 판 USDT 되삼 (`note` = 놓친 이유: 두 칸 걸침 / 호가 이동 / 물량 부족 / 다시 충분 / 알 수 없음 + 주문 때·직후 호가) |
+| `tp_confirm_fail` | 익절 조건이 됐는데 확인 시세에서는 목표 미달 (`premium_top` = 처음 순손익, `premium_depth` = 확인 순손익, `threshold_percent` = 목표, `position_id`) |
+| `tp_worst_fail` | 평균 순손익은 목표 이상인데 **전부 마지막 매수 호가 줄 가격에 팔면 목표 미만** → 안 팔고 다음 스캔에 다시 (`premium_depth` = 그 최악 순손익) |
+| `tp_judge` | **익절 확정** (`premium_top` = 확인 순손익, `threshold_percent` = 목표, `premium_depth` = 전부 마지막 매수 호가 줄에 팔았을 때 순손익). 2026-10-29 전 기록의 `premium_depth` 는 유동 여유(%p) |
+| `tp_miss` | 익절 지정가 FOK 가 전량 체결 안 됨 → 포지션 그대로, 2초 뒤 다시 (`note` = 놓친 이유와 호가) |
 
 ```sql
 -- 코인별로 어디서 막히는지

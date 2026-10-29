@@ -72,8 +72,10 @@ class DecisionTest(unittest.TestCase):
             self.assertIsNotNone(pos.planned_entry_premium)
             self.assertAlmostEqual(pos.planned_entry_premium, pos.entry_premium, places=6)  # 페이퍼는 판단 = 실제
 
-    def test_depth_fail_when_book_is_thin(self):
-        """맨 앞 호가는 통과했지만 수량을 넣으니 밀려서 못 넘김 → depth_fail 에 두 김프가 같이 남는다"""
+    def test_thin_book_is_cut_then_too_small(self):
+        """맨 앞 호가 1개만 기준 안, 그 뒤는 기준 밖 → 지정가 안쪽 물량(1개)의 50% 로 줄이면 최소 주문보다 작다
+        → size_reject (예전엔 원래 크기의 평균 김프로 depth_fail. 2026-10-29 부터 크기를 먼저 안쪽 물량에 맞춘다,
+        docs/issues.md #3 B)"""
         from kimp.premium import OrderBook, Quote
         # 업비트 매도 호가: 맨 앞 1개만 싸고 그 뒤는 비싸다 → 500 USDT 어치 사면 평균가가 밀린다
         usdt, by = 1400.0, 1.0
@@ -85,11 +87,11 @@ class DecisionTest(unittest.TestCase):
                   usdt=OrderBook(bids=[(usdt, 1e9)], asks=[(usdt * 1.0001, 1e9)]))
         self.market.quotes = {"XRP": q}
         self.engine.step()
-        self.assertEqual(self._stages(), [("XRP", "depth_fail")])
+        self.assertEqual(self._stages(), [("XRP", "size_reject")])
         with self.sf() as s:
             d = s.scalars(select(Decision)).one()
             self.assertLess(d.premium_top, -0.5)
-            self.assertGreater(d.premium_depth, -0.5)
+            self.assertIn("최소 주문", d.note)
             self.assertEqual(s.query(Position).count(), 0)
 
     def test_no_slot_when_two_coins_qualify_and_one_slot(self):
