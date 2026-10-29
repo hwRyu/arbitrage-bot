@@ -45,6 +45,10 @@
    - 왕복 호가(코인 호가 + USDT 호가)가 스프레드 가드(ENTRY_MAX_SPREAD_PERCENT)보다 넓으면 '가드차단' → 그 아래로.
      실제 봇은 그 코인에 들어가지 않으므로 백테스트 점수가 좋아도 쓸 수 없다 (2026-10-29 추가).
      예) 업비트 140원 코인은 한 칸이 0.71% → 바이비트·USDT 호가를 더하면 0.8% 를 넘기 쉽다
+   - 업비트 호가 단위 경계(10·100·1,000원 …) 를 기간 안에 넘나든 코인은 '경계왕래' → 보통 코인 아래로 (가드차단 위).
+     경계 위에선 스프레드 가드, 경계 바로 아래선 경계 가드(ENTRY_TICK_BOUNDARY_MARGIN_PERCENT)가 진입을 막으므로
+     백테스트가 세는 기회의 상당수를 실제로는 못 잡고, 경계를 오가는 순간엔 FOK 놓침이 반복된다 (CAP·XPL 2026-10-30).
+     지금 가격이 경계 바로 아래(경계 가드 안)면 '경계근처' 로 .env 추천에서 뺀다 (2026-10-30 추가).
 
 주의
 ------------------------------------------------------------------
@@ -82,6 +86,7 @@ from kimp.history import (
     make_history_session_factory,
 )
 from kimp.market_data import USDT_KRW_SYMBOL, bybit_symbol, upbit_symbol
+from kimp.premium import near_tick_boundary, tick_boundaries_crossed
 from kimp.simulate import tick_floor_percent, usdt_tick_percent
 from kimp.spread import (LIVE_SAMPLES, MODE_AUTO, MODE_COMMON, MODE_LIVE, MODE_RECORDS, MODES,
                          is_rough, median_spread_depth, resolve_spreads)
@@ -473,6 +478,8 @@ class CoinScore:
     bybit_fee_percent: float = 0.0     # 이 코인의 바이비트 taker 요율 (%) — 소형 코인은 0.11
     round_trip_percent: float = 0.0    # 왕복 호가 = 코인 호가(업비트+바이비트) + USDT 호가 (%) — 봇의 스프레드 가드가 보는 값
     guard_percent: float = 0.0         # 스프레드 가드 한도 (ENTRY_MAX_SPREAD_PERCENT, 0 = 안 봄)
+    tick_edge_now: bool = False        # 지금 업비트 가격이 호가 단위 경계 바로 아래 (경계 가드가 진입을 막는 상태)
+    tick_edge_crossed: bool = False    # 기간 안에 업비트 가격이 호가 단위 경계를 넘나듦
 
     @property
     def guard_blocked(self) -> bool:
@@ -576,7 +583,8 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
                   live: CoinLive, size_usdt: float,
                   cycle_good_hours: float = CYCLE_GOOD_HOURS,
                   recent_days: float = 0.0, entry_threshold: Optional[float] = None,
-                  max_spread_percent: float = 0.0, depth_share_percent: float = 100.0) -> Optional[CoinScore]:
+                  max_spread_percent: float = 0.0, depth_share_percent: float = 100.0,
+                  tick_edge_now: bool = False, tick_edge_crossed: bool = False) -> Optional[CoinScore]:
     """
     코인 하나 평가: 통계 + 백테스트(전체 / 검증) + 경고 표시
 
@@ -621,6 +629,7 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
         coverage=len(series) / max(1.0, days * DAY_MS / bar_ms),
         full=full, test=test, days=days, test_days=test_days, cycle_good_hours=cycle_good_hours,
         round_trip_percent=leg, guard_percent=max_spread_percent,
+        tick_edge_now=tick_edge_now, tick_edge_crossed=tick_edge_crossed,
     )
     score.flags = make_flags(score, size_usdt, depth_share_percent)
     return score
@@ -638,6 +647,10 @@ def make_flags(s: CoinScore, size_usdt: float, depth_share_percent: float = 100.
         flags.append("이상김프")
     if s.guard_blocked:
         flags.append("가드차단")
+    if s.tick_edge_now:
+        flags.append("경계근처")
+    if s.tick_edge_crossed:
+        flags.append("경계왕래")
     if s.coverage < MIN_COVERAGE:
         flags.append("데이터부족")
     if s.spread_percent > WIDE_SPREAD_PERCENT:
@@ -661,8 +674,9 @@ def make_flags(s: CoinScore, size_usdt: float, depth_share_percent: float = 100.
 
 
 def rank(scores: Sequence[CoinScore]) -> List[CoinScore]:
-    """점수 높은 순 (같으면 전체 월 수익 높은 순). 이상김프 코인은 맨 아래, 가드차단 코인은 그 위"""
-    return sorted(scores, key=lambda s: (not s.abnormal, not s.guard_blocked, s.score, s.monthly), reverse=True)
+    """점수 높은 순 (같으면 전체 월 수익 높은 순). 이상김프 코인은 맨 아래, 가드차단 코인은 그 위, 경계왕래 코인은 그 위"""
+    return sorted(scores, key=lambda s: (not s.abnormal, not s.guard_blocked, not s.tick_edge_crossed, s.score, s.monthly),
+                  reverse=True)
 
 
 # ======================================================================
@@ -725,6 +739,8 @@ LEGEND = """
   펀딩/8h  평균 펀딩비율 (8시간 기준 %). + 면 숏인 우리가 받음
 경고
   이상김프(1시간 평균 ±5% 초과, 입출금 막힘 의심 → 맨 아래) 가드차단(왕복 호가 > ENTRY_MAX_SPREAD_PERCENT, 봇이 안 들어감 → 그 위)
+  경계왕래(기간 안에 업비트 호가 단위 경계 10·100·1,000원 을 넘나듦 → 그 위. 경계 양쪽에서 가드에 막히고 FOK 놓침이 반복됨)
+  경계근처(지금 가격이 경계 바로 아래, 경계 가드가 막는 상태 → .env 추천 제외)
   기회드묾(주기 1주 초과) 데이터부족(기간 80% 미만) 호가넓음(>0.3%)
   물량얇음(호가 0.3% 안 물량 < 포지션 ÷ ENTRY_MAX_DEPTH_SHARE_PERCENT, 기본 포지션의 2배 → 진입 크기가 줄어듦)
   추세↑↓(중간값이 1%p 넘게 이동) 회귀느림(반감기 48시간 초과) 펀딩냄 물림(끝에 손실로 들고 있음)
@@ -745,7 +761,7 @@ def env_snippet(ranked: Sequence[CoinScore], n: int, max_open_positions: int = 3
     used = 0.0
     skipped: List[str] = []
     for s in ranked[:n]:
-        if not (s.full and s.score > 0 and not s.abnormal and not s.guard_blocked):
+        if not (s.full and s.score > 0 and not s.abnormal and not s.guard_blocked and not s.tick_edge_now):
             continue
         need = max(s.occupancy, MIN_OCCUPANCY)
         if used + need > budget:
@@ -843,20 +859,24 @@ def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, fl
                  fixed: float, target: float, stop: float, live: Dict[str, CoinLive],
                  size: float, cycle_hours: float, recent_days: float = 0.0,
                  entry_threshold: Optional[float] = None, exec_slippage=None, fees=None,
-                 max_spread_percent: float = 0.0, depth_share_percent: float = 100.0) -> List[CoinScore]:
+                 max_spread_percent: float = 0.0, depth_share_percent: float = 100.0,
+                 tick_margin_percent: float = 0.0) -> List[CoinScore]:
     """받아둔 종가로 코인마다 점수 계산 (호가 간격은 미리 정해둔 resolved 값 사용)"""
     bar_ms = TIMEFRAME_MS[timeframe]
     scores = []
     for c, (up, by, funding) in data.items():
-        floor = tick_floor_percent(list(up.values()), list(by.values())) or 0.0
+        up_prices = list(up.values())
+        floor = tick_floor_percent(up_prices, list(by.values())) or 0.0
         spread = max(resolved.get(c, 0.0), floor)
+        edge_now = bool(up_prices) and near_tick_boundary(up_prices[-1], tick_margin_percent) is not None
+        edge_crossed = bool(up_prices) and bool(tick_boundaries_crossed(min(up_prices), max(up_prices)))
         # 체결 밀림 가정(kimp/slippage.py)은 거래당 고정 비용으로 — 청산 때 판단 호가보다 불리하게 체결되는 몫.
         # fixed 는 코인별 dict(수수료가 코인마다 달라서)일 수도, 하나의 숫자일 수도 있다
         slip = exec_slippage.for_coin(c) if exec_slippage is not None else 0.0
         fixed_c = fixed[c] if isinstance(fixed, dict) else fixed
         s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, days, spread, usdt_spread,
                           fixed_c + slip, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold,
-                          max_spread_percent, depth_share_percent)
+                          max_spread_percent, depth_share_percent, edge_now, edge_crossed)
         if s:
             s.timeframe = timeframe
             if fees is not None:   # 표에 보여줄 수수료 (코인별 요율)
@@ -1019,7 +1039,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           settings.stop_loss_percent, live, size, args.cycle_hours, args.recent_days,
                           args.entry_threshold, exec_slippage=slip, fees=settings.fees,
                           max_spread_percent=settings.entry_max_spread_percent,
-                          depth_share_percent=settings.entry_max_depth_share_percent)
+                          depth_share_percent=settings.entry_max_depth_share_percent,
+                          tick_margin_percent=settings.entry_tick_boundary_margin_percent)
 
     # 2단계: 1단계 상위 코인만 더 짧은 봉으로 다시 평가 (시뮬레이션과 같은 기준으로 맞추기)
     refined_timeframe = None
@@ -1040,7 +1061,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                        fixed, target, settings.stop_loss_percent, live, size,
                                        args.cycle_hours, args.recent_days, args.entry_threshold, exec_slippage=slip,
                                        fees=settings.fees, max_spread_percent=settings.entry_max_spread_percent,
-                                       depth_share_percent=settings.entry_max_depth_share_percent)
+                                       depth_share_percent=settings.entry_max_depth_share_percent,
+                                       tick_margin_percent=settings.entry_tick_boundary_margin_percent)
                 done = {x.coin for x in refined}
                 scores = refined + [x for x in scores if x.coin not in done]
                 usdt_spread = r_usdt_spread

@@ -2,6 +2,7 @@
 import unittest
 
 from kimp.screen import (
+    env_snippet,
     RECENT_FAIL_DISCOUNT,
     CoinLive,
     SwingCosts,
@@ -130,6 +131,23 @@ class ScoreTest(unittest.TestCase):
         return evaluate_coin(coin, series(values), BAR, days=len(values) * BAR / 86_400_000,
                              spread_percent=0.05, usdt_spread_percent=0.05, fixed_cost_percent=0.4,
                              target=1.0, stop=-5.0, funding=[], live=CoinLive(), size_usdt=1000)
+
+    def test_tick_edge_flags_and_rank(self):
+        """기간 안에 100원 경계를 넘나든 코인은 '경계왕래' 로 보통 코인 아래, 지금 경계 바로 아래면 '경계근처' 로 .env 추천 제외"""
+        from kimp.premium import tick_boundaries_crossed
+        self.assertEqual(tick_boundaries_crossed(93.0, 103.0), [100])
+        self.assertEqual(tick_boundaries_crossed(80.0, 90.0), [])
+        vals = ([-1.5] * 5 + [0.8] * 5) * 40
+        kw = dict(spread_percent=0.3, usdt_spread_percent=0.075, fixed_cost_percent=0.4, target=1.0, stop=-5.0,
+                  funding=[], live=CoinLive(), size_usdt=1000)
+        crossed = evaluate_coin("EDGE", series(vals), BAR, days=len(vals) * BAR / 86_400_000, tick_edge_crossed=True, **kw)
+        plain = evaluate_coin("OK", series([0.0, 0.05] * 150), BAR, days=300 * BAR / 86_400_000, **kw)
+        self.assertIn("경계왕래", crossed.flags)
+        self.assertGreater(crossed.score, plain.score)                 # 점수는 더 높지만
+        self.assertEqual([x.coin for x in rank([crossed, plain])], ["OK", "EDGE"])   # 순위는 아래
+        now = evaluate_coin("NOW", series(vals), BAR, days=len(vals) * BAR / 86_400_000, tick_edge_now=True, **kw)
+        self.assertIn("경계근처", now.flags)
+        self.assertNotIn("NOW", env_snippet(rank([now, plain]), 2))
 
     def test_spread_guard_blocked_coin_goes_down(self):
         """왕복 호가(코인 + USDT)가 스프레드 가드보다 넓으면 '가드차단' — 실제 봇이 안 들어가니 점수가 좋아도 아래로"""

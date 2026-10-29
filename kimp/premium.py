@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 # 호가 한 줄: (가격, 수량)
 Level = Tuple[float, float]
@@ -70,6 +70,13 @@ def near_tick_boundary(price: float, margin_percent: float) -> Optional[Tuple[fl
     if last_upper * (1 - margin_percent / 100) <= price <= last_upper:
         return last_upper, last_tick, 1_000.0
     return None
+
+
+def tick_boundaries_crossed(low: float, high: float) -> List[float]:
+    """[low, high] 가격 구간이 넘나드는 업비트 호가 단위 경계들 (예: 93~103원 → [100]). 스크리너의 '경계왕래' 판정용"""
+    if low <= 0 or high < low:
+        return []
+    return [upper for upper, _tick in _UPBIT_KRW_TICKS if low < upper <= high]
 
 
 def upbit_limit_price(price: float, side: str) -> float:
