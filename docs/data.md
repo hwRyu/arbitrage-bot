@@ -234,6 +234,7 @@ FROM premium_snapshots GROUP BY coin;
 |---|---|
 | `near` | 기준 근처까지 왔지만 못 넘음 — **아깝게 놓친 순간** |
 | `spread_block` | 김프는 됐는데 **지금 왕복 호가**가 `ENTRY_MAX_SPREAD_PERCENT` 를 넘어 보류 (`premium_depth` = 왕복 호가 %). 가격이 호가 단위 경계를 넘은 코인 |
+| `tick_edge_block` | 김프는 됐는데 업비트 매도 호가가 호가 단위 경계(100원 등) 바로 아래·딱 경계라 보류 (`premium_depth` = 그 매도 호가). `ENTRY_TICK_BOUNDARY_MARGIN_PERCENT`, docs/issues.md #4 |
 | `funding_block` | 김프는 됐는데 펀딩비가 불리해서 보류 |
 | `size_reject` | 주문 크기가 거래소 최소 미만 (지정가 안쪽 물량에 맞춰 줄였더니 최소 미만이면 `note` 에 그렇게 적는다) |
 | `depth_reject` | 수량만큼 호가가 없음 |

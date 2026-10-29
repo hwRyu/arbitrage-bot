@@ -49,6 +49,29 @@ def upbit_krw_tick(price: float) -> float:
     return 1_000.0
 
 
+def near_tick_boundary(price: float, margin_percent: float) -> Optional[Tuple[float, float, float]]:
+    """
+    호가 단위가 커지는 경계 바로 아래(또는 딱 경계)인가 — 그렇다면 (경계, 아래 한 칸, 위 한 칸)
+
+    업비트는 100원 미만이면 한 칸 0.1원, 100원부터 1원이다 (1,000·10,000원 등도 같다). 매도 호가가 경계 바로 아래나
+    딱 경계에 있으면 지금 왕복 호가는 좁아서 스프레드 가드를 통과하지만, 그 줄이 팔리면 다음 줄이 한 번에 큰 칸 위다.
+    그래서 주문이 닿기 전에 놓치거나(CAP #27~#30 2026-10-30: 47초에 4번), 들고 있다가 경계를 넘으면 팔 때 한 칸이
+    커져 익절이 어려워진다 (docs/issues.md #4).
+
+    판정: 경계 B 에 대해 B × (1 − margin%) ≤ 가격 ≤ B. margin 0 이면 보지 않음 (None).
+    예) margin 1% → 99.0 ~ 100원이 '100원 경계 근처'. 98.9원·101원은 아님 (101원은 왕복 호가가 넓어 스프레드 가드가 막는다)
+    """
+    if margin_percent <= 0 or price <= 0:
+        return None
+    for (upper, tick), (_next_upper, next_tick) in zip(_UPBIT_KRW_TICKS, _UPBIT_KRW_TICKS[1:]):
+        if upper * (1 - margin_percent / 100) <= price <= upper:
+            return upper, tick, next_tick
+    last_upper, last_tick = _UPBIT_KRW_TICKS[-1]
+    if last_upper * (1 - margin_percent / 100) <= price <= last_upper:
+        return last_upper, last_tick, 1_000.0
+    return None
+
+
 def upbit_limit_price(price: float, side: str) -> float:
     """
     지정가를 호가 단위에 맞춘다 — 판단한 가격보다 나쁘게는 절대 안 되게

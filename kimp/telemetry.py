@@ -167,6 +167,7 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
         depth_reject   수량만큼 호가를 소진하니 다 못 채움 (호가 부족)
         depth_fail     맨 앞 호가는 통과했는데 수량 소진 평균가로는 기준 못 넘음 (호가 밀림). 크기를 지정가 안쪽 물량에 맞춘 뒤 본다
         worst_fail     평균 김프는 기준 안, 전부 마지막 매도 호가 줄 가격이면 기준 밖 (지정가 FOK 안전 확인, premium_depth = 그 김프)
+        tick_edge_block 업비트 매도 호가가 호가 단위 경계(100원 등) 바로 아래·딱 경계라 보류 (premium_depth = 그 매도 호가)
         no_slot        조건은 됐지만 자리(최대 포지션 수·한 번만 돌리기)가 없어 다른 코인에 밀림
         balance_block  한쪽 USDT 가 모자람
         rejected       주문 단계에서 거절·되돌림 (note 에 이유)

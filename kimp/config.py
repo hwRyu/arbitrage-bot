@@ -347,6 +347,13 @@ class Settings:
     #   들어가 −4.05 USDT. 스크리너는 그때그때 가격을 모르므로 엔진이 봐야 한다.
     entry_max_spread_percent: float = 0.8
 
+    # ★ 업비트 호가 단위 경계 근처 진입 금지 (%, docs/issues.md #4, kimp.premium.near_tick_boundary)
+    #   매도 호가가 '한 칸이 커지는 경계'(100·1,000·10,000원 …) 아래 이 % 안이거나 딱 경계면 들어가지 않는다 (0 = 안 봄).
+    #   경계 바로 아래는 지금 호가 간격이 좁아 스프레드 가드를 통과하지만, 그 줄이 팔리면 다음 줄이 큰 칸(100원이면 1%) 위라
+    #   주문이 닿기 전에 놓치기 쉽고(CAP 2026-10-30 47초에 4번), 들고 있다 경계를 넘으면 익절이 어려워진다.
+    #   예) 1 → 99.0~100원, 990~1,000원 … 은 진입 안 함
+    entry_tick_boundary_margin_percent: float = 1.0
+
     # ★ 업비트 지정가 FOK 진입 크기 상한 (%, docs/issues.md #3 B, kimp/fok_sizing.py)
     #   '지정가 안쪽 물량' = 전부 그 가격에 사도 진입 기준을 넘는 가장 비싼 매도 호가 줄까지의 물량 합.
     #   사려는 코인 개수가 그 합의 이 % 를 넘으면 숏 개수를 줄인다. 남이 0.5초 사이 일부를 먼저 사 가도
@@ -650,6 +657,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
                                       else d.entry_min_funding_8h_percent),
         max_funding_cost_percent=_env_float("MAX_FUNDING_COST_PERCENT", d.max_funding_cost_percent),
         entry_max_spread_percent=_env_float("ENTRY_MAX_SPREAD_PERCENT", d.entry_max_spread_percent),
+        entry_tick_boundary_margin_percent=_env_float("ENTRY_TICK_BOUNDARY_MARGIN_PERCENT",
+                                                      d.entry_tick_boundary_margin_percent),
         entry_max_depth_share_percent=_env_float("ENTRY_MAX_DEPTH_SHARE_PERCENT", d.entry_max_depth_share_percent),
         one_shot=_env_bool("ONE_SHOT", d.one_shot),
         one_shot_max_hours=_env_float("ONE_SHOT_MAX_HOURS", d.one_shot_max_hours),
@@ -816,6 +825,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("MAX_SLIPPAGE_PERCENT 는 0 이상이어야 합니다")
     if not 0 < s.entry_max_depth_share_percent <= 100:
         errors.append("ENTRY_MAX_DEPTH_SHARE_PERCENT 는 0 보다 크고 100 이하여야 합니다 (지정가 안쪽 물량 중 살 비율 %)")
+    if s.entry_tick_boundary_margin_percent < 0:
+        errors.append("ENTRY_TICK_BOUNDARY_MARGIN_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
     if s.entry_max_spread_percent < 0:
         errors.append("ENTRY_MAX_SPREAD_PERCENT 는 0 이상이어야 합니다 (0 = 보지 않음)")
     if s.scan_interval_sec < 1:

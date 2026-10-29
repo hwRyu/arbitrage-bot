@@ -39,7 +39,7 @@ from kimp.fok_sizing import EntryFit, fit_entry
 from kimp.fok_trace import classify_miss
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium
-from kimp.premium import Quote
+from kimp.premium import Quote, near_tick_boundary
 from kimp import telemetry
 
 LF = chr(10)  # 줄바꿈 (편집 사고를 막으려고 상수로)
@@ -909,6 +909,19 @@ class Engine:
                     f"[진입 보류] {coin} | 왕복 호가 {spread:.2f}% > 한도 {limit:.2f}% | 호가 단위가 넓어 목표 "
                     f"{self.s.params_for(coin).target_net_profit_percent:.2f}% 가 안 나옵니다", cooldown_sec=600.0)
                 telemetry.decision(session, coin, "spread_block", top, threshold, premium_depth=spread, now=now_utc)
+                continue
+            # 호가 단위 경계 근처: 매도 호가가 '한 칸이 커지는 경계' 바로 아래·딱 경계면 들어가지 않는다 (docs/issues.md #4).
+            # 스프레드 가드는 지금 호가 간격만 보므로, 99.9 / 100원처럼 아래쪽이 아직 작은 칸이면 통과시킨다
+            near = near_tick_boundary(quote.upbit.best_ask or 0.0, self.s.entry_tick_boundary_margin_percent)
+            if near is not None:
+                edge, below, above = near
+                self._log_throttled(
+                    f"tick-edge-{coin}", logging.INFO,
+                    f"[진입 보류] {coin} | 업비트 매도 호가 {quote.upbit.best_ask:g}원이 호가 단위 경계 {edge:g}원 근처 "
+                    f"(한 칸 {below:g} → {above:g}원, 경계 아래 {self.s.entry_tick_boundary_margin_percent:g}% 안) | "
+                    f"주문 사이 다음 줄로 뛰면 놓치고, 넘으면 익절이 어려워짐", cooldown_sec=600.0)
+                telemetry.decision(session, coin, "tick_edge_block", top, threshold,
+                                   premium_depth=quote.upbit.best_ask, now=now_utc)
                 continue
             # 펀딩비 안전장치: 숏이 돈을 내는 쪽이 심하면 들어가지 않는다 (김프 조건을 통과한 코인만 확인)
             min_funding = self.s.entry_min_funding_8h_percent
