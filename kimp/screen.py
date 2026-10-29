@@ -42,6 +42,9 @@
    점수 = 기본 점수 ÷ 자리 점유율 × 띠 가중치  예) 기본 4.0 ÷ 점유율 0.5 × 띠 0.8 → 6.4
    - 김프가 1시간 평균으로 ±5% 를 넘은 적이 있으면 '이상김프' (입출금 막힘 등) → 순위 맨 아래로
      예) LSK 2026-09-22~10-02 김프 −5% ~ −31% → 들어가자마자 손절만 반복 (한 달 −64 USDT)
+   - 왕복 호가(코인 호가 + USDT 호가)가 스프레드 가드(ENTRY_MAX_SPREAD_PERCENT)보다 넓으면 '가드차단' → 그 아래로.
+     실제 봇은 그 코인에 들어가지 않으므로 백테스트 점수가 좋아도 쓸 수 없다 (2026-10-29 추가).
+     예) 업비트 140원 코인은 한 칸이 0.71% → 바이비트·USDT 호가를 더하면 0.8% 를 넘기 쉽다
 
 주의
 ------------------------------------------------------------------
@@ -468,6 +471,13 @@ class CoinScore:
     fee_percent: float = 0.0           # 왕복 거래 수수료 (%) — 코인별 요율 반영 (업비트 4번 + 바이비트 2번)
     upbit_fee_percent: float = 0.0     # 이 코인의 업비트 요율 (%)
     bybit_fee_percent: float = 0.0     # 이 코인의 바이비트 taker 요율 (%) — 소형 코인은 0.11
+    round_trip_percent: float = 0.0    # 왕복 호가 = 코인 호가(업비트+바이비트) + USDT 호가 (%) — 봇의 스프레드 가드가 보는 값
+    guard_percent: float = 0.0         # 스프레드 가드 한도 (ENTRY_MAX_SPREAD_PERCENT, 0 = 안 봄)
+
+    @property
+    def guard_blocked(self) -> bool:
+        """왕복 호가가 스프레드 가드보다 넓어 실제 봇이 들어가지 않는 코인"""
+        return self.guard_percent > 0 and self.round_trip_percent > self.guard_percent
 
     @property
     def abnormal(self) -> bool:
@@ -565,7 +575,8 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
                   target: float, stop: float, funding: Sequence[Tuple[int, float]],
                   live: CoinLive, size_usdt: float,
                   cycle_good_hours: float = CYCLE_GOOD_HOURS,
-                  recent_days: float = 0.0, entry_threshold: Optional[float] = None) -> Optional[CoinScore]:
+                  recent_days: float = 0.0, entry_threshold: Optional[float] = None,
+                  max_spread_percent: float = 0.0, depth_share_percent: float = 100.0) -> Optional[CoinScore]:
     """
     코인 하나 평가: 통계 + 백테스트(전체 / 검증) + 경고 표시
 
@@ -577,6 +588,8 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
         usdt_spread_percent: 업비트 USDT/KRW 호가 간격 (%)
         fixed_cost_percent: 수수료 + 전송비 (%)
         recent_days: 검증에 쓸 최근 기간 (일). 0 이면 기간의 뒤 1/3
+        max_spread_percent: 스프레드 가드 (ENTRY_MAX_SPREAD_PERCENT). 왕복 호가가 이보다 넓으면 '가드차단'
+        depth_share_percent: 진입 크기 상한 (ENTRY_MAX_DEPTH_SHARE_PERCENT). 물량 경고 기준 = 포지션 ÷ 이 비율
     """
     if len(series) < 50:
         return None
@@ -607,21 +620,30 @@ def evaluate_coin(coin: str, series: Sequence[Tuple[int, float]], bar_ms: int, d
         funding_8h=funding_per_8h_percent(funding, days),
         coverage=len(series) / max(1.0, days * DAY_MS / bar_ms),
         full=full, test=test, days=days, test_days=test_days, cycle_good_hours=cycle_good_hours,
+        round_trip_percent=leg, guard_percent=max_spread_percent,
     )
-    score.flags = make_flags(score, size_usdt)
+    score.flags = make_flags(score, size_usdt, depth_share_percent)
     return score
 
 
-def make_flags(s: CoinScore, size_usdt: float) -> List[str]:
-    """조심할 점 표시"""
+def make_flags(s: CoinScore, size_usdt: float, depth_share_percent: float = 100.0) -> List[str]:
+    """
+    조심할 점 표시
+
+    물량얇음: 봇은 진입 크기를 '지정가 안쪽 물량' 의 depth_share_percent 이하로 맞춘다 (ENTRY_MAX_DEPTH_SHARE_PERCENT,
+    kimp/fok_sizing.py). 그래서 포지션 ÷ 그 비율 (기본 50% → 포지션의 2배) 보다 물량이 적으면 크기가 줄어든다.
+    """
     flags = []
     if s.abnormal:
         flags.append("이상김프")
+    if s.guard_blocked:
+        flags.append("가드차단")
     if s.coverage < MIN_COVERAGE:
         flags.append("데이터부족")
     if s.spread_percent > WIDE_SPREAD_PERCENT:
         flags.append("호가넓음")
-    if s.live.depth_usdt is not None and s.live.depth_usdt < size_usdt:
+    need_depth = size_usdt * 100.0 / depth_share_percent if depth_share_percent > 0 else size_usdt
+    if s.live.depth_usdt is not None and s.live.depth_usdt < need_depth:
         flags.append("물량얇음")
     if abs(s.stats.drift) > TREND_WARN_PERCENT:
         flags.append("추세↑" if s.stats.drift > 0 else "추세↓")
@@ -639,8 +661,8 @@ def make_flags(s: CoinScore, size_usdt: float) -> List[str]:
 
 
 def rank(scores: Sequence[CoinScore]) -> List[CoinScore]:
-    """점수 높은 순 (같으면 전체 월 수익 높은 순). 이상김프 코인은 맨 아래"""
-    return sorted(scores, key=lambda s: (not s.abnormal, s.score, s.monthly), reverse=True)
+    """점수 높은 순 (같으면 전체 월 수익 높은 순). 이상김프 코인은 맨 아래, 가드차단 코인은 그 위"""
+    return sorted(scores, key=lambda s: (not s.abnormal, not s.guard_blocked, s.score, s.monthly), reverse=True)
 
 
 # ======================================================================
@@ -702,7 +724,9 @@ LEGEND = """
   비용     한 바퀴 비용 = 수수료 + 전송비 + (코인 호가 + USDT 호가) × 2 (%)
   펀딩/8h  평균 펀딩비율 (8시간 기준 %). + 면 숏인 우리가 받음
 경고
-  이상김프(1시간 평균 ±5% 초과, 입출금 막힘 의심 → 맨 아래) 기회드묾(주기 1주 초과) 데이터부족(기간 80% 미만) 호가넓음(>0.3%) 물량얇음(호가 0.3% 안 물량 < 포지션 크기)
+  이상김프(1시간 평균 ±5% 초과, 입출금 막힘 의심 → 맨 아래) 가드차단(왕복 호가 > ENTRY_MAX_SPREAD_PERCENT, 봇이 안 들어감 → 그 위)
+  기회드묾(주기 1주 초과) 데이터부족(기간 80% 미만) 호가넓음(>0.3%)
+  물량얇음(호가 0.3% 안 물량 < 포지션 ÷ ENTRY_MAX_DEPTH_SHARE_PERCENT, 기본 포지션의 2배 → 진입 크기가 줄어듦)
   추세↑↓(중간값이 1%p 넘게 이동) 회귀느림(반감기 48시간 초과) 펀딩냄 물림(끝에 손실로 들고 있음)
   최근기회없음(전체 기간엔 벌었지만 검증 구간엔 완결된 거래가 없음 → 점수 1/4 로 감점)
 """
@@ -721,7 +745,7 @@ def env_snippet(ranked: Sequence[CoinScore], n: int, max_open_positions: int = 3
     used = 0.0
     skipped: List[str] = []
     for s in ranked[:n]:
-        if not (s.full and s.score > 0 and not s.abnormal):
+        if not (s.full and s.score > 0 and not s.abnormal and not s.guard_blocked):
             continue
         need = max(s.occupancy, MIN_OCCUPANCY)
         if used + need > budget:
@@ -818,7 +842,8 @@ def load_series(store: HistoryStore, md, coins: Sequence[str], timeframe: str, s
 def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, float], usdt_spread: float,
                  fixed: float, target: float, stop: float, live: Dict[str, CoinLive],
                  size: float, cycle_hours: float, recent_days: float = 0.0,
-                 entry_threshold: Optional[float] = None, exec_slippage=None, fees=None) -> List[CoinScore]:
+                 entry_threshold: Optional[float] = None, exec_slippage=None, fees=None,
+                 max_spread_percent: float = 0.0, depth_share_percent: float = 100.0) -> List[CoinScore]:
     """받아둔 종가로 코인마다 점수 계산 (호가 간격은 미리 정해둔 resolved 값 사용)"""
     bar_ms = TIMEFRAME_MS[timeframe]
     scores = []
@@ -830,7 +855,8 @@ def evaluate_all(data, usdt, timeframe: str, days: float, resolved: Dict[str, fl
         slip = exec_slippage.for_coin(c) if exec_slippage is not None else 0.0
         fixed_c = fixed[c] if isinstance(fixed, dict) else fixed
         s = evaluate_coin(c, premium_series(up, by, usdt), bar_ms, days, spread, usdt_spread,
-                          fixed_c + slip, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold)
+                          fixed_c + slip, target, stop, funding, live[c], size, cycle_hours, recent_days, entry_threshold,
+                          max_spread_percent, depth_share_percent)
         if s:
             s.timeframe = timeframe
             if fees is not None:   # 표에 보여줄 수수료 (코인별 요율)
@@ -991,12 +1017,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fixed = {c: settings.fees.round_trip_trade_fee_percent(c) + transfer_pct for c in coins}
     scores = evaluate_all(data, usdt, args.timeframe, args.days, resolved, usdt_spread, fixed, target,
                           settings.stop_loss_percent, live, size, args.cycle_hours, args.recent_days,
-                          args.entry_threshold, exec_slippage=slip, fees=settings.fees)
+                          args.entry_threshold, exec_slippage=slip, fees=settings.fees,
+                          max_spread_percent=settings.entry_max_spread_percent,
+                          depth_share_percent=settings.entry_max_depth_share_percent)
 
     # 2단계: 1단계 상위 코인만 더 짧은 봉으로 다시 평가 (시뮬레이션과 같은 기준으로 맞추기)
     refined_timeframe = None
     if args.refine_top and args.refine_timeframe != args.timeframe:
-        picks = [x.coin for x in rank(scores) if not x.abnormal][:args.refine_top]
+        picks = [x.coin for x in rank(scores) if not x.abnormal and not x.guard_blocked][:args.refine_top]
         if picks:
             refined_timeframe = args.refine_timeframe
             print(f"2단계: 상위 {len(picks)}개를 {refined_timeframe} 봉으로 다시 평가합니다 "
@@ -1011,7 +1039,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 refined = evaluate_all(r_data, r_usdt, refined_timeframe, args.days, resolved, r_usdt_spread,
                                        fixed, target, settings.stop_loss_percent, live, size,
                                        args.cycle_hours, args.recent_days, args.entry_threshold, exec_slippage=slip,
-                                       fees=settings.fees)
+                                       fees=settings.fees, max_spread_percent=settings.entry_max_spread_percent,
+                                       depth_share_percent=settings.entry_max_depth_share_percent)
                 done = {x.coin for x in refined}
                 scores = refined + [x for x in scores if x.coin not in done]
                 usdt_spread = r_usdt_spread

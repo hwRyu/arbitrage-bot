@@ -131,6 +131,28 @@ class ScoreTest(unittest.TestCase):
                              spread_percent=0.05, usdt_spread_percent=0.05, fixed_cost_percent=0.4,
                              target=1.0, stop=-5.0, funding=[], live=CoinLive(), size_usdt=1000)
 
+    def test_spread_guard_blocked_coin_goes_down(self):
+        """왕복 호가(코인 + USDT)가 스프레드 가드보다 넓으면 '가드차단' — 실제 봇이 안 들어가니 점수가 좋아도 아래로"""
+        vals = ([-1.5] * 5 + [0.8] * 5) * 40
+        kw = dict(usdt_spread_percent=0.075, fixed_cost_percent=0.4, target=1.0, stop=-5.0, funding=[],
+                  live=CoinLive(), size_usdt=1000, max_spread_percent=0.8)
+        wide = evaluate_coin("WIDE", series(vals), BAR, days=len(vals) * BAR / 86_400_000, spread_percent=0.78, **kw)
+        ok = evaluate_coin("OK", series([0.0, 0.05] * 150), BAR, days=300 * BAR / 86_400_000, spread_percent=0.3, **kw)
+        self.assertAlmostEqual(wide.round_trip_percent, 0.855)
+        self.assertTrue(wide.guard_blocked)
+        self.assertIn("가드차단", wide.flags)
+        self.assertFalse(ok.guard_blocked)
+        self.assertEqual([x.coin for x in rank([wide, ok])], ["OK", "WIDE"])
+
+    def test_thin_depth_flag_uses_entry_share(self):
+        """진입 크기 상한 50% → 물량이 포지션의 2배 미만이면 '물량얇음' (봇이 크기를 줄인다)"""
+        vals = [0.0, 0.05] * 150
+        kw = dict(spread_percent=0.1, usdt_spread_percent=0.075, fixed_cost_percent=0.4, target=1.0, stop=-5.0,
+                  funding=[], size_usdt=1000)
+        mid = CoinLive(depth_usdt=1500.0)
+        self.assertIn("물량얇음", evaluate_coin("A", series(vals), BAR, days=1, live=mid, depth_share_percent=50.0, **kw).flags)
+        self.assertNotIn("물량얇음", evaluate_coin("A", series(vals), BAR, days=1, live=mid, depth_share_percent=100.0, **kw).flags)
+
     def test_wave_coin_ranks_above_flat_coin(self):
         wave = self._eval("WAVE", ([-1.5] * 5 + [0.8] * 5) * 40)  # 4등분해도 구간마다 모양이 같게
         flat = self._eval("FLAT", [0.0, 0.05] * 150)
