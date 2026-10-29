@@ -40,6 +40,7 @@ from kimp.fok_trace import classify_miss
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium
 from kimp.premium import Quote, near_tick_boundary
+from kimp.volatility import RangeTracker
 from kimp import telemetry
 
 LF = chr(10)  # 줄바꿈 (편집 사고를 막으려고 상수로)
@@ -125,6 +126,8 @@ class Engine:
         self._last_log: Dict[str, float] = {}
         self._reentry_allowed_at: Dict[str, float] = {}
         self._tp_retry_at: Dict[int, float] = {}   # 익절 지정가가 놓친 포지션 → 이 시각까지 익절 판단 쉼
+        # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
+        self._bybit_range = RangeTracker()
         self._last_status_log = 0.0
 
         # 사람이 지시한 강제 청산 요청 (텔레그램 /close). 다른 스레드에서 직접 청산하면
@@ -291,6 +294,9 @@ class Engine:
         self._quote_ms = (time.monotonic() - t_quote) * 1000   # 시세 조회만 (환율 조회는 빼고)
         if not quotes:
             return
+        now_clock = self._clock()
+        for coin, q in quotes.items():
+            self._bybit_range.record(coin, now_clock, q.bybit.mid)
 
         with self.session_factory() as session:
             # 송금 도착 확인, 덜 끝난 진입·청산 이어서, 거래소와 대조 (페이퍼도 같은 흐름)
@@ -395,10 +401,11 @@ class Engine:
                     reason = None
                 else:
                     worst_text = "?" if worst is None else f"{worst:+.3f}%"
-                    logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%% (전부 마지막 줄 가격이면 %s)",
-                                pos.id, pos.coin, pnl.net_percent, target, worst_text)
+                    vol = self._bybit_range.describe(pos.coin, self._clock())   # 변동성 기록 (docs/issues.md #5)
+                    logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%% (전부 마지막 줄 가격이면 %s) | %s",
+                                pos.id, pos.coin, pnl.net_percent, target, worst_text, vol)
                     telemetry.decision(session, pos.coin, "tp_judge", pnl.net_percent, target,
-                                       premium_depth=worst, position_id=pos.id, now=self._now_utc())
+                                       premium_depth=worst, position_id=pos.id, note=vol, now=self._now_utc())
 
         # 기록은 확인 시세 판정이 끝난 값으로 (가짜 꼭대기가 최고점·평가 기록에 남지 않게)
         pos.last_net_percent = pnl.net_percent
@@ -479,7 +486,10 @@ class Engine:
         """
         try:
             fx_krw = self.fx.get() if self.fx else None
-            return self.market.fetch_quotes([coin], fx_krw).get(coin)
+            fresh = self.market.fetch_quotes([coin], fx_krw).get(coin)
+            if fresh is not None:
+                self._bybit_range.record(coin, self._clock(), fresh.bybit.mid)
+            return fresh
         except Exception as exc:
             logger.warning("%s 확인 시세 조회 실패 (이번 스캔은 주문 안 함): %s", coin, exc)
             return None
@@ -1044,19 +1054,21 @@ class Engine:
             pos.stop_loss_percent = params.stop_loss_percent
             pos.run_id = self.run_id
             session.commit()
+            vol = self._bybit_range.describe(coin, self._clock())   # 변동성 기록 (docs/issues.md #5)
             telemetry.decision(session, coin, "entered", top, threshold, premium_depth=depth, size_usdt=size,
-                               bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id, now=self._now_utc())
+                               bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id, note=vol,
+                               now=self._now_utc())
             notional = pos.bybit_qty * pos.entry_bybit_price_usdt
             target = estimated_exit_premium(pos.entry_premium, params.target_net_profit_percent, notional, 0.0,
                                             self.s.fees, quote.usdt_spread_percent or 0.0, coin=coin)
             logger.info(
                 "[진입] #%d %s | 김프 %+.3f%% (기준 %+.2f%%, 판단 %+.3f%%) | 목표 %.2f%% → 김프 약 %+.2f%% 필요 | "
                 "업비트 USDT %.2f개 매도 (%.1f원) → %.6g개 매수 (%s원) | 바이비트 %g개 숏 (%.6f USDT, %.0f배) | "
-                "강제청산가 %.6f",
+                "강제청산가 %.6f | %s",
                 pos.id, coin, pos.entry_premium, params.entry_premium_threshold_percent, depth,
                 params.target_net_profit_percent, target,
                 pos.usdt_sold, pos.entry_usdt_price_krw, pos.upbit_qty, f"{pos.entry_upbit_price_krw:,.2f}",
-                pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage, pos.liquidation_price,
+                pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage, pos.liquidation_price, vol,
             )
             open_positions[coin] = pos
             if self.s.one_shot:

@@ -244,11 +244,11 @@ FROM premium_snapshots GROUP BY coin;
 | `balance_block` | 한쪽 USDT 부족 |
 | `rejected` | 주문 단계 거절·되돌림 (`note`) |
 | `confirm_fail` | 조건은 됐는데 **주문 직전 확인 시세**에서는 기준을 못 넘음 — 한순간 튄 값 (`premium_depth` = 확인 시세 김프). 확인 시세로 크기·안전 확인도 다시 하므로 거기서 떨어져도 여기 |
-| `entered` | 진입함 |
+| `entered` | 진입함 (`note` = 직전 10초 바이비트 가격 범위, 2026-10-30~. 변동성 가드 기준을 정하려고 모으는 값, docs/issues.md #5) |
 | `entry_miss` | 지정가 FOK 매수가 전량 체결 안 돼 취소 → 판 USDT 되삼 (`note` = 놓친 이유: 두 칸 걸침 / 호가 이동 / 물량 부족 / 다시 충분 / 알 수 없음 + 주문 때·직후 호가) |
 | `tp_confirm_fail` | 익절 조건이 됐는데 확인 시세에서는 목표 미달 (`premium_top` = 처음 순손익, `premium_depth` = 확인 순손익, `threshold_percent` = 목표, `position_id`) |
 | `tp_worst_fail` | 평균 순손익은 목표 이상인데 **전부 마지막 매수 호가 줄 가격에 팔면 목표 미만** → 안 팔고 다음 스캔에 다시 (`premium_depth` = 그 최악 순손익) |
-| `tp_judge` | **익절 확정** (`premium_top` = 확인 순손익, `threshold_percent` = 목표, `premium_depth` = 전부 마지막 매수 호가 줄에 팔았을 때 순손익). 2026-10-29 전 기록의 `premium_depth` 는 유동 여유(%p) |
+| `tp_judge` | **익절 확정** (`premium_top` = 확인 순손익, `threshold_percent` = 목표, `premium_depth` = 전부 마지막 매수 호가 줄에 팔았을 때 순손익). 2026-10-29 전 기록의 `premium_depth` 는 유동 여유(%p). `note` = 직전 10초 바이비트 가격 범위 (2026-10-30~) |
 | `tp_miss` | 익절 지정가 FOK 가 전량 체결 안 됨 → 포지션 그대로, 2초 뒤 다시 (`note` = 놓친 이유와 호가) |
 
 ```sql
