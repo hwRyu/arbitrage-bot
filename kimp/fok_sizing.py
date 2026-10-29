@@ -115,7 +115,13 @@ def fit_entry(quote: Quote, bybit_qty: float, fee_rate: float, threshold: float,
     for _ in range(max_rounds):
         if plan.upbit.filled_qty <= cap * (1 + 1e-9):
             break
-        smaller = round_qty(bybit_qty * cap / plan.upbit.filled_qty * 0.999)   # 0.999 = 가격 변화로 다시 넘지 않게
+        try:
+            smaller = round_qty(bybit_qty * cap / plan.upbit.filled_qty * 0.999)   # 0.999 = 가격 변화로 다시 넘지 않게
+        except Exception:
+            # 거래소 주문 단위보다 작게 줄어들면 ccxt 가 예외를 던진다 (GMT 2026-10-30 06:50: 안쪽 물량이 거의 사라진 호가에서
+            # 1개 미만 → 'must be greater than minimum amount precision of 1'). 예외가 스캔 전체를 멈추면 보유 포지션 관리까지
+            # 건너뛰므로, 여기서 '이 크기로는 못 들어감' 으로 끝낸다
+            smaller = 0.0
         if smaller <= 0 or smaller >= bybit_qty:
             return EntryFit("depth_reject", bybit_qty, premium=plan.premium, max_price=max_price,
                             within_qty=within, original_qty=original)

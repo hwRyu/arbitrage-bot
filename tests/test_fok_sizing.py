@@ -85,6 +85,20 @@ class FitEntryTest(unittest.TestCase):
         self.assertLessEqual(fit.coin_qty, 1500.0)
         self.assertEqual(fit.limit_price, 88.0)
 
+    def test_round_qty_error_is_a_reject_not_a_crash(self):
+        """줄인 개수가 거래소 주문 단위보다 작아 반올림이 예외를 던져도 스캔을 멈추지 않고 depth_reject (GMT 2026-10-30 06:50)"""
+        thin = Quote(coin="MINA",
+                     upbit=OrderBook(bids=[(87.9, DEEP)], asks=[(88.0, 0.001), (88.2, 10000.0)]),
+                     bybit=mina_quote().bybit, usdt=mina_quote().usdt)
+
+        def strict_round(q):
+            if q < 1:
+                raise ValueError("amount must be greater than minimum amount precision of 1")
+            return float(int(q))
+
+        fit = fit_entry(thin, 5680, 0.0, 0.0, 50.0, strict_round)
+        self.assertEqual(fit.status, "depth_reject")
+
     def test_average_outside_threshold(self):
         fit = fit_entry(mina_quote(), 5680, 0.0, -0.5, 50.0, ROUND)
         self.assertEqual(fit.status, "depth_fail")
