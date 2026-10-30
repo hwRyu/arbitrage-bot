@@ -266,7 +266,8 @@ class HedgeBroker:
         """
         Args:
             executor: 실행기 (PaperExecutor / DryRunExecutor / LiveExecutor)
-            max_slippage_percent: 진입할 때 맨 앞 호가보다 이 % 이상 밀리면 진입 안 함
+            max_slippage_percent: 시장가 다리(업비트 USDT·바이비트)가 맨 앞 호가보다 이 % 이상 밀리면 진입 안 함.
+                업비트 코인은 지정가 FOK 라 해당 없음. 진입 뒤 '판단 김프 → 실제 김프' 차이 경고의 기준으로도 쓴다
             leverage / mmr: 바이비트 레버리지, 유지증거금률 (증거금·강제청산 가격 계산)
             limit_on_tick: 업비트 코인 지정가를 호가 단위에 맞출지. 실거래·페이퍼는 True.
                 시뮬레이션(kimp/simulate.py)만 False — 과거 1분봉에 호가 간격을 가정해 만든 가짜 호가는 단위 밖 가격이라
@@ -683,7 +684,9 @@ class HedgeBroker:
             raise EntryRejected("업비트 USDT 매수 호가가 모자람")
         if not plan.upbit.is_complete:
             raise EntryRejected("업비트 코인 매도 호가가 모자람")
-        for name, fill in (("업비트 코인", plan.upbit), ("업비트 USDT", plan.usdt), ("바이비트", plan.bybit)):
+        # 시장가로 나가는 두 다리(업비트 USDT, 바이비트 숏)만 본다. 업비트 코인은 판단가 지정가 FOK 라 밀릴 수 없고
+        # (지정가 위로는 체결되지 않는다), 호가 소진은 안쪽 물량 50% 규칙과 마지막 줄 안전 확인이 이미 막는다 (2026-10-31)
+        for name, fill in (("업비트 USDT", plan.usdt), ("바이비트", plan.bybit)):
             if fill.slippage_percent > self.max_slippage_percent:
                 raise EntryRejected(f"{name}에서 너무 밀림 {fill.slippage_percent:.3f}%")
 
