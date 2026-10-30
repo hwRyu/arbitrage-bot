@@ -263,8 +263,10 @@ class Settings:
 
     # ★ 연속 놓침 쉬기 (docs/issues.md 놓침 후보 N1): 같은 코인의 지정가 FOK 진입 놓침이 ENTRY_MISS_WINDOW_SEC 안에
     #   ENTRY_MISS_STREAK_LIMIT 번이 되면 그 코인은 ENTRY_MISS_COOLDOWN_SEC 동안 진입하지 않는다 (limit 0 = 끔).
-    #   놓침 한 번에 USDT 왕복 약 0.1~0.2%(20 USDT 에 0.035 USDT)가 들고, 순간 신호가 켜졌다 꺼지는 장에서는 2초마다
-    #   반복된다 (XPL 2026-10-30 07:04~07:06 151초에 4번, CAP 06:04~06:05 47초에 4번). 그 반복을 끊는다
+    #   도입 이유(10-30 아침): 놓침 한 번에 USDT 왕복 약 0.1~0.2%(20 USDT 에 0.035 USDT)가 들고, 순간 신호가 켜졌다 꺼지는
+    #   장에서는 2초마다 반복됐다 (XPL 07:04~07:06 151초에 4번, CAP 06:04~06:05 47초에 4번).
+    #   ※ 지금은 거의 의미 없는 옵션 (2026-10-31): 같은 날 저녁부터 코인 FOK 를 먼저 내서 놓침 비용이 0 이 됐고, 1초 미만
+    #   신호는 신호 게이트(signal_filter_*)가 앞단에서 거른다. 남는 효과는 "두 번 놓치면 10분 기회 포기" 뿐 — 보험으로만 둔다
     entry_miss_streak_limit: int = 2
     entry_miss_window_sec: float = 300.0
     entry_miss_cooldown_sec: float = 600.0
