@@ -224,6 +224,9 @@ LEG_INFO = {
 # 청산 한 번에 남은 양을 다시 주문하는 최대 횟수
 MAX_LEG_RETRIES = 3
 
+# 우리가 '사는' 단계 — 체결가가 판단가보다 높으면 불리. 나머지(파는 단계)는 낮으면 불리
+BUY_SIDES = {"buy", "buy_usdt", "trim_buy_usdt", "unwind_buy_usdt", "close_short", "unwind_close_short"}
+
 
 @dataclass
 class LegSum:
@@ -369,12 +372,13 @@ class HedgeBroker:
                     pos.id, pos.coin, (time.monotonic() - decided) * 1000, ", ".join(sides))
 
     def _leg(self, session: Session, pos: Position, side: str, call: Callable[[str], LegFill],
-             expected_price: Optional[float] = None) -> LegFill:
+             expected_price: Optional[float] = None, expected_slip: Optional[float] = None) -> LegFill:
         """
         주문 한 동작: 추적번호를 붙여 SENT 로 먼저 저장 → 주문 → 결과로 DONE (안 들어갔으면 VOID)
 
         결과를 모르면(OrderUnknown) SENT 그대로 둔다 → 다음 스캔(sync)에서 추적번호로 조회해서 채운다.
         expected_price 는 분석용: 판단 때 호가 소진 계산으로 예상한 평균가 (실제 avg_price 와 비교하려고 남긴다).
+        expected_slip 은 그 예상가가 맨 앞 호가보다 얼마나 나쁜가 (%, 판단 때 호가로 우리 수량이 먹는 줄들) — [체결 차이] 로그용.
         """
         row = self._sent_row(session, pos, side, expected_price)
         self._log_send(pos, [side])
@@ -385,7 +389,7 @@ class HedgeBroker:
         except OrderFailed:
             self._settle(session, row, failed=True)
             raise
-        self._settle(session, row, f)
+        self._settle(session, row, f, pos=pos, expected_slip=expected_slip)
         return f
 
     def _sent_row(self, session: Session, pos: Position, side: str, expected_price: Optional[float],
@@ -407,7 +411,8 @@ class HedgeBroker:
             session.flush()
         return row
 
-    def _settle(self, session: Session, row: Fill, f: Optional[LegFill] = None, failed: bool = False) -> None:
+    def _settle(self, session: Session, row: Fill, f: Optional[LegFill] = None, failed: bool = False,
+                pos: Optional[Position] = None, expected_slip: Optional[float] = None) -> None:
         """SENT 기록에 결과를 채운다: 체결값이면 DONE, 안 들어갔으면 VOID. 메인 스레드에서만 부른다"""
         if failed:
             row.state = FillState.VOID
@@ -415,9 +420,30 @@ class HedgeBroker:
             self._fill_row(row, f)
         row.done_at = self._now()
         session.commit()
+        if not failed and pos is not None:
+            self._log_fill_diff(pos, row, f, expected_slip)
+
+    @staticmethod
+    def _log_fill_diff(pos: Position, row: Fill, f: LegFill, expected_slip: Optional[float]) -> None:
+        """
+        [체결 차이] 판단가 대비 체결가 차이 — 두 몫으로 나눠 적는다 (2026-10-30, '밀림' 이라는 말을 쓰지 않는다)
+
+        판단가(expected_price)는 판단 때 호가로 우리 수량을 먹었을 때의 평균이라 **호가 소진 몫**(맨 앞 호가 대비, expected_slip)은
+        이미 들어 있다. 따라서 판단가 → 체결가 차이는 거의 전부 **가격 이동 몫** — 판단과 체결 사이(0.2~0.6초)에 시장이 움직인 것
+        (BLEND #38 2026-10-30 14:40: 숏 닫기 +0.814% — 20 USDT 는 맨 앞 줄 하나로 충분했고 바이비트가 그 1분에 +2.5% 급등 중).
+        불리한 방향이 +. 사는 단계는 체결가가 높으면, 파는 단계는 낮으면 불리.
+        """
+        if not row.expected_price or f is None or f.qty <= 0 or not f.avg_price:
+            return
+        move = (f.avg_price / row.expected_price - 1) * 100
+        if row.side not in BUY_SIDES:
+            move = -move
+        slip_text = f"{expected_slip:+.3f}%" if expected_slip is not None else "-"
+        logger.info("[체결 차이] #%d %s %s | 판단 %.8g → 체결 %.8g | 불리 %+.3f%% (호가 소진 몫 %s · 가격 이동 몫 %+.3f%%)",
+                    pos.id, pos.coin, row.side, row.expected_price, f.avg_price, move, slip_text, move)
 
     def _legs_parallel(self, session: Session, pos: Position,
-                       specs: List[Tuple[str, Callable[[str], LegFill], Optional[float]]]) -> Dict[str, LegFill]:
+                       specs: List[tuple]) -> Dict[str, LegFill]:
         """
         서로 독립인 주문 여러 개를 **동시에** 낸다 (실거래). 페이퍼는 장부(DB)를 쓰므로 순차로
 
@@ -427,24 +453,26 @@ class HedgeBroker:
         각 호출은 서로 다른 거래소 객체를 쓴다 (업비트 ∥ 바이비트) — 같은 ccxt 객체를 두 스레드가 쓰면 안 된다.
 
         Args:
-            specs: [(단계 이름, 추적번호 → 체결값 함수, 예상가)]
+            specs: [(단계 이름, 추적번호 → 체결값 함수, 예상가[, 예상 호가 소진 %])]
         Returns:
             {단계 이름: 체결값} — 실패한 단계는 빠진다
         Raises:
             OrderUnknown: 어느 하나라도 결과를 모름 (그 기록은 SENT 로 남고, 나머지 결과는 이미 적혔다)
             OrderFailed: 어느 하나가 안 들어감 (그 기록은 VOID, 나머지 결과는 이미 적혔다)
         """
+        specs = [(s[0], s[1], s[2], s[3] if len(s) > 3 else None) for s in specs]
         if self.ex.is_paper or len(specs) <= 1:
-            return {side: self._leg(session, pos, side, call, expected_price=exp) for side, call, exp in specs}
-        rows = [(side, self._sent_row(session, pos, side, exp, commit=False), call) for side, call, exp in specs]
+            return {side: self._leg(session, pos, side, call, expected_price=exp, expected_slip=slip)
+                    for side, call, exp, slip in specs}
+        rows = [(side, self._sent_row(session, pos, side, exp, commit=False), call, slip) for side, call, exp, slip in specs]
         session.commit()   # SENT 기록들을 한 번에 — 주문은 이 뒤에 나간다
-        self._log_send(pos, [side for side, _, _ in rows])
+        self._log_send(pos, [side for side, *_ in rows])
         with ThreadPoolExecutor(max_workers=len(rows)) as pool:
-            futures = [(side, row, pool.submit(call, row.client_id)) for side, row, call in rows]
+            futures = [(side, row, pool.submit(call, row.client_id), slip) for side, row, call, slip in rows]
             results: Dict[str, LegFill] = {}
             unknown: Optional[Exception] = None
             failed: Optional[Exception] = None
-            for side, row, fut in futures:
+            for side, row, fut, slip in futures:
                 try:
                     f = fut.result()
                 except OrderUnknown as exc:
@@ -454,7 +482,7 @@ class HedgeBroker:
                     self._settle(session, row, failed=True)
                 else:
                     results[side] = f
-                    self._settle(session, row, f)
+                    self._settle(session, row, f, pos=pos, expected_slip=slip)
         if unknown is not None:
             raise unknown
         if failed is not None:
@@ -711,7 +739,7 @@ class HedgeBroker:
             bought = self._leg(session, pos, "buy",
                                lambda cid: ex.buy_coin_with_krw(session, quote, coin, krw_for_coin, client_id=cid,
                                                                 limit_price=limit),
-                               expected_price=plan.upbit.avg_price)
+                               expected_price=plan.upbit.avg_price, expected_slip=plan.upbit.slippage_percent)
             if fok is not None:
                 logger.info("[지정가 주문] #%d %s | %s | %s", pos.id, coin, fok.describe(),
                             "체결" if bought.qty > 0 else "미체결")
@@ -724,9 +752,9 @@ class HedgeBroker:
             try:
                 self._legs_parallel(session, pos, [
                     ("open_short", lambda cid: ex.open_short(session, quote, coin, short_qty, client_id=cid),
-                     plan.bybit.avg_price),
+                     plan.bybit.avg_price, plan.bybit.slippage_percent),
                     ("sell_usdt", lambda cid: ex.sell_usdt(session, quote, usdt_qty, client_id=cid),
-                     plan.usdt.avg_price),
+                     plan.usdt.avg_price, plan.usdt.slippage_percent),
                 ])
             except OrderUnknown:
                 raise
@@ -761,7 +789,7 @@ class HedgeBroker:
         # 포지션은 양쪽 다 들어간 정상 헷지라 되돌리지 않지만, 목표까지 그만큼 더 올라야 하므로 알린다.
         drift = pos.entry_premium - plan.premium
         if drift > self.max_slippage_percent:
-            logger.warning("[진입 김프 밀림] #%d %s | 판단 %+.3f%% → 실제 %+.3f%% (%+.3f%%p 불리) | 주문 사이에 가격이 움직임 | "
+            logger.warning("[진입 김프 변동] #%d %s | 판단 %+.3f%% → 실제 %+.3f%% (%+.3f%%p 불리) | 주문 사이에 가격이 움직임 | "
                            "헷지는 정상, 목표까지 그만큼 더 올라야 합니다",
                            pos.id, coin, plan.premium, pos.entry_premium, drift)
         return pos
@@ -1004,6 +1032,9 @@ class HedgeBroker:
         exp_sell = plan.upbit.avg_price if plan else None
         exp_usdt = plan.usdt.avg_price if plan else None
         exp_short = plan.bybit.avg_price if plan else None
+        slip_sell = plan.upbit.slippage_percent if plan else None     # [체결 차이] 의 호가 소진 몫
+        slip_usdt = plan.usdt.slippage_percent if plan else None
+        slip_short = plan.bybit.slippage_percent if plan else None
         done = False
         # 익절: 코인 매도를 판단가 지정가 FOK 로 먼저 낸다 (아직 아무것도 안 판 상태에서만).
         # 전량 체결 안 되면 포지션을 OPEN 으로 되돌리고 ExitDeferred — 다른 다리는 손대지 않았으니 되돌릴 게 없다.
@@ -1016,7 +1047,8 @@ class HedgeBroker:
                 left = min(pos.upbit_qty, self.balance(session, coin_key(pos.coin)))
                 fok = fok_snapshot(quote.upbit.bids, "sell", limit, left) if quote else None   # 놓친 이유 분석용
                 sold = self._leg(session, pos, "sell", lambda cid: self.ex.sell_coin(
-                    session, quote, pos.coin, left, client_id=cid, limit_price=limit), expected_price=exp_sell)
+                    session, quote, pos.coin, left, client_id=cid, limit_price=limit), expected_price=exp_sell,
+                    expected_slip=slip_sell)
                 if fok is not None:
                     logger.info("[지정가 주문] #%d %s | %s | %s", pos.id, pos.coin, fok.describe(),
                                 "체결" if sold.qty > 0 else "미체결")
@@ -1051,11 +1083,11 @@ class HedgeBroker:
                 specs = []
                 if not coin_done:
                     specs.append(("sell", lambda cid, q=left: self.ex.sell_coin(session, quote, pos.coin, q, client_id=cid),
-                                  exp_sell))
+                                  exp_sell, slip_sell))
                 if not short_done:
                     specs.append(("close_short", lambda cid, q=short_left: self.ex.close_short(
                         session, quote, pos.coin, q, pos.entry_bybit_price_usdt,
-                        pos.bybit_margin_usdt * q / pos.bybit_qty, client_id=cid), exp_short))
+                        pos.bybit_margin_usdt * q / pos.bybit_qty, client_id=cid), exp_short, slip_short))
                 fills = self._legs_parallel(session, pos, specs) if specs else {}
                 if "sell" in fills:
                     coin_done = fills["sell"].qty <= 0
@@ -1078,7 +1110,8 @@ class HedgeBroker:
                                                                            s("buy_usdt", sums).fee)
                 if krw_left >= self.ex.min_order_krw("USDT"):  # 2)
                     self._leg(session, pos, "buy_usdt", lambda cid: self.ex.buy_usdt_with_krw(
-                        session, quote, krw_left / (1 + rate), client_id=cid), expected_price=exp_usdt)
+                        session, quote, krw_left / (1 + rate), client_id=cid), expected_price=exp_usdt,
+                        expected_slip=slip_usdt)
                     sums = self._sums(session, pos)
                     krw_left = (s("sell", sums).cost - s("sell", sums).fee) - (s("buy_usdt", sums).cost +
                                                                                s("buy_usdt", sums).fee)

@@ -773,7 +773,26 @@ class HedgeGapTest(unittest.TestCase):
                 pos = broker.open_hedge(s, q, 50.0)
             self.assertEqual(pos.status, PositionStatus.OPEN)
             self.assertGreater(pos.entry_premium - judged, 0.9)        # 약 1%p 불리하게 기록됨
-            self.assertTrue(any("진입 김프 밀림" in m for m in logs.output), logs.output)
+            self.assertTrue(any("진입 김프 변동" in m for m in logs.output), logs.output)
+
+    def test_fill_diff_log_splits_depth_and_move(self):
+        """[체결 차이]: 판단가 → 체결가 차이를 호가 소진 몫(판단 때 호가)과 가격 이동 몫(주문 사이 움직임)으로 적는다.
+        바이비트가 코인 체결 직후 1% 내려가면 숏(파는 단계)은 가격 이동 몫 +1% 불리"""
+        import re
+        prices = Prices()
+        up, by = JumpyPerpUpbit(prices), FakeBybit(prices)
+        ex = LiveExecutor(up, by, settings(), sleep=lambda _x: None, order_timeout_sec=0.01)
+        broker = HedgeBroker(ex, FEES, 0.3, leverage=1.0, safety=Safety(3), auto_transfer=True, network="TRX")
+        sf = make_session_factory(":memory:")
+        with sf() as s:
+            with self.assertLogs("kimp.broker", level=logging.INFO) as logs:
+                broker.open_hedge(s, prices.quote(), 50.0)
+        diffs = {re.search(r"#\d+ \w+ (\w+) \|", m).group(1): m for m in logs.output if "[체결 차이]" in m}
+        self.assertEqual(set(diffs), {"buy", "open_short", "sell_usdt"})
+        short = diffs["open_short"]
+        self.assertIn("호가 소진 몫 +0.000%", short)                                  # 호가가 깊어 소진 0
+        self.assertAlmostEqual(float(re.search(r"가격 이동 몫 ([+-][\d.]+)%", short).group(1)), 1.0, delta=0.02)
+        self.assertIn("가격 이동 몫 +0.000%", diffs["buy"])                             # 업비트 FOK 는 판단가 그대로
 
     def test_small_drift_is_quiet(self):
         """0.3% 안쪽으로만 움직이면 경고하지 않는다"""

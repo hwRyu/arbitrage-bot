@@ -413,7 +413,7 @@ def print_one_shot_report(settings: Settings, session_factory) -> None:
     for f in fills:
         state = f.state or "DONE"
         print(f"         {f.exchange:7s} {f.side:16s} {f.qty:>14.6g} @ {f.avg_price:>14.6g} "
-              f"수수료 {f.fee:>10.4f} {f.fee_currency}  밀림 {f.slippage_percent:+.3f}%  {state}")
+              f"수수료 {f.fee:>10.4f} {f.fee_currency}  호가소진 {f.slippage_percent:+.3f}%  {state}")
     if fundings:
         print(f"  펀딩비 {len(fundings)}번, 합계 {sum(f.amount_usdt for f in fundings):+.4f} USDT")
     if transfers:
