@@ -83,7 +83,7 @@ def make_settings(**overrides) -> Settings:
     base = dict(coins=["XRP"], entry_premium_threshold_percent=-0.5, target_net_profit_percent=1.0,
                 stop_loss_percent=-5.0, position_size_usdt=500, max_open_positions=1,
                 fees=FEES, funding_refresh_sec=0, snapshot_interval_sec=0, paper_initial_total_usdt=10_000,
-                db_path=":memory:")
+                db_path=":memory:", signal_filter_enabled=False)   # 게이트는 tests/test_signal_gate.py 에서
     base.update(overrides)
     return Settings(**base)
 

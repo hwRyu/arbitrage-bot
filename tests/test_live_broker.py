@@ -1061,7 +1061,7 @@ class MinOrderTest(unittest.TestCase):
 
         prices = Prices()
         broker = PaperBroker(FEES, 0.3)
-        e = Engine(Settings(coins=["XRP"], fees=FEES), M(), None, broker, make_session_factory(":memory:"), ["XRP"])
+        e = Engine(Settings(coins=["XRP"], fees=FEES, signal_filter_enabled=False), M(), None, broker, make_session_factory(":memory:"), ["XRP"])
         self.assertIsNone(e._plan_bybit_qty("XRP", prices.quote(), 4.0))  # 4 USDT < 최소 5 USDT
         self.assertIsNotNone(e._plan_bybit_qty("XRP", prices.quote(), 10.0))
 

@@ -181,6 +181,10 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
         entry_miss     코인 매수 지정가 FOK 가 전량 체결 안 돼 취소 → 판 USDT 되삼 (note 에 놓친 이유·지정가·호가)
         tp_miss        익절 매도 지정가 FOK 가 전량 체결 안 돼 취소 → 포지션 그대로, FOK_RETRY_SEC 뒤 다시
                        (premium_top = 순손익, note 에 놓친 이유·호가)
+        filter_hold    김프는 기준 안인데 신호 신뢰도 점수가 컷 미만이라 기다림 (2026-10-31, docs/filter.md.
+                       premium_depth = 수량 소진 김프, note = 점수)
+        tp_filter_hold 순손익은 목표 이상인데 신뢰도 점수가 컷 미만이라 기다림 (premium_top = 순손익, threshold = 목표,
+                       premium_depth = 점수)
     """
     # 조건이 유지되는 동안 매 판단마다 같은 줄이 쌓이는 단계(near·spread_block …)는 코인·단계별로
     # REPEAT_COOLDOWN_SEC 에 한 번만 적는다. 소켓 시세로 0.25초마다 판단하면 그냥 두면 시간당 만 줄이 넘는다.
@@ -201,7 +205,7 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
 
 # 반복 단계: 조건이 이어지는 동안 매 판단마다 나오는 것들 (코인·단계별로 REPEAT_COOLDOWN_SEC 에 한 번만 기록)
 REPEAT_STAGES = frozenset({"near", "spread_block", "funding_block", "size_reject", "depth_reject", "depth_fail",
-                           "no_slot", "balance_block"})
+                           "no_slot", "balance_block", "filter_hold", "tp_filter_hold"})
 REPEAT_COOLDOWN_SEC = 10.0
 _repeat_last: Dict[Tuple[str, str], float] = {}
 

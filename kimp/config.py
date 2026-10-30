@@ -322,6 +322,16 @@ class Settings:
     #   1% 이하 차이는 그대로 둔다 (50 USDT 포지션이면 0.5 USDT. 가격 10% 움직여도 0.05 USDT)
     hedge_tolerance_percent: float = 1.0
 
+    # ★ 신호 신뢰도 게이트 (2026-10-31, docs/filter.md): 진입 기준·익절 목표를 막 넘은 신호는 바로 믿지 않는다.
+    #   신호가 켜진 순간 점수를 0.1 로 내리고, 되돌림 없이 유지될수록 τ(초)에 따라 올라가 컷(0.7)을 넘을 때만 주문한다.
+    #   깔끔하게 유지되면 약 1.1×τ 초, 흔들리면 더 오래, 반납하면 못 넘는다. 11시간·40코인 이벤트 기록: 켜지자마자 행동하면
+    #   0.6초 뒤 손해≥0.2%p 가 17%, 2~3초 살아남은 신호만 행동하면 2~3% (신호의 40~45% 가 남음). Z 는 평소 변화폭 대비
+    #   급변 판정 배수. 끄면(false) 예전처럼 켜지는 순간 주문한다. 시뮬레이션(1분봉)은 항상 끔
+    signal_filter_enabled: bool = True
+    signal_filter_tau_sec: float = 2.5
+    signal_filter_cut: float = 0.7
+    signal_filter_z_spike: float = 3.0
+
     # ★ 원화 버퍼 (2026-10-30, docs/concept.md 2번): 업비트에 '가장 큰 포지션 크기 × 이 수' 만큼을 늘 원화로 둔다.
     #   진입은 그 원화로 코인 FOK 를 먼저 내고, 체결되면 쓴 만큼 USDT 를 되판다 → 놓쳐도 USDT 왕복 비용(0.175%)이 없고
     #   판단 → 주문 도착이 USDT 매도 한 번(약 0.4초)만큼 빨라진다. 버퍼 원화는 어떤 포지션에도 속하지 않는 현금이라
@@ -670,6 +680,10 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
         hedge_tolerance_percent=_env_float("HEDGE_TOLERANCE_PERCENT", d.hedge_tolerance_percent),
         upbit_krw_buffer_positions=_env_float("UPBIT_KRW_BUFFER_POSITIONS", d.upbit_krw_buffer_positions),
+        signal_filter_enabled=_env_bool("SIGNAL_FILTER_ENABLED", d.signal_filter_enabled),
+        signal_filter_tau_sec=_env_float("SIGNAL_FILTER_TAU_SEC", d.signal_filter_tau_sec),
+        signal_filter_cut=_env_float("SIGNAL_FILTER_CUT", d.signal_filter_cut),
+        signal_filter_z_spike=_env_float("SIGNAL_FILTER_Z_SPIKE", d.signal_filter_z_spike),
         upbit_min_order_krw=_env_float("UPBIT_MIN_ORDER_KRW", d.upbit_min_order_krw),
         entry_min_funding_8h_percent=(_env_optional_float("ENTRY_MIN_FUNDING_8H_PERCENT")
                                       if os.getenv("ENTRY_MIN_FUNDING_8H_PERCENT") is not None
@@ -890,6 +904,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("MAX_POSITION_USDT 는 0보다 커야 합니다")
     if s.upbit_krw_buffer_positions < 0:
         errors.append("UPBIT_KRW_BUFFER_POSITIONS 는 0 이상이어야 합니다")
+    if s.signal_filter_tau_sec <= 0 or not 0 < s.signal_filter_cut <= 1 or s.signal_filter_z_spike <= 0:
+        errors.append("SIGNAL_FILTER_TAU_SEC·Z_SPIKE 는 0보다 커야 하고 SIGNAL_FILTER_CUT 은 0~1 사이여야 합니다")
     if s.daily_loss_limit_usdt is not None and s.daily_loss_limit_usdt <= 0:
         errors.append("DAILY_LOSS_LIMIT_USDT 는 0보다 커야 합니다")
     if s.max_funding_cost_percent < 0:

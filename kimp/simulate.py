@@ -327,7 +327,8 @@ def run_simulation(
     여기서는 1분마다 하는 것이고, 그래서 1분봉보다 짧은 기회는 못 본다.
     """
     # 시뮬레이션용 설정: 메모리 DB, 김프 기록/현황 로그는 끔 (필요 없고 느려짐)
-    sim_settings = replace(settings, db_path=":memory:", snapshot_interval_sec=float("inf"))
+    # 신호 신뢰도 게이트는 끈다 — 1분 간격 판단에서는 '몇 초 유지' 를 볼 수 없어 한 칸(1분) 늦추는 효과만 난다
+    sim_settings = replace(settings, db_path=":memory:", snapshot_interval_sec=float("inf"), signal_filter_enabled=False)
     session_factory = make_session_factory(":memory:")
     # 실시간 봇과 같은 브로커·안전장치 설정 (비상정지 파일만 안 봄)
     safety = Safety(settings.max_consecutive_failures, settings.daily_loss_limit_usdt, None, clock)

@@ -40,7 +40,8 @@ from kimp.fok_sizing import EntryFit, fit_entry
 from kimp.fok_trace import classify_miss
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium
-from kimp.premium import Quote, near_tick_boundary
+from kimp.premium import Quote, near_tick_boundary, upbit_krw_tick
+from kimp.signal_filter import FilterParams, FilterState, SignalFilter
 from kimp.volatility import RangeTracker
 from kimp import telemetry
 
@@ -132,6 +133,11 @@ class Engine:
         self._miss_times: Dict[str, Deque[float]] = {}   # 코인별 최근 진입 놓침 시각 (연속 놓침 쉬기, N1)
         # 코인별 최근 스캔의 업비트 매도 호가 (시각, 호가) — '지정가 줄 나이' 기록용 (docs/issues.md N5, 가드 아님)
         self._ask_hist: Dict[str, Deque[Tuple[float, Sequence]]] = {}
+        # 신호 신뢰도 게이트 (docs/filter.md): 코인별 진입 김프 필터, 포지션별 순손익 필터
+        self._filter_params = FilterParams(tau_sec=settings.signal_filter_tau_sec, cut=settings.signal_filter_cut,
+                                           z_spike=settings.signal_filter_z_spike)
+        self._entry_filters: Dict[str, SignalFilter] = {}
+        self._tp_filters: Dict[int, SignalFilter] = {}
         # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
         self._bybit_range = RangeTracker()
         self._last_status_log = 0.0
@@ -364,6 +370,8 @@ class Engine:
 
         # 목표 / 손절은 진입할 때 포지션에 저장한 값 (들고 있는 중에 .env 를 바꿔도 처음 값으로)
         target, stop = self._exit_rules(pos)
+        # 신호 신뢰도 (docs/filter.md): 순손익 시계열에 '목표 이상' 이 켜진 순간부터 되돌림 없이 유지되는지를 점수로
+        gate = self._gate(self._tp_filters, pos.id, pnl.net_percent, quote.upbit.best_bid, pnl.net_percent >= target)
         # 익절 기준은 목표 그대로다. 업비트 코인 매도가 판단가 지정가 FOK 라 판단보다 나쁘게 팔리지 않으므로
         # 밀림 여유를 목표에 얹지 않는다 (2026-10-29 유동 여유 제거, docs/issues.md #3)
         reason: Optional[str] = None
@@ -381,6 +389,16 @@ class Engine:
                 reason = ExitReason.FUNDING_COST
         if reason == ExitReason.TAKE_PROFIT and self._clock() < self._tp_retry_at.get(pos.id, 0.0):
             reason = None   # 방금 익절 지정가가 놓침 → FOK_RETRY_SEC 지나고 다시
+        if reason == ExitReason.TAKE_PROFIT and gate is not None and gate.score < self.s.signal_filter_cut:
+            # 목표를 막 넘은 신호 — 몇 초 유지되는지 보고 판다. 튐이면 곧 꺼지고, 진짜면 점수가 올라 다음 스캔에 판다
+            self._log_throttled(
+                f"tp-gate-{pos.coin}", logging.INFO,
+                f"[익절 대기] #{pos.id} {pos.coin} | 순손익 {pnl.net_percent:+.3f}% ≥ 목표 {target:.2f}% 이지만 "
+                f"{self._tp_filters[pos.id].describe(self._clock())} < 컷 {self.s.signal_filter_cut:.2f} | 유지되면 판다",
+                cooldown_sec=10.0)
+            telemetry.decision(session, pos.coin, "tp_filter_hold", pnl.net_percent, target, premium_depth=gate.score,
+                               position_id=pos.id, now=self._now_utc())
+            reason = None
         if reason == ExitReason.TAKE_PROFIT:
             # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
             fresh = self._fresh_quote(pos.coin)
@@ -412,10 +430,12 @@ class Engine:
                 else:
                     worst_text = "?" if worst is None else f"{worst:+.3f}%"
                     vol = self._bybit_range.describe(pos.coin, self._clock())   # 변동성 기록 (docs/issues.md #5)
-                    logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%% (전부 마지막 줄 가격이면 %s) | %s",
-                                pos.id, pos.coin, pnl.net_percent, target, worst_text, vol)
+                    gate_text = self._tp_filters[pos.id].describe(self._clock()) if pos.id in self._tp_filters else ""
+                    logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%% (전부 마지막 줄 가격이면 %s) | %s | %s",
+                                pos.id, pos.coin, pnl.net_percent, target, worst_text, vol, gate_text)
                     telemetry.decision(session, pos.coin, "tp_judge", pnl.net_percent, target,
-                                       premium_depth=worst, position_id=pos.id, note=vol, now=self._now_utc())
+                                       premium_depth=worst, position_id=pos.id, note=f"{vol} | {gate_text}",
+                                       now=self._now_utc())
 
         # 기록은 확인 시세 판정이 끝난 값으로 (가짜 꼭대기가 최고점·평가 기록에 남지 않게)
         pos.last_net_percent = pnl.net_percent
@@ -551,6 +571,7 @@ class Engine:
                                note=f"{why} | {exc} | {detail}", now=self._now_utc())
             return
         self._reentry_allowed_at[pos.coin] = self._clock() + self.s.reentry_cooldown_sec
+        self._tp_filters.pop(pos.id, None)
         if final is None:
             return  # 일부 단계 실패 → CLOSING 으로 남음, 다음 스캔에서 이어서 (broker.sync)
         level = logging.CRITICAL if liquidated else logging.INFO
@@ -931,6 +952,10 @@ class Engine:
             # 맨 앞 호가 김프는 실제 체결 김프보다 **항상 유리하므로**, 여기서 떨어지면
             # 수량을 넣고 계산해도 절대 통과할 수 없다 → 안전하게 건너뛸 수 있다.
             top = quote.entry_premium_top
+            # 신호 신뢰도 (docs/filter.md): 맨 앞 호가 김프 시계열에 '기준 이하' 가 켜진 순간부터 유지되는지를 점수로.
+            # 기준 근처가 아니어도 매 스캔 갱신해야 시계열이 끊기지 않는다
+            gate = (self._gate(self._entry_filters, coin, top, quote.upbit.best_ask, top <= threshold)
+                    if top is not None else None)
             if top is None or top > threshold + telemetry.NEAR_MARGIN_PERCENT:
                 continue  # 기준 근처에도 못 왔으면 기록도 안 남긴다
             # 분석용 기록: 기준 근처부터는 어느 단계에서 걸렸는지 한 줄씩 남긴다 (kimp/telemetry.py)
@@ -1007,6 +1032,16 @@ class Engine:
                 continue
             if fit.status == "ok":
                 bybit_qty = fit.bybit_qty
+            if fit.status == "ok" and premium <= threshold and gate is not None and gate.score < self.s.signal_filter_cut:
+                # 기준을 막 넘은 신호 — 몇 초 유지되는지 보고 들어간다 (튐이면 곧 꺼진다, docs/filter.md)
+                self._log_throttled(
+                    f"entry-gate-{coin}", logging.INFO,
+                    f"[진입 대기] {coin} | 김프 {premium:+.3f}% ≤ 기준 {threshold:+.2f}% 이지만 "
+                    f"{self._entry_filters[coin].describe(self._clock())} < 컷 {self.s.signal_filter_cut:.2f} | 유지되면 들어간다",
+                    cooldown_sec=10.0)
+                telemetry.decision(session, coin, "filter_hold", top, threshold, premium_depth=premium, size_usdt=size,
+                                   bybit_qty=bybit_qty, funding_8h=funding, note=f"신뢰도 {gate.score:.2f}", now=now_utc)
+                continue
             if fit.status == "ok" and premium <= threshold:
                 # 정렬 기준으로 '기준보다 얼마나 더 낮은가'(음수, 작을수록 좋음)를 맨 앞에 둔다.
                 # 김프 절댓값으로 줄 세우면 기준이 느슨한 코인이 늘 이긴다 — 코인마다 기준이
@@ -1098,20 +1133,21 @@ class Engine:
             pos.run_id = self.run_id
             session.commit()
             vol = self._bybit_range.describe(coin, self._clock())   # 변동성 기록 (docs/issues.md #5)
+            gate_text = self._entry_filters[coin].describe(self._clock()) if coin in self._entry_filters else ""
             telemetry.decision(session, coin, "entered", top, threshold, premium_depth=depth, size_usdt=size,
-                               bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id, note=f"{vol} | {age}",
-                               now=self._now_utc())
+                               bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id,
+                               note=f"{vol} | {age} | {gate_text}", now=self._now_utc())
             notional = pos.bybit_qty * pos.entry_bybit_price_usdt
             target = estimated_exit_premium(pos.entry_premium, params.target_net_profit_percent, notional, 0.0,
                                             self.s.fees, quote.usdt_spread_percent or 0.0, coin=coin)
             logger.info(
                 "[진입] #%d %s | 김프 %+.3f%% (기준 %+.2f%%, 판단 %+.3f%%) | 목표 %.2f%% → 김프 약 %+.2f%% 필요 | "
                 "업비트 %.6g개 매수 (%s원) → USDT %.2f개 매도 (%.1f원) | 바이비트 %g개 숏 (%.6f USDT, %.0f배) | "
-                "강제청산가 %.6f | %s | %s",
+                "강제청산가 %.6f | %s | %s | %s",
                 pos.id, coin, pos.entry_premium, params.entry_premium_threshold_percent, depth,
                 params.target_net_profit_percent, target,
                 pos.upbit_qty, f"{pos.entry_upbit_price_krw:,.2f}", pos.usdt_sold, pos.entry_usdt_price_krw,
-                pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage, pos.liquidation_price, vol, age,
+                pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage, pos.liquidation_price, vol, age, gate_text,
             )
             open_positions[coin] = pos
             if self.s.one_shot:
@@ -1142,6 +1178,20 @@ class Engine:
             q.clear()
             return count
         return None
+
+    def _gate(self, filters: dict, key, x: float, price: Optional[float], signal_on: bool) -> Optional[FilterState]:
+        """
+        신호 신뢰도 필터 갱신 (docs/filter.md). 꺼져 있으면 None (= 예전처럼 켜지는 순간 주문)
+
+        filters: 코인별(진입) 또는 포지션별(익절) SignalFilter. x 는 김프 또는 순손익(%), price 는 업비트 가격(호가 한 칸 바닥용)
+        """
+        if not self.s.signal_filter_enabled:
+            return None
+        f = filters.get(key)
+        if f is None:
+            f = filters[key] = SignalFilter(self._filter_params)
+        tick_pct = upbit_krw_tick(price) / price * 100 if price else 0.0
+        return f.update(self._clock(), x, tick_pct, signal_on=signal_on)
 
     def _level_age(self, coin: str, limit: Optional[float], qty: float) -> str:
         """
