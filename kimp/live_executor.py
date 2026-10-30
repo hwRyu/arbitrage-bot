@@ -331,10 +331,18 @@ class LiveExecutor:
     # ------------------------------------------------------------------
     # 주문
     # ------------------------------------------------------------------
-    def _wait(self, ex, order: dict, symbol: str) -> dict:
-        """주문이 끝날 때까지 조회 (시장가라 보통 1초 안에 끝남)"""
+    def _wait(self, ex, order: dict, symbol: str, stats: Optional[dict] = None) -> dict:
+        """
+        주문이 끝날 때까지 조회 (시장가·FOK 라 보통 첫 조회에 끝남)
+
+        조회 횟수와 첫 조회 상태를 stats 에 남긴다 (_order 가 단계별 시간 로그에 쓴다, docs/issues.md N4).
+        인스턴스 속성이 아니라 호출마다 받는 dict 다 — 진입의 숏 ∥ USDT 매도가 두 스레드에서 동시에 이 함수를 돈다
+        BLEND #36 익절 (2026-10-30 10:30): FOK 매도 전송 → 체결 확인이 2.8초 (평소 0.4~0.8초) 걸리는 동안 바이비트가
+        +0.25% 움직여 이익이 사라졌다. 그 2.8초가 주문 요청 응답인지 상태 조회 반복인지 가리려고 센다
+        """
         deadline = time.monotonic() + self.order_timeout_sec
         oid = order.get("id")
+        polls, first_status = 0, None
         while True:
             try:
                 if ex is self.by:
@@ -344,6 +352,11 @@ class LiveExecutor:
             except Exception as exc:
                 got = None
                 logger.warning("주문 %s 조회 실패 (다시): %s", oid, exc)
+            polls += 1
+            if first_status is None:
+                first_status = (got or {}).get("status") or "조회 실패"
+            if stats is not None:
+                stats["polls"], stats["first"] = polls, first_status
             if got and (got.get("status") in DONE_STATUSES or
                         (got.get("filled") and not got.get("remaining"))):
                 return got
@@ -430,6 +443,8 @@ class LiveExecutor:
           있음 → 그 주문 결과로 진행 / 없음 → 실패 (OrderFailed) / 조회도 실패 → 모름 (OrderUnknown)
         allow_empty: 체결 0 을 실패가 아니라 '아무 일 없음'(qty 0) 으로 돌려준다 — 지정가 FOK 가 취소된 경우
         """
+        t0 = time.monotonic()
+        stats: dict = {}
         try:
             order = place()
         except Exception as exc:
@@ -448,18 +463,24 @@ class LiveExecutor:
                 raise OrderFailed(f"{what}: 주문 거절 {exc}") from exc
             logger.warning("%s: 주문 요청은 오류였지만 추적번호 %s 로 조회하니 들어가 있음 → 그대로 진행", what, client_id)
             order = found
-        done = self._wait(ex, order, symbol)
+        t1 = time.monotonic()
+        done = self._wait(ex, order, symbol, stats)
+        t2 = time.monotonic()
         self._refresh_after_order(ex)
+        polls, first_status = stats.get("polls", 0), stats.get("first", "-")
+        # 단계별 시간 (N4): 요청 = 주문 요청 → 응답, 확인 = 끝날 때까지 상태 조회 (횟수, 첫 조회 상태), 합계
+        timing = (f"요청 {t1 - t0:.2f}초 · 확인 조회 {polls}회 {t2 - t1:.2f}초 (첫 조회 {first_status}) · "
+                  f"합계 {t2 - t0:.2f}초")
         try:
             fill = self._fill(done, fee_ccy, what)
         except OrderFailed:
             if not allow_empty:
                 raise
-            logger.info("[지정가 미체결] %s | 전량 즉시 체결이 안 돼 취소됨 (상태 %s, 주문 %s)", what, done.get("status"),
-                        done.get("id"))
+            logger.info("[지정가 미체결] %s | 전량 즉시 체결이 안 돼 취소됨 (상태 %s, 주문 %s) | %s", what, done.get("status"),
+                        done.get("id"), timing)
             return self._nothing()
-        logger.info("[주문 체결] %s %g개 평균 %.8g (금액 %.8g, 수수료 %.8g %s, 주문 %s)",
-                    what, fill.qty, fill.avg_price, fill.cost, fill.fee, fee_ccy, fill.order_id)
+        logger.info("[주문 체결] %s %g개 평균 %.8g (금액 %.8g, 수수료 %.8g %s, 주문 %s) | %s",
+                    what, fill.qty, fill.avg_price, fill.cost, fill.fee, fee_ccy, fill.order_id, timing)
         return fill
 
     @staticmethod

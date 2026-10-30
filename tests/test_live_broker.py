@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 
-from kimp.broker import EntryRejected, HedgeBroker, PaperBroker
+from kimp.broker import EntryMissed, EntryRejected, HedgeBroker, PaperBroker
 from kimp.config import FeeSettings, Settings
 from kimp.db import ExitReason, Fill, Position, PositionStatus, Transfer, TransferStatus, make_session_factory, utcnow
 from kimp.executor import BYBIT_USDT, UPBIT_USDT, OrderFailed
@@ -348,6 +348,28 @@ class PrefetchTest(unittest.TestCase):
             by.fetch_positions = lambda *a, **k: (_ for _ in ()).throw(AssertionError("캐시가 있는데 REST 를 불렀다"))
             self.assertFalse(broker.ex.short_gone(s, "XRP"))
             self.assertAlmostEqual(broker.ex.position_liq_price(s, "XRP"), broker.ex._liq["XRP"])
+
+
+class OrderTimingLogTest(unittest.TestCase):
+    """주문 단계별 시간 기록 (docs/issues.md N4): 요청 / 확인 조회 횟수·시간 / 합계가 체결·미체결 로그에 붙는다"""
+
+    def test_fill_and_miss_logs_carry_timing(self):
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            with self.assertLogs("kimp.live_executor", level=logging.INFO) as logs:
+                broker.open_hedge(s, prices.quote(), 50.0)
+            fills = [m for m in logs.output if "[주문 체결]" in m]
+            self.assertEqual(len(fills), 3)                                     # 코인 FOK · USDT 매도 · 숏
+            for m in fills:
+                self.assertRegex(m, r"요청 \d+\.\d\d초 · 확인 조회 \d+회 \d+\.\d\d초 \(첫 조회 \w+\) · 합계 \d+\.\d\d초")
+            judged = prices.quote()
+            prices.coin_bid, prices.coin_ask = 2830.0, 2835.0                    # 놓치게
+            with self.assertLogs("kimp.live_executor", level=logging.INFO) as logs:
+                with self.assertRaises(EntryMissed):
+                    broker.open_hedge(s, judged, 50.0)
+            miss = [m for m in logs.output if "[지정가 미체결]" in m]
+            self.assertEqual(len(miss), 1)
+            self.assertRegex(miss[0], r"확인 조회 1회 .* 합계 \d+\.\d\d초")
 
 
 class LiveRoundTripTest(unittest.TestCase):
