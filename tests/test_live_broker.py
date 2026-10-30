@@ -776,7 +776,7 @@ class HedgeGapTest(unittest.TestCase):
             self.assertTrue(any("진입 김프 변동" in m for m in logs.output), logs.output)
 
     def test_fill_diff_log_splits_depth_and_move(self):
-        """[체결 차이]: 판단가 → 체결가 차이를 호가 소진 몫(판단 때 호가)과 가격 이동 몫(주문 사이 움직임)으로 적는다.
+        """[판단→체결 가격 이동]: 주문 사이 가격 이동(판단가 → 체결가)과 판단 때 호가 소진을 같이 적는다.
         바이비트가 코인 체결 직후 1% 내려가면 숏(파는 단계)은 가격 이동 몫 +1% 불리"""
         import re
         prices = Prices()
@@ -787,12 +787,12 @@ class HedgeGapTest(unittest.TestCase):
         with sf() as s:
             with self.assertLogs("kimp.broker", level=logging.INFO) as logs:
                 broker.open_hedge(s, prices.quote(), 50.0)
-        diffs = {re.search(r"#\d+ \w+ (\w+) \|", m).group(1): m for m in logs.output if "[체결 차이]" in m}
+        diffs = {re.search(r"#\d+ \w+ (\w+) \|", m).group(1): m for m in logs.output if "[판단→체결 가격 이동]" in m}
         self.assertEqual(set(diffs), {"buy", "open_short", "sell_usdt"})
         short = diffs["open_short"]
-        self.assertIn("호가 소진 몫 +0.000%", short)                                  # 호가가 깊어 소진 0
-        self.assertAlmostEqual(float(re.search(r"가격 이동 몫 ([+-][\d.]+)%", short).group(1)), 1.0, delta=0.02)
-        self.assertIn("가격 이동 몫 +0.000%", diffs["buy"])                             # 업비트 FOK 는 판단가 그대로
+        self.assertIn("호가 소진 +0.000%", short)                                  # 호가가 깊어 소진 0
+        self.assertAlmostEqual(float(re.search(r"가격 이동 ([+-][\d.]+)% 불리", short).group(1)), 1.0, delta=0.02)
+        self.assertIn("가격 이동 +0.000% 불리", diffs["buy"])                             # 업비트 FOK 는 판단가 그대로
 
     def test_small_drift_is_quiet(self):
         """0.3% 안쪽으로만 움직이면 경고하지 않는다"""

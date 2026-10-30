@@ -378,7 +378,7 @@ class HedgeBroker:
 
         결과를 모르면(OrderUnknown) SENT 그대로 둔다 → 다음 스캔(sync)에서 추적번호로 조회해서 채운다.
         expected_price 는 분석용: 판단 때 호가 소진 계산으로 예상한 평균가 (실제 avg_price 와 비교하려고 남긴다).
-        expected_slip 은 그 예상가가 맨 앞 호가보다 얼마나 나쁜가 (%, 판단 때 호가로 우리 수량이 먹는 줄들) — [체결 차이] 로그용.
+        expected_slip 은 그 예상가가 맨 앞 호가보다 얼마나 나쁜가 (%, 판단 때 호가로 우리 수량이 먹는 줄들) — [판단→체결 가격 이동] 로그용.
         """
         row = self._sent_row(session, pos, side, expected_price)
         self._log_send(pos, [side])
@@ -426,7 +426,7 @@ class HedgeBroker:
     @staticmethod
     def _log_fill_diff(pos: Position, row: Fill, f: LegFill, expected_slip: Optional[float]) -> None:
         """
-        [체결 차이] 판단가 대비 체결가 차이 — 두 몫으로 나눠 적는다 (2026-10-30, '밀림' 이라는 말을 쓰지 않는다)
+        [판단→체결 가격 이동] 주문 사이에 시장이 움직인 만큼 (2026-10-30, '밀림' 이라는 말을 쓰지 않는다)
 
         판단가(expected_price)는 판단 때 호가로 우리 수량을 먹었을 때의 평균이라 **호가 소진 몫**(맨 앞 호가 대비, expected_slip)은
         이미 들어 있다. 따라서 판단가 → 체결가 차이는 거의 전부 **가격 이동 몫** — 판단과 체결 사이(0.2~0.6초)에 시장이 움직인 것
@@ -439,8 +439,8 @@ class HedgeBroker:
         if row.side not in BUY_SIDES:
             move = -move
         slip_text = f"{expected_slip:+.3f}%" if expected_slip is not None else "-"
-        logger.info("[체결 차이] #%d %s %s | 판단 %.8g → 체결 %.8g | 불리 %+.3f%% (호가 소진 몫 %s · 가격 이동 몫 %+.3f%%)",
-                    pos.id, pos.coin, row.side, row.expected_price, f.avg_price, move, slip_text, move)
+        logger.info("[판단→체결 가격 이동] #%d %s %s | 판단 %.8g → 체결 %.8g | 주문 사이 가격 이동 %+.3f%% 불리 (호가 소진 %s 는 판단가에 포함)",
+                    pos.id, pos.coin, row.side, row.expected_price, f.avg_price, move, slip_text)
 
     def _legs_parallel(self, session: Session, pos: Position,
                        specs: List[tuple]) -> Dict[str, LegFill]:
@@ -1032,7 +1032,7 @@ class HedgeBroker:
         exp_sell = plan.upbit.avg_price if plan else None
         exp_usdt = plan.usdt.avg_price if plan else None
         exp_short = plan.bybit.avg_price if plan else None
-        slip_sell = plan.upbit.slippage_percent if plan else None     # [체결 차이] 의 호가 소진 몫
+        slip_sell = plan.upbit.slippage_percent if plan else None     # [판단→체결 가격 이동] 의 호가 소진
         slip_usdt = plan.usdt.slippage_percent if plan else None
         slip_short = plan.bybit.slippage_percent if plan else None
         done = False
