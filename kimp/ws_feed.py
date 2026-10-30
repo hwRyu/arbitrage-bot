@@ -21,8 +21,12 @@
     - 주문은 그대로 REST (live_executor). 소켓 주문은 쓰지 않는다.
 
 동작
-    데몬 스레드 하나에서 asyncio 루프를 돌리고, 심볼마다 ccxt.pro watch_order_book 을 끝없이 기다린다.
-    연결이 끊기면 ccxt 가 다시 붙고, 예외가 나면 잠깐 쉬었다 다시 시도한다 (로그는 묶어서, 복구도 한 번만).
+    데몬 스레드 하나에서 asyncio 루프를 돌린다.
+    - 바이비트: 심볼마다 ccxt.pro watch_order_book 을 끝없이 기다린다. 연결이 끊기면 ccxt 가 다시 붙는다.
+    - 업비트: ccxt 를 쓰지 않고 **연결 하나에 코드 전부를 한 번에 구독**한다 (aiohttp, wss://api.upbit.com/websocket/v1).
+      ccxt 는 심볼을 하나 더 구독할 때마다 연결을 닫고 새로 열어(원격 종료 코드 1000) 코인 40개면 재접속이 끝나지
+      않는다 (2026-10-30 수집기 --ws --top 40: 6분에 409번 끊김). 업비트 공식 방식은 구독 메시지 하나에 코드 목록이다.
+    예외가 나면 잠깐 쉬었다 다시 시도한다 (로그는 묶어서, 복구도 한 번만).
     그동안 그 심볼은 묵은 호가가 되어 books() 가 None → MarketData 가 REST 로 받는다. 즉 소켓이 죽어도 봇은 선다.
 
 한계
@@ -32,9 +36,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -49,10 +55,35 @@ RETRY_BACKOFF_MAX_SEC = 10.0   # 소켓 예외 뒤 다시 붙기까지 최대 �
 # 심볼 하나가 이보다 오래 아무것도 안 오면 (연결은 살아 있어도) 의심 → REST 로. 한가한 코인은 새벽에 몇 분씩 호가가
 # 안 바뀐다 (BLEND 2026-10-25 02:33, 60초 기준이 자꾸 걸렸다) — 구독 하나가 조용히 죽는 건 드무니 넉넉히 둔다
 SYMBOL_SILENT_MAX_SEC = 300.0
-# 시작 뒤 이 시간 안의 끊김은 조용히 다시 붙는다 (경고 안 함). 업비트는 ccxt 가 심볼을 하나 더 구독할 때마다 연결을
-# 닫고 새로 여는데(원격 종료 코드 1000), 코인 6개면 시작 3초 동안 그게 열두 번쯤 찍힌다 — 실거래면 전부 텔레그램으로
-# 간다. 이 시간이 지나도 끊기면 진짜 문제라 경고한다. (업비트 묶음 구독은 ccxt 가 아직 지원하지 않는다)
-WARMUP_SEC = 30.0   # 실측: 코인 5개면 업비트 재접속 정리에 8~15초 (2026-10-24 21:43 재기동 때 10초를 넘겨 경고가 샜다)
+# 시작 뒤 이 시간 안의 끊김은 조용히 다시 붙는다 (경고 안 함). 바이비트 ccxt 구독 정리 시간. 이 시간이 지나도 끊기면
+# 진짜 문제라 경고한다. (업비트는 2026-10-30 부터 묶음 구독이라 시작 때 끊김이 없다)
+WARMUP_SEC = 30.0
+UPBIT_WS_URL = "wss://api.upbit.com/websocket/v1"
+UPBIT_WS_HEARTBEAT_SEC = 30.0   # 업비트는 120초 동안 아무것도 안 오가면 끊는다 → aiohttp 가 알아서 ping
+
+
+def upbit_code(symbol: str) -> str:
+    """ccxt 심볼 → 업비트 코드. 'MINA/KRW' → 'KRW-MINA'"""
+    base, quote = symbol.split("/")
+    return f"{quote}-{base}"
+
+
+def parse_upbit_orderbook(data: dict) -> Optional[Tuple[str, OrderBook]]:
+    """
+    업비트 웹소켓 orderbook 메시지 → (ccxt 심볼, OrderBook). orderbook 이 아니면 None
+
+    메시지: {"type":"orderbook","code":"KRW-MINA","timestamp":…,"orderbook_units":[{"ask_price","bid_price","ask_size","bid_size"},…]}
+    units 는 매수·매도 쌍이 가격 순(맨 앞이 가장 좋은 호가)으로 15줄.
+    """
+    if data.get("type") != "orderbook" or not data.get("code"):
+        return None
+    quote, base = data["code"].split("-", 1)
+    units = data.get("orderbook_units") or []
+    return f"{base}/{quote}", OrderBook(
+        bids=[(float(u["bid_price"]), float(u["bid_size"])) for u in units],
+        asks=[(float(u["ask_price"]), float(u["ask_size"])) for u in units],
+        timestamp_ms=data.get("timestamp"),
+    )
 
 
 @dataclass(frozen=True)
@@ -205,10 +236,13 @@ class WsFeed:
         """거래소 소켓 객체를 만들고 심볼마다 받기 작업을 띄운 뒤, 멈추라는 신호까지 기다린다"""
         import ccxt.pro as ccxtpro   # 무거운 모듈이라 쓸 때만 (REST 만 쓰는 실행에서는 안 올린다)
 
-        exchanges = {"upbit": ccxtpro.upbit(),
-                     "bybit": ccxtpro.bybit({"options": {"defaultType": "swap"}})}
+        exchanges = {"bybit": ccxtpro.bybit({"options": {"defaultType": "swap"}})}
+        subs = self._subscriptions()
         tasks = [asyncio.create_task(self._watch(exchanges[name], key, symbol), name=f"ws-{symbol}")
-                 for name, key, symbol in self._subscriptions()]
+                 for name, key, symbol in subs if name == "bybit"]
+        upbit = [(key, symbol) for name, key, symbol in subs if name == "upbit"]
+        if upbit:
+            tasks.append(asyncio.create_task(self._watch_upbit(upbit), name="ws-upbit"))
         try:
             while not self._stop.is_set():
                 await asyncio.sleep(0.2)
@@ -222,8 +256,51 @@ class WsFeed:
                 except Exception:
                     pass
 
+    async def _watch_upbit(self, subs: List[Tuple[Key, str]]) -> None:
+        """업비트 코드 전부를 연결 하나·구독 하나로 끝없이 받는다. 끊기면 잠깐 쉬었다 다시 (그동안은 REST 가 받는다)"""
+        import aiohttp
+
+        key_of = {upbit_code(symbol): key for key, symbol in subs}
+        codes = list(key_of)
+        backoff = 1.0
+        log_key = "ws-upbit"
+        while not self._stop.is_set():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(UPBIT_WS_URL, heartbeat=UPBIT_WS_HEARTBEAT_SEC) as ws:
+                        await ws.send_json([{"ticket": f"kimp-{uuid.uuid4().hex[:8]}"},
+                                            {"type": "orderbook", "codes": codes}, {"format": "DEFAULT"}])
+                        async for msg in ws:
+                            if msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
+                                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                    raise ConnectionError(f"업비트 소켓 종료 {msg.type.name}")
+                                continue
+                            parsed = parse_upbit_orderbook(json.loads(msg.data))
+                            if parsed is None:
+                                continue
+                            symbol, book = parsed
+                            key = key_of.get(upbit_code(symbol))
+                            if key is None:
+                                continue
+                            backoff = 1.0
+                            _log_recovered(log_key, "웹소켓 호가 upbit")
+                            self._store(key, book)
+                        raise ConnectionError("업비트 소켓이 닫혔습니다")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._mark_dead("upbit")
+                if self._clock() - (self._started_at or 0.0) < WARMUP_SEC:
+                    logger.debug("[웹소켓 호가] 시작 중 재접속 upbit: %s", exc)
+                    await asyncio.sleep(0.5)
+                    continue
+                _log_repeat(log_key, logging.WARNING,
+                            f"[웹소켓 호가 끊김] upbit | {exc} | 다시 붙는 중 (그동안 REST 로 받습니다)")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RETRY_BACKOFF_MAX_SEC)
+
     async def _watch(self, ex, key: Key, symbol: str) -> None:
-        """심볼 하나를 끝없이 받는다. 예외가 나면 묶어서 알리고 잠깐 쉬었다 다시 (그동안은 REST 가 받는다)"""
+        """(바이비트) 심볼 하나를 ccxt.pro 로 끝없이 받는다. 예외가 나면 묶어서 알리고 잠깐 쉬었다 다시 (그동안은 REST 가 받는다)"""
         backoff = 1.0
         log_key = f"ws-{key[0]}"   # 거래소 단위로 묶는다 — 연결 하나가 끊기면 심볼 전부가 같이 끊기므로 한 줄이면 된다
         while not self._stop.is_set():

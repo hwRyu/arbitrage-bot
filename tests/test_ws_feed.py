@@ -96,6 +96,21 @@ class WsFeedTest(unittest.TestCase):
         self.assertTrue(self.feed.wait_change(0.0))
         self.assertFalse(self.feed.wait_change(0.0))             # 신호는 한 번 읽으면 비워진다
 
+    def test_upbit_code_and_orderbook_parse(self):
+        """업비트 묶음 구독: 심볼 ↔ 코드 변환과 orderbook 메시지 → OrderBook (맨 앞이 가장 좋은 호가)"""
+        from kimp.ws_feed import parse_upbit_orderbook, upbit_code
+        self.assertEqual(upbit_code("MINA/KRW"), "KRW-MINA")
+        self.assertEqual(upbit_code("USDT/KRW"), "KRW-USDT")
+        msg = {"type": "orderbook", "code": "KRW-MINA", "timestamp": 1_700_000_000_000,
+               "orderbook_units": [{"ask_price": 88.1, "bid_price": 88.0, "ask_size": 5000.0, "bid_size": 3000.0},
+                                   {"ask_price": 88.2, "bid_price": 87.9, "ask_size": 1.0, "bid_size": 2.0}]}
+        symbol, book = parse_upbit_orderbook(msg)
+        self.assertEqual(symbol, "MINA/KRW")
+        self.assertEqual(book.asks[0], (88.1, 5000.0))
+        self.assertEqual(book.bids[0], (88.0, 3000.0))
+        self.assertEqual(book.timestamp_ms, 1_700_000_000_000)
+        self.assertIsNone(parse_upbit_orderbook({"type": "ticker", "code": "KRW-MINA"}))
+
     def test_subscriptions_cover_each_coin_and_usdt_once(self):
         subs = self.feed._subscriptions()
         self.assertEqual([s[2] for s in subs], ["MINA/KRW", "MINA/USDT:USDT", "CAP/KRW", "CAP/USDT:USDT", "USDT/KRW"])
