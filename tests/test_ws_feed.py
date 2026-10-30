@@ -96,6 +96,19 @@ class WsFeedTest(unittest.TestCase):
         self.assertTrue(self.feed.wait_change(0.0))
         self.assertFalse(self.feed.wait_change(0.0))             # 신호는 한 번 읽으면 비워진다
 
+    def test_on_update_callback_names_coin_or_star_for_usdt(self):
+        """호가가 저장될 때마다 콜백: 코인 심볼이면 코인 이름, USDT/KRW 면 '*' (모든 코인에 영향)"""
+        from kimp.premium import OrderBook
+        from kimp.ws_feed import WsFeed
+        feed = WsFeed(["MINA"], clock=lambda: 0.0)
+        got = []
+        feed.on_update = got.append
+        book = OrderBook(bids=[(1.0, 1.0)], asks=[(1.1, 1.0)])
+        feed._store(("upbit", "MINA/KRW"), book)
+        feed._store(("bybit", "MINA/USDT:USDT"), book)
+        feed._store(("upbit", "USDT/KRW"), book)
+        self.assertEqual(got, ["MINA", "MINA", "*"])
+
     def test_upbit_code_and_orderbook_parse(self):
         """업비트 묶음 구독: 심볼 ↔ 코드 변환과 orderbook 메시지 → OrderBook (맨 앞이 가장 좋은 호가)"""
         from kimp.ws_feed import parse_upbit_orderbook, upbit_code

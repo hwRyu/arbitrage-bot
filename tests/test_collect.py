@@ -116,17 +116,14 @@ class TickModeTest(unittest.TestCase):
             return list(self.books_by_coin)
 
     def setUp(self):
-        try:
-            os.remove(TMP)
-        except OSError:
-            pass
-        self.settings = replace(Settings(coins=["AAA"]), snapshot_db_path=TMP)
+        import tempfile
+        # 윈도우는 열린 연결이 남으면 파일을 못 지워 다음 테스트에 기록이 겹친다 → 테스트마다 새 임시 폴더
+        self._dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.tmp = os.path.join(self._dir.name, "ticks.db")
+        self.settings = replace(Settings(coins=["AAA"]), snapshot_db_path=self.tmp)
 
     def tearDown(self):
-        try:
-            os.remove(TMP)
-        except OSError:
-            pass
+        self._dir.cleanup()
 
     def test_row_from_books(self):
         row = tick_row("AAA", self.FakeBooks(101.0), 1_000)
@@ -160,10 +157,69 @@ class TickModeTest(unittest.TestCase):
         feed.books_by_coin["AAA"] = self.FakeBooks(101.2)
         written = run_ws(self.settings, ["AAA", "BBB"], 0.0, threading.Event(), feed=feed, now_ms=now_ms, max_rounds=1)
         self.assertEqual(written, 2)                                   # 새 루프라 기억이 없어 둘 다 적는다
-        with make_session_factory(TMP)() as s:
+        with make_session_factory(self.tmp)() as s:
             self.assertEqual(s.scalar(select(func.count()).select_from(TickPremium)), 4)
             from kimp.db import Position
             self.assertEqual(s.scalar(select(func.count()).select_from(Position)), 0)
+
+    def test_run_ws_records_on_update_event_between_sweeps(self):
+        """호가가 바뀌면(feed.on_update) 전체 훑기를 기다리지 않고 그 코인을 바로 적는다 — 0.5초보다 짧은 틈도 남게"""
+        import kimp.collect as c
+
+        import time
+
+        class EventFeed(self.FakeFeed):
+            on_update = None
+            reads = 0
+
+            def books(self, coin):
+                self.reads += 1
+                return super().books(coin)
+
+        feed = EventFeed({"AAA": self.FakeBooks(101.0), "BBB": self.FakeBooks(102.0)})
+        t = [0]
+
+        def now_ms():
+            t[0] += 100
+            return t[0]
+
+        orig_flush = c.TICK_FLUSH_SEC
+        c.TICK_FLUSH_SEC = 0.01
+        stop = threading.Event()
+
+        def wait_until(cond):
+            for _ in range(400):
+                if cond():
+                    return
+                time.sleep(0.005)
+
+        def driver():
+            # 시작 훑기(두 코인 읽음)가 끝난 뒤, 다음 전체 훑기(interval 10초) 전에 AAA 를 두 번 바꾼다
+            wait_until(lambda: feed.on_update is not None and feed.reads >= 2)
+            reads = feed.reads
+            feed.books_by_coin["AAA"] = self.FakeBooks(101.3)
+            feed.on_update("AAA")
+            wait_until(lambda: feed.reads > reads)          # 루프가 그 변화를 읽을 때까지
+            reads = feed.reads
+            feed.books_by_coin["AAA"] = self.FakeBooks(101.0)
+            feed.on_update("AAA")
+            wait_until(lambda: feed.reads > reads)
+            time.sleep(0.05)
+            stop.set()
+
+        th = threading.Thread(target=driver)
+        th.start()
+        try:
+            written = run_ws(self.settings, ["AAA", "BBB"], 10.0, stop, feed=feed, now_ms=now_ms)
+        finally:
+            c.TICK_FLUSH_SEC = orig_flush
+            th.join()
+        with make_session_factory(self.tmp)() as s:
+            rows = s.query(TickPremium).filter(TickPremium.coin == "AAA").order_by(TickPremium.ts_ms).all()
+        self.assertGreaterEqual(written, 3)
+        self.assertEqual(len(rows), 3)                                 # 처음 + 튐 + 되돌아옴
+        self.assertGreater(rows[1].entry_premium_top, rows[0].entry_premium_top)
+        self.assertAlmostEqual(rows[2].entry_premium_top, rows[0].entry_premium_top, places=9)
 
 
 class PickCoinsTest(unittest.TestCase):

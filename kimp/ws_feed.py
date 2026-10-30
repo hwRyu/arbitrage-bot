@@ -115,6 +115,8 @@ class WsFeed:
         self._last_any: Dict[str, float] = {}                  # 거래소 이름 → 그 거래소에서 마지막으로 뭔가 온 시각
         self._lock = threading.Lock()
         self._changed = threading.Event()   # 호가가 하나라도 새로 오면 켜진다 (엔진이 기다렸다 깨는 신호)
+        # 호가가 바뀔 때마다 부르는 콜백 (소켓 스레드에서 부르니 빨리 끝나야 한다). 인자: 바뀐 코인, USDT/KRW 면 "*"
+        self.on_update: Optional[Callable[[str], None]] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started_at: Optional[float] = None
@@ -212,6 +214,10 @@ class WsFeed:
             self._updates[key] = self._updates.get(key, 0) + 1
             self._last_any[key[0]] = now
         self._changed.set()
+        cb = self.on_update
+        if cb is not None:
+            symbol = key[1]
+            cb("*" if symbol == USDT_KRW_SYMBOL else symbol.split("/")[0])
 
     def _subscriptions(self) -> List[Tuple[str, Key, str]]:
         """(거래소 이름, key, 심볼) 목록: 코인마다 업비트·바이비트 + 업비트 USDT/KRW 한 번"""
