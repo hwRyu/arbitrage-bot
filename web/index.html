@@ -464,13 +464,30 @@
         <label>코인 <input id="clCoins" placeholder="비우면 .env COINS" style="width:200px"></label>
         <label>또는 상위 <input id="clTop" type="number" placeholder="40" style="width:65px">개</label>
         <label><input type="checkbox" id="clAll"> 전체 (약 240개)</label>
-        <label>주기 <input id="clInterval" type="number" value="60" min="5" style="width:60px">초</label>
+        <label>주기 <input id="clInterval" type="number" value="60" min="0.25" step="0.25" style="width:60px">초</label>
         <label>시간 <input id="clHours" type="number" placeholder="무제한" style="width:70px">h</label>
+        <label><input type="checkbox" id="clWs"> 웹소켓 초 단위 (필터 자료, tick_premiums)</label>
         <button class="act" id="clRun">수집 시작</button>
       </div>
       <div class="row"><span class="muted">주문·포지션 없이 기록만 합니다 (봇과 별개, <code>data/market.db</code>).
-30줄만 넘으면 스크리너·시뮬레이션이 추측값 대신 실측 호가를 씁니다.</span></div>
+30줄만 넘으면 스크리너·시뮬레이션이 추측값 대신 실측 호가를 씁니다. <b>웹소켓 초 단위</b>를 켜면 0.5초마다 보고
+맨 앞 호가 김프가 바뀐 코인만 적습니다 (신호 신뢰도 필터 상수용, docs/filter.md — 상위 40개 권장).</span></div>
     </div>
+
+    <h3 style="font-size:14px;margin:18px 0 8px">초 단위 김프 시계열 (수집기 웹소켓 모드)</h3>
+    <div class="cards" id="tickCards"></div>
+    <div class="panel">
+      <div class="row">
+        <label>코인 <select id="tickCoin"></select></label>
+        <label>최근 <input id="tickMin" type="number" value="30" min="1" style="width:60px">분</label>
+        <button class="act" id="tickLoad">보기</button>
+        <span class="muted" id="tickInfo"></span>
+      </div>
+      <svg id="tickSvg" viewBox="0 0 900 220" style="width:100%;height:220px;background:#0f1520;border-radius:6px"></svg>
+      <div class="row"><span class="muted">파란 선 = 진입 김프(맨 앞 호가), 주황 선 = 청산 김프. 값이 바뀐 점만 기록하므로 계단 모양입니다.
+몇 초 튀었다 돌아오는 뾰족한 산이 '시차 틈', 올라가서 머무는 계단이 '진짜 변화' 입니다.</span></div>
+    </div>
+    <div class="wrap"><table id="tickTable"></table></div>
 
     <div class="cards" id="dataCards"></div>
     <h3 style="font-size:14px;margin:18px 0 8px">코인별 김프·호가 기록 (수집 결과)</h3>
@@ -677,7 +694,7 @@ document.querySelectorAll(".tabs button").forEach((b) => b.onclick = () => {
   if (b.dataset.tab === "screen") loadScreen();
   if (b.dataset.tab === "sim") loadSims();
   if (b.dataset.tab === "bot") loadBot();
-  if (b.dataset.tab === "data") loadData();
+  if (b.dataset.tab === "data") { loadData(); loadTicks(); }
 });
 $("chartCoin").onchange = () => { CHART_PICKED = true; $("chartCoin").value = $("chartCoin").value.trim().toUpperCase(); loadChart(); };
 $("chartCoin").onkeydown = (e) => { if (e.key === "Enter") $("chartCoin").onchange(); };
@@ -1379,8 +1396,68 @@ async function loadData() {
 
 $("clRun").onclick = () => runJob("collect", {
   coins: $("clCoins").value, top: $("clTop").value, all: $("clAll").checked ? "1" : "",
-  interval: $("clInterval").value, hours: $("clHours").value,
+  interval: $("clInterval").value, hours: $("clHours").value, ws: $("clWs").checked ? "1" : "",
 });
+$("clWs").onchange = () => {   // 웹소켓 모드는 0.5초, 아니면 60초가 기본
+  if ($("clWs").checked && Number($("clInterval").value) >= 5) $("clInterval").value = 0.5;
+  if (!$("clWs").checked && Number($("clInterval").value) < 5) $("clInterval").value = 60;
+};
+
+// ---------- 초 단위 김프 시계열 (tick_premiums) ----------
+async function loadTicks() {
+  try {
+    const t = await api("/api/ticks");
+    $("tickCards").innerHTML = [
+      ["기록", t.rows.toLocaleString() + "줄"],
+      ["코인", t.coins.length + "개"],
+      ["DB 크기", t.size_mb.toLocaleString() + " MB"],
+      ["마지막 기록", t.to_ms ? kst(t.to_ms) : "없음"],
+    ].map(([k, v]) => `<div class="card"><b>${k}</b><span>${v}</span></div>`).join("");
+    const sel = $("tickCoin"), keep = sel.value;
+    sel.innerHTML = t.coins.map((c) => `<option value="${c.coin}">${c.coin} (${c.count.toLocaleString()})</option>`).join("");
+    if (keep && t.coins.some((c) => c.coin === keep)) sel.value = keep;
+    table($("tickTable"), [
+      { t: "코인", v: (r) => r.coin },
+      { t: "기록", v: (r) => r.count.toLocaleString() + "줄" },
+      { t: "기간", v: (r) => `${kst(r.from_ms)} ~ ${kst(r.to_ms)}` },
+    ], t.coins);
+    if (sel.value) drawTicks(await api(`/api/ticks?coin=${sel.value}&minutes=${$("tickMin").value || 30}`));
+  } catch (e) {
+    $("tickCards").innerHTML = `<p class="err">${e.message}</p>`;
+  }
+}
+
+function drawTicks(data) {
+  const svg = $("tickSvg"), rows = data.series || [];
+  $("tickInfo").textContent = rows.length ? `${data.coin} 최근 ${data.minutes}분 · ${rows.length}점` : "";
+  if (!rows.length) { svg.innerHTML = `<text x="20" y="30" fill="#8b98a9">기록이 없습니다 (수집기 웹소켓 모드를 켜 두세요)</text>`; return; }
+  const W = 900, H = 220, L = 52, R = 12, T = 12, B = 22;
+  const t0 = rows[0].ts, t1 = rows[rows.length - 1].ts || t0 + 1;
+  const vals = rows.flatMap((r) => [r.entry, r.exit]);
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = (hi - lo) * 0.1 || 0.05; lo -= pad; hi += pad;
+  const x = (t) => L + (t - t0) / Math.max(1, t1 - t0) * (W - L - R);
+  const y = (v) => T + (hi - v) / (hi - lo) * (H - T - B);
+  let g = "";
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, yy = y(v);
+    g += `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" stroke="#223" /><text x="4" y="${yy + 4}" fill="#8b98a9" font-size="11">${v.toFixed(2)}%</text>`;
+  }
+  for (let i = 0; i <= 4; i++) {
+    const t = t0 + (t1 - t0) * i / 4;
+    g += `<text x="${x(t) - 20}" y="${H - 6}" fill="#8b98a9" font-size="11">${kst(t).slice(11, 19)}</text>`;
+  }
+  // 값이 바뀐 점만 있으니 계단(이전 값 유지)으로 잇는다
+  const step = (key) => rows.map((r, i) => (i ? `H${x(r.ts).toFixed(1)} ` : `M${x(r.ts).toFixed(1)} ${y(r[key]).toFixed(1)} `) +
+    (i ? `V${y(r[key]).toFixed(1)} ` : "")).join("");
+  g += `<path d="${step("entry")}" fill="none" stroke="#4ea1ff" stroke-width="1.4"/>`;
+  g += `<path d="${step("exit")}" fill="none" stroke="#ff9f43" stroke-width="1.4"/>`;
+  svg.innerHTML = g;
+}
+$("tickLoad").onclick = async () => {
+  const coin = $("tickCoin").value;
+  if (coin) drawTicks(await api(`/api/ticks?coin=${coin}&minutes=${$("tickMin").value || 30}`));
+};
 $("fcRun").onclick = () => {
   if (!$("fcCoins").value.trim()) { alert("코인을 적어 주세요 (예: CAP,SEI)"); return; }
   runJob("fetch", { coins: $("fcCoins").value, days: $("fcDays").value, timeframe: $("fcTf").value });
@@ -1496,7 +1573,7 @@ async function pollJob() {
         if (j.kind === "sim" && j.status === "done") loadSims();
         if (j.kind === "bot") loadBot();
         if (j.kind === "fetch" || j.kind === "prune") loadData();
-        if (j.kind === "collect") { loadData(); loadLive(); }
+        if (j.kind === "collect") { loadData(); loadLive(); loadTicks(); }
       } else if (j.kind === "bot") {
         loadBot();  // 봇이 돌고 있으면 기록이 쌓이는 걸 같이 보여준다
       } else if (j.kind === "collect") {

@@ -10,10 +10,11 @@ from dataclasses import replace
 
 from sqlalchemy import func, select
 
-from kimp.collect import pick_coins, run, snapshot_rows
+from kimp.collect import TickDedup, pick_coins, run, run_ws, snapshot_rows, tick_row
 from kimp.config import Settings
-from kimp.db import PremiumSnapshot, make_session_factory
+from kimp.db import PremiumSnapshot, TickPremium, make_session_factory
 from kimp.market_data import TopQuote
+from kimp.premium import OrderBook
 
 TMP = "data/_test_collect.db"
 
@@ -92,6 +93,77 @@ class RunTest(unittest.TestCase):
         finally:
             c.fetch_tops = orig
         self.assertEqual(written, 0)
+
+
+class TickModeTest(unittest.TestCase):
+    """--ws 모드: 웹소켓 호가로 바뀐 김프만 tick_premiums 에 적는다 (docs/filter.md 1단계)"""
+
+    class FakeBooks:
+        def __init__(self, up_ask):
+            self.upbit = OrderBook(bids=[(99.0, 1.0)], asks=[(up_ask, 1.0)])
+            self.bybit = OrderBook(bids=[(0.0745, 1.0)], asks=[(0.0755, 1.0)])
+            self.usdt = OrderBook(bids=[(1_330.0, 1.0)], asks=[(1_331.0, 1.0)])
+            self.age_ms, self.skew_ms = 10, 3
+
+    class FakeFeed:
+        def __init__(self, books):
+            self.books_by_coin = books
+
+        def books(self, coin):
+            return self.books_by_coin.get(coin)
+
+        def fresh_coins(self):
+            return list(self.books_by_coin)
+
+    def setUp(self):
+        try:
+            os.remove(TMP)
+        except OSError:
+            pass
+        self.settings = replace(Settings(coins=["AAA"]), snapshot_db_path=TMP)
+
+    def tearDown(self):
+        try:
+            os.remove(TMP)
+        except OSError:
+            pass
+
+    def test_row_from_books(self):
+        row = tick_row("AAA", self.FakeBooks(101.0), 1_000)
+        top = make_top()
+        self.assertAlmostEqual(row.entry_premium_top, top.entry_premium_top, places=9)
+        self.assertAlmostEqual(row.exit_premium_top, top.exit_premium_top, places=9)
+        self.assertAlmostEqual(row.mid_premium, top.mid_premium, places=9)
+        self.assertEqual((row.ts_ms, row.skew_ms), (1_000, 3))
+
+    def test_dedup_writes_only_changes_and_heartbeat(self):
+        d = TickDedup(heartbeat_sec=60)
+        a = tick_row("AAA", self.FakeBooks(101.0), 0)
+        self.assertTrue(d.should_write(a))
+        self.assertFalse(d.should_write(tick_row("AAA", self.FakeBooks(101.0), 500)))        # 같은 값
+        self.assertTrue(d.should_write(tick_row("AAA", self.FakeBooks(101.1), 1_000)))       # 바뀜
+        self.assertFalse(d.should_write(tick_row("AAA", self.FakeBooks(101.1), 30_000)))
+        self.assertTrue(d.should_write(tick_row("AAA", self.FakeBooks(101.1), 61_500)))      # 하트비트
+        self.assertTrue(d.should_write(tick_row("BBB", self.FakeBooks(101.1), 61_500)))      # 코인별
+
+    def test_run_ws_writes_changed_rows_only(self):
+        feed = self.FakeFeed({"AAA": self.FakeBooks(101.0), "BBB": self.FakeBooks(102.0)})
+        t = [0]
+
+        def now_ms():
+            t[0] += 500
+            return t[0]
+
+        written = run_ws(self.settings, ["AAA", "BBB", "CCC"], 0.0, threading.Event(), feed=feed, now_ms=now_ms,
+                         max_rounds=3)
+        self.assertEqual(written, 2)                                   # 첫 바퀴만 2줄, 그 뒤는 안 바뀜. CCC 는 호가 없음
+        feed.books_by_coin["AAA"] = self.FakeBooks(101.2)
+        written = run_ws(self.settings, ["AAA", "BBB"], 0.0, threading.Event(), feed=feed, now_ms=now_ms, max_rounds=1)
+        self.assertEqual(written, 2)                                   # 새 루프라 기억이 없어 둘 다 적는다
+        with make_session_factory(TMP)() as s:
+            self.assertEqual(s.scalar(select(func.count()).select_from(TickPremium)), 4)
+            from kimp.db import Position
+            self.assertEqual(s.scalar(select(func.count()).select_from(Position)), 0)
 
 
 class PickCoinsTest(unittest.TestCase):

@@ -186,6 +186,17 @@ SELECT coin, COUNT(*),
 FROM premium_snapshots GROUP BY coin;
 ```
 
+### 1-3b. `tick_premiums` — 초 단위 김프 시계열 (수집기 `--ws`, 2026-10-30, docs/filter.md)
+`python -m kimp.collect --ws --top 40` 이 `data/market.db` 에 쌓는다. 웹소켓 맨 앞 호가로 0.5초마다 계산한 코인 몫 김프를
+**값이 바뀐 코인만** 적고, 60초 넘게 안 바뀌어도 한 줄은 적는다(하트비트). 신호 신뢰도 필터의 상수를 넓은 표본으로 정하는 자료.
+
+| 컬럼 | 뜻 |
+|---|---|
+| `coin` · `ts_ms` | 코인 · 기록 시각 (UTC ms) |
+| `entry_premium_top` · `exit_premium_top` · `mid_premium` | 맨 앞 호가 진입/청산 김프 · 가운데 김프 (premium_snapshots 와 같은 정의) |
+| `upbit_bid/ask` · `bybit_bid/ask` · `usdt_bid/ask` | 그 순간 맨 앞 호가 |
+| `skew_ms` | 업비트·바이비트 호가를 받은 시각 차 |
+
 ### 1-4. `funding_events` — 펀딩비 정산
 
 | 컬럼 | 뜻 |

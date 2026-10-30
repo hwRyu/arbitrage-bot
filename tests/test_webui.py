@@ -138,6 +138,51 @@ class SnapshotBackedTest(unittest.TestCase):
         self.assertEqual(out["series"], [])
 
 
+class TickApiTest(unittest.TestCase):
+    """초 단위 김프 시계열 (tick_premiums): 현황과 코인별 최근 N분 시계열"""
+
+    def setUp(self):
+        import tempfile
+        from dataclasses import replace
+        from kimp.db import TickPremium, make_session_factory
+        # 윈도우는 열린 연결이 남으면 파일을 못 지워 다음 실행에 기록이 겹친다 → 매번 새 임시 폴더
+        self._dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.TMP = os.path.join(self._dir.name, "ticks.db")
+        self.settings = replace(Settings(coins=["CAP"]), snapshot_db_path=self.TMP, db_path=":memory:",
+                                live_db_path="data/_none_live.db", dry_run_db_path="data/_none_dry.db")
+        with make_session_factory(self.TMP)() as s:
+            for i, (e, x) in enumerate([(-0.10, -0.40), (-0.55, -0.85), (-0.12, -0.42)]):
+                s.add(TickPremium(coin="CAP", ts_ms=1_000_000 + i * 500, entry_premium_top=e, exit_premium_top=x,
+                                  mid_premium=(e + x) / 2, upbit_bid=1, upbit_ask=1, bybit_bid=1, bybit_ask=1,
+                                  usdt_bid=1, usdt_ask=1, skew_ms=5))
+            s.add(TickPremium(coin="SEI", ts_ms=1_000_000, entry_premium_top=0.1, exit_premium_top=-0.1, mid_premium=0,
+                              upbit_bid=1, upbit_ask=1, bybit_bid=1, bybit_ask=1, usdt_bid=1, usdt_ask=1))
+            s.commit()
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_summary_and_history(self):
+        from kimp.webui import tick_history, tick_summary
+        summary = tick_summary(self.settings)
+        self.assertEqual(summary["rows"], 4)
+        self.assertEqual([c["coin"] for c in summary["coins"]], ["CAP", "SEI"])
+        self.assertEqual(summary["coins"][0]["count"], 3)
+        self.assertEqual(summary["to_ms"], 1_001_000)
+        h = tick_history(self.settings, "cap", minutes=1, now_ms=1_001_000)
+        self.assertEqual(h["count"], 3)
+        self.assertEqual([p["entry"] for p in h["series"]], [-0.10, -0.55, -0.12])
+        self.assertEqual(tick_history(self.settings, "CAP", minutes=1, now_ms=5_000_000)["series"], [])
+
+    def test_collect_ws_flag(self):
+        from kimp.webui import build_command
+        cmd, _env = build_command("collect", {"top": "40", "interval": "0.5", "ws": "1"})
+        self.assertIn("--ws", cmd)
+        self.assertEqual(cmd[cmd.index("--top") + 1], "40")
+        cmd, _env = build_command("collect", {"coins": "CAP", "ws": ""})
+        self.assertNotIn("--ws", cmd)
+
+
 class MissingFilesTest(unittest.TestCase):
     """파일이 없을 때도 터지지 않고 빈 값을 준다"""
 

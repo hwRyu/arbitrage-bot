@@ -7,6 +7,7 @@
     python -m kimp.collect --all             # 양쪽 거래소에 다 있는 코인 전부 (약 240개)
     python -m kimp.collect --once            # 한 번만 기록하고 종료 (확인용)
     python -m kimp.collect --hours 24        # 24시간 돌고 종료
+    python -m kimp.collect --ws --top 40     # 웹소켓으로 0.5초마다 맨 앞 호가 김프 (tick_premiums, docs/filter.md)
 
 **봇(main.py)과 역할이 다르다**
     main.py          전략을 돌린다 (진입·청산·손익). 페이퍼/드라이런/실거래
@@ -22,6 +23,10 @@
 
 쌓는 곳: `SNAPSHOT_DB_PATH` (기본 `data/market.db`) 의 `premium_snapshots` 테이블.
 코인마다 `--interval` 초에 한 줄. 자세한 컬럼 설명은 docs/data.md.
+
+**--ws 모드 (2026-10-30, docs/filter.md 1단계)**: REST 대신 웹소켓 호가(kimp/ws_feed.WsFeed)로 코인 수십 개를
+0.5초마다 보고, 맨 앞 호가 김프가 **바뀐 코인만** `tick_premiums` 에 적는다 (60초 넘게 안 바뀌면 하트비트 한 줄).
+신호 신뢰도 필터의 상수를 '우리 코인' 이 아니라 넓은 표본으로 정하려는 자료라 기본은 거래대금 상위 40개를 권한다.
 """
 from __future__ import annotations
 
@@ -33,13 +38,18 @@ import time
 from typing import Dict, List, Optional, Sequence
 
 from kimp.config import Settings, load_settings
-from kimp.db import PremiumSnapshot, make_session_factory
+from kimp.db import PremiumSnapshot, TickPremium, make_session_factory
 from kimp.market_data import MarketData, TopQuote, fetch_tops
+from kimp.premium import premium_percent
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_SEC = 60.0
 STATUS_EVERY = 10  # 몇 번 기록할 때마다 현황 한 줄을 찍을지
+TICK_INTERVAL_SEC = 0.5        # --ws 모드 기본 주기
+TICK_HEARTBEAT_SEC = 60.0      # 값이 안 바뀌어도 이 시간마다 한 줄 (조용함 ≠ 끊김)
+TICK_STATUS_SEC = 60.0         # --ws 모드 현황 로그 간격
+TICK_QUANT_PCT = 0.005         # 이 %p 단위로 같으면 '안 바뀜' 으로 본다 (바이비트 호가 1틱 흔들림까지 다 적지 않게)
 
 
 def snapshot_rows(tops: Dict[str, TopQuote]) -> List[PremiumSnapshot]:
@@ -145,6 +155,105 @@ def run(settings: Settings, coins: Sequence[str], interval_sec: float, stop: thr
     return written
 
 
+def tick_row(coin: str, fb, ts_ms: int) -> TickPremium:
+    """웹소켓 호가 세 장 → 초 단위 김프 기록 한 줄 (맨 앞 호가만 쓴다)"""
+    up, by, us = fb.upbit, fb.bybit, fb.usdt
+    return TickPremium(
+        coin=coin, ts_ms=ts_ms,
+        entry_premium_top=premium_percent(up.best_ask, by.best_bid, us.best_bid),
+        exit_premium_top=premium_percent(up.best_bid, by.best_ask, us.best_ask),
+        mid_premium=premium_percent((up.best_bid + up.best_ask) / 2, (by.best_bid + by.best_ask) / 2,
+                                    (us.best_bid + us.best_ask) / 2),
+        upbit_bid=up.best_bid, upbit_ask=up.best_ask, bybit_bid=by.best_bid, bybit_ask=by.best_ask,
+        usdt_bid=us.best_bid, usdt_ask=us.best_ask, skew_ms=getattr(fb, "skew_ms", None),
+    )
+
+
+class TickDedup:
+    """코인마다 마지막으로 적은 (진입·청산 김프, 시각) 을 기억해 바뀐 것만 적게 한다 (하트비트 포함)"""
+
+    def __init__(self, heartbeat_sec: float = TICK_HEARTBEAT_SEC):
+        self.heartbeat_ms = heartbeat_sec * 1000
+        self._last: Dict[str, tuple] = {}
+
+    def should_write(self, row: TickPremium) -> bool:
+        # 0.005%p 단위로 양자화: 필터가 보는 변화(평소 변화폭 MAD 의 몇 배, 0.02%p 이상)보다 훨씬 작은 흔들림은
+        # 기록하지 않는다. 40코인 3일에 수 GB 가 되는 것을 막는다 (docs/filter.md 1단계)
+        key = (round(row.entry_premium_top / TICK_QUANT_PCT), round(row.exit_premium_top / TICK_QUANT_PCT))
+        prev = self._last.get(row.coin)
+        if prev is not None and prev[0] == key and row.ts_ms - prev[1] < self.heartbeat_ms:
+            return False
+        self._last[row.coin] = (key, row.ts_ms)
+        return True
+
+
+def run_ws(settings: Settings, coins: Sequence[str], interval_sec: float, stop: threading.Event,
+           max_hours: float = 0.0, feed=None, now_ms=None, max_rounds: int = 0) -> int:
+    """
+    --ws 모드 기록 루프: 웹소켓 호가를 interval_sec 마다 훑어 김프가 바뀐 코인만 tick_premiums 에 적는다
+
+    Args:
+        feed: 테스트용 가짜 WsFeed (books(coin) 만 있으면 된다). None 이면 진짜 WsFeed 를 띄운다
+        now_ms: 테스트용 시각 함수. None 이면 time.time
+        max_rounds: 0 이면 무제한 (테스트용)
+    Returns:
+        적은 줄 수
+    """
+    from kimp.ws_feed import WsFeed
+    own_feed = feed is None
+    if own_feed:
+        feed = WsFeed(coins, max_age_ms=settings.quote_ws_max_age_ms)
+        feed.start()
+        if not feed.wait_ready(timeout=15.0):
+            logger.warning("웹소켓 호가가 15초 안에 다 들어오지 않았습니다 (들어온 코인부터 적습니다): %s", feed.status_text())
+    clock = now_ms or (lambda: int(time.time() * 1000))
+    sf = make_session_factory(settings.snapshot_db_path)
+    dedup = TickDedup()
+    started = time.monotonic()
+    written = rounds = 0
+    last_status = time.monotonic()
+    logger.info("수집 시작 (웹소켓): 코인 %d개, %.2g초마다 보고 바뀐 것만 기록 → %s (tick_premiums)",
+                len(coins), interval_sec, settings.snapshot_db_path)
+    logger.info("코인: %s", ", ".join(coins))
+    try:
+        while not stop.is_set():
+            begin = time.monotonic()
+            try:
+                ts = clock()
+                rows = []
+                for coin in coins:
+                    fb = feed.books(coin)
+                    if fb is None:
+                        continue
+                    row = tick_row(coin, fb, ts)
+                    if dedup.should_write(row):
+                        rows.append(row)
+                if rows:
+                    with sf() as session:
+                        session.add_all(rows)
+                        session.commit()
+                    written += len(rows)
+                rounds += 1
+                if time.monotonic() - last_status >= TICK_STATUS_SEC:
+                    last_status = time.monotonic()
+                    fresh = len(feed.fresh_coins()) if hasattr(feed, "fresh_coins") else len(coins)
+                    logger.info("기록 %d회 · 총 %d줄 | 신선한 코인 %d/%d%s", rounds, written, fresh, len(coins),
+                                f" | {feed.status_text()}" if hasattr(feed, "status_text") else "")
+            except Exception:
+                logger.exception("기록 실패 (다음 차례에 다시 시도)")
+            if max_rounds and rounds >= max_rounds:
+                break
+            if max_hours and (time.monotonic() - started) >= max_hours * 3600:
+                logger.info("정해진 %g시간이 지나 종료합니다", max_hours)
+                break
+            stop.wait(max(0.0, interval_sec - (time.monotonic() - begin)))
+    finally:
+        if own_feed:
+            feed.stop()
+    logger.info("수집 종료 (웹소켓): %d회 · %d줄 (%s)", rounds, written, settings.snapshot_db_path)
+    return written
+
+
 def _fx_or_none(previous: Optional[float]) -> Optional[float]:
     """달러 환율 (표시용). 실패하면 이전 값을 그대로 쓴다 — 김프 계산에는 쓰지 않는다"""
     try:
@@ -167,8 +276,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--coins", default=None, help="코인 지정. 예: CAP,SEI (안 적으면 .env 의 COINS)")
     parser.add_argument("--all", action="store_true", help="양쪽 거래소에 다 있는 코인 전부 (약 240개)")
     parser.add_argument("--top", type=int, default=0, help="업비트 거래대금 상위 N개")
-    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SEC,
-                        help=f"기록 주기 (초, 기본 {DEFAULT_INTERVAL_SEC:g})")
+    parser.add_argument("--interval", type=float, default=None,
+                        help=f"기록 주기 (초, 기본 {DEFAULT_INTERVAL_SEC:g}, --ws 면 {TICK_INTERVAL_SEC:g})")
+    parser.add_argument("--ws", action="store_true",
+                        help="웹소켓 호가로 초 단위 김프 시계열(tick_premiums) 기록 (docs/filter.md). 바뀐 값만 적는다")
     parser.add_argument("--once", action="store_true", help="한 번만 기록하고 종료 (확인용)")
     parser.add_argument("--hours", type=float, default=0.0, help="이 시간만 돌고 종료 (기본 무제한)")
     args = parser.parse_args(argv)
@@ -195,7 +306,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         signal.signal(signal.SIGTERM, on_signal)
     except (AttributeError, ValueError):  # 윈도우에서 없을 수 있다
         pass
-    run(settings, coins, args.interval, stop, once=args.once, max_hours=args.hours, md=md)
+    if args.ws:
+        run_ws(settings, coins, args.interval or TICK_INTERVAL_SEC, stop, max_hours=args.hours)
+    else:
+        run(settings, coins, args.interval or DEFAULT_INTERVAL_SEC, stop, once=args.once, max_hours=args.hours, md=md)
     print(f"{LF}쌓인 기록 보기: python -m kimp.webui (데이터 탭) 또는 python -m kimp.report")
     return 0
 

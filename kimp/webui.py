@@ -13,6 +13,7 @@
                 없으면 과거 1분봉(data/history.db)으로 계산해서 그린다
     지금 김프   거래소 호가창을 그 자리에서 조회한 진입/청산 김프 (새로고침마다)
     추천 코인   python -m kimp.screen 이 남긴 data/screen_latest.json
+    데이터      시세 수집 실행·기록 현황, 초 단위 김프 시계열(수집기 --ws, tick_premiums) 차트
     시뮬레이션  python -m kimp.simulate 가 history DB 에 저장한 실행 기록과 거래 내역
     대시보드    기간을 정해서 본 성과 (누적 손익·일별·코인별·거래 이력). 집계는 kimp/dashboard.py
     관리선      목표 순이익에 맞는 진입·청산 김프 (비용 역산 + 기회 많은 자리). 계산은 kimp/levels.py
@@ -35,7 +36,7 @@ from sqlalchemy import func, select
 from kimp.config import Settings, load_settings
 from kimp.dashboard import dashboard
 from kimp.levels import plan as level_plan
-from kimp.db import PaperBalance, Position, PositionStatus, PremiumSnapshot, make_session_factory
+from kimp.db import PaperBalance, Position, PositionStatus, PremiumSnapshot, TickPremium, make_session_factory
 from kimp.history import BYBIT, UPBIT, UPBIT_USDT, HistoryStore, SimRun, SimTrade, make_history_session_factory
 from kimp.spread import (MODE_AUTO, MODE_LABELS, MODES, forced_coins, resolve_spreads,
                          snapshot_spreads_multi)
@@ -145,6 +146,65 @@ def recorded_coins(settings: Settings) -> List[Dict[str, Any]]:
                     select(PremiumSnapshot.coin, func.count()).group_by(PremiumSnapshot.coin)).all():
                 total[coin] = total.get(coin, 0) + n
     return [{"coin": c, "count": n} for c, n in sorted(total.items(), key=lambda kv: -kv[1])]
+
+
+def _unique_paths(paths) -> List[str]:
+    """같은 파일이 두 번 들어오면(모드 DB 와 수집 DB 가 같은 경로) 한 번만 (기록이 두 배로 세지지 않게)"""
+    seen, out = set(), []
+    for p in paths:
+        key = os.path.normcase(os.path.abspath(p)) if p != ":memory:" else p
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def tick_summary(settings: Settings) -> Dict[str, Any]:
+    """초 단위 김프 시계열(tick_premiums) 현황: 코인별 건수·기간, 전체 건수, DB 크기 (데이터 탭)"""
+    coins: Dict[str, Dict[str, Any]] = {}
+    total = 0
+    size_mb = 0.0
+    for path in _unique_paths(settings.snapshot_db_paths()):
+        if not os.path.exists(path):
+            continue
+        with make_session_factory(path)() as session:
+            rows = session.execute(
+                select(TickPremium.coin, func.count(), func.min(TickPremium.ts_ms), func.max(TickPremium.ts_ms))
+                .group_by(TickPremium.coin)).all()
+        if rows:
+            size_mb += os.path.getsize(path) / 1e6
+        for coin, n, lo, hi in rows:
+            c = coins.setdefault(coin, {"coin": coin, "count": 0, "from_ms": lo, "to_ms": hi})
+            c["count"] += n
+            c["from_ms"], c["to_ms"] = min(c["from_ms"], lo), max(c["to_ms"], hi)
+            total += n
+    out = sorted(coins.values(), key=lambda c: -c["count"])
+    return {"rows": total, "coins": out, "size_mb": round(size_mb, 1),
+            "to_ms": max((c["to_ms"] for c in out), default=None)}
+
+
+def tick_history(settings: Settings, coin: str, minutes: float = 30.0, now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """
+    코인 하나의 초 단위 김프 시계열 (데이터 탭 차트). 값이 바뀐 점만 있으므로 선으로 이으면 계단이 된다
+
+    series: [{ts, entry, exit, mid, skew}] 시각순. 기록이 없으면 빈 목록
+    """
+    import time as _time
+
+    now_ms = now_ms if now_ms is not None else int(_time.time() * 1000)
+    start_ms = now_ms - int(minutes * 60_000)
+    points: List[Dict[str, Any]] = []
+    for path in _unique_paths(settings.snapshot_db_paths()):
+        if not os.path.exists(path):
+            continue
+        with make_session_factory(path)() as session:
+            for r in session.execute(
+                    select(TickPremium).where(TickPremium.coin == coin.upper(), TickPremium.ts_ms >= start_ms,
+                                              TickPremium.ts_ms <= now_ms).order_by(TickPremium.ts_ms)).scalars():
+                points.append({"ts": r.ts_ms, "entry": r.entry_premium_top, "exit": r.exit_premium_top,
+                               "mid": r.mid_premium, "skew": r.skew_ms})
+    points.sort(key=lambda p: p["ts"])
+    return {"coin": coin.upper(), "minutes": minutes, "series": points, "count": len(points)}
 
 
 def premium_history(settings: Settings, coin: str, hours: float = 24.0, now_ms: Optional[int] = None,
@@ -583,10 +643,13 @@ def build_command(kind: str, params: Dict[str, str]) -> Tuple[List[str], Dict[st
         cmd = [sys.executable, "-m", "kimp.history", "prune"]
         allowed, env_map = {"days": "--days", "source": "--source", "coins": "--coins"}, {}
     elif kind == "collect":
-        # 시세 수집기: 주문·포지션 없이 김프·호가만 적는다 (봇과 별개)
+        # 시세 수집기: 주문·포지션 없이 김프·호가만 적는다 (봇과 별개). all / ws 는 값 없는 스위치
         cmd = [sys.executable, "-m", "kimp.collect"]
         allowed, env_map = {"coins": "--coins", "top": "--top", "interval": "--interval",
                             "hours": "--hours"}, {}
+        for key, flag in (("all", "--all"), ("ws", "--ws")):
+            if (params.get(key) or "").strip() in ("1", "true", "on"):
+                cmd.append(flag)
     elif kind == "bot":
         # 페이퍼 모드로만 켠다 (화면에서 실거래를 켤 수 있으면 사고가 난다)
         cmd = [sys.executable, "main.py"]
@@ -784,6 +847,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(sim_runs(self.settings))
             elif url.path == "/api/candles":
                 self._json(candle_summary(self.settings))
+            elif url.path == "/api/ticks":
+                # 초 단위 김프 시계열: coin 이 있으면 그 코인의 최근 minutes 분, 없으면 현황
+                coin = (query.get("coin") or [""])[0].strip()
+                if coin:
+                    self._json(tick_history(self.settings, coin, float((query.get("minutes") or ["30"])[0])))
+                else:
+                    self._json(tick_summary(self.settings))
             elif url.path == "/api/bot":
                 self._json(bot_state(self.settings))
             elif url.path == "/api/jobs":

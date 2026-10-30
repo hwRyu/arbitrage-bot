@@ -26,7 +26,7 @@ import os
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, create_engine, inspect, text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -230,6 +230,33 @@ class PremiumSnapshot(Base):
     upbit_mid_krw: Mapped[float] = mapped_column(Float)
     bybit_mid_usdt: Mapped[float] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class TickPremium(Base):
+    """
+    초 단위 김프 시계열 한 점 (수집기 --ws 모드, docs/filter.md 1단계)
+
+    웹소켓 맨 앞 호가로 0.5초마다 계산한 코인 몫 김프. **값이 바뀔 때만** 적고(같은 호가가 이어지면 생략),
+    60초 넘게 안 바뀌어도 한 줄은 적어 '조용함' 과 '끊김' 을 구분한다. 신호 신뢰도 필터(docs/filter.md)의
+    상수를 코인 수십 개로 정하고 검증하는 자료다. 1분 스냅샷(premium_snapshots)과 달리 펀딩비·환율은 없다.
+    """
+
+    __tablename__ = "tick_premiums"
+    __table_args__ = (Index("ix_tick_premiums_coin_ts", "coin", "ts_ms"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    coin: Mapped[str] = mapped_column(String(20))
+    ts_ms: Mapped[int] = mapped_column(Integer)  # 기록 시각 (UTC ms)
+    entry_premium_top: Mapped[float] = mapped_column(Float)  # 맨 앞 호가 진입 김프 (코인 살 값 / 숏 칠 값 / USDT 팔 값)
+    exit_premium_top: Mapped[float] = mapped_column(Float)  # 맨 앞 호가 청산 김프
+    mid_premium: Mapped[float] = mapped_column(Float)  # 가운데 가격 김프
+    upbit_bid: Mapped[float] = mapped_column(Float)
+    upbit_ask: Mapped[float] = mapped_column(Float)
+    bybit_bid: Mapped[float] = mapped_column(Float)
+    bybit_ask: Mapped[float] = mapped_column(Float)
+    usdt_bid: Mapped[float] = mapped_column(Float)
+    usdt_ask: Mapped[float] = mapped_column(Float)
+    skew_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 업비트·바이비트 호가 받은 시각 차
 
 
 class Run(Base):
