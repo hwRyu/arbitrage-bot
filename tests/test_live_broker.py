@@ -21,6 +21,13 @@ from kimp.safety import Safety
 FEES = FeeSettings(upbit_trade_fee_rate=0.0005, bybit_taker_fee_rate=0.00055, transfer_fee_usdt_per_cycle=0.0,
                    slippage_buffer_percent=0.05)
 DEEP = 1e12
+# 가짜 업비트의 시작 원화 = 원화 버퍼 (2026-10-30 부터 코인 FOK 를 버퍼 원화로 먼저 낸다). 50개 숏 ≈ 100 USDT ≈ 14만 원 포지션 2개분
+KRW0 = 300_000.0
+
+
+def value_short(pos):
+    """금액 헷징 숏 목표 개수 = 코인 금액(원) ÷ USDT 판 가격 ÷ 숏 가격 (= 코인 개수 × (1 + 진입 김프))"""
+    return pos.upbit_qty * pos.entry_upbit_price_krw / pos.entry_usdt_price_krw / pos.entry_bybit_price_usdt
 
 
 class Prices:
@@ -115,7 +122,7 @@ class FakeUpbit(FakeExchange):
 
     def __init__(self, prices):
         super().__init__(prices)
-        self.bal = {"USDT": 500.0, "KRW": 0.0, "XRP": 0.0}
+        self.bal = {"USDT": 500.0, "KRW": KRW0, "XRP": 0.0}
 
     def _book(self, symbol):
         return (self.p.usdt_bid, self.p.usdt_ask) if symbol == "USDT/KRW" else (self.p.coin_bid, self.p.coin_ask)
@@ -313,6 +320,11 @@ def make_live(fail_safety=3):
     return prices, up, by, broker, sf
 
 
+def start_equity(prices):
+    """가짜 거래소 시작 자본 (USDT): 업비트 500 + 원화 버퍼 + 바이비트 600"""
+    return 500 + KRW0 / ((prices.usdt_bid + prices.usdt_ask) / 2) + 600
+
+
 def equity(up, by, prices):
     """양쪽 총 자본 (USDT): 업비트 USDT + 원화/USDT + 코인 평가 + 바이비트 free + 증거금 + 숏 평가"""
     usdt_mid = (prices.usdt_bid + prices.usdt_ask) / 2
@@ -344,12 +356,13 @@ class LiveRoundTripTest(unittest.TestCase):
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)  # 50개 숏 ≈ 100 USDT 계획
             self.assertEqual(pos.status, PositionStatus.OPEN)
-            self.assertAlmostEqual(by.short, pos.upbit_qty)   # 숏 = 실제로 산 코인 개수 (수수료·호가만큼 50개보다 조금 적다)
+            self.assertEqual(up.calls[0], "buy XRP/KRW limit")   # 코인 FOK 가 첫 주문 (버퍼 원화로)
+            self.assertAlmostEqual(by.short, value_short(pos), places=6)   # 금액 헷징: 코인 금액 ÷ 바이비트 가격
             self.assertAlmostEqual(by.short, 49.9, delta=0.2)
-            self.assertAlmostEqual(pos.usdt_sold, 100.0)  # 계획한 숏 금액만큼 USDT 매도
+            self.assertAlmostEqual(pos.usdt_sold, 100.0, delta=0.05)  # 코인에 쓴 원화만큼 USDT 를 되팔았다
             self.assertAlmostEqual(up.bal["XRP"], pos.upbit_qty)
-            self.assertAlmostEqual(up.bal["KRW"], 0.0, delta=1.0)  # 원화는 1원 미만 내림 자투리만
-            start = 500 + 600
+            self.assertAlmostEqual(up.bal["KRW"], KRW0, delta=1.0)  # 버퍼는 쓴 만큼 되채워져 그대로
+            start = start_equity(prices)
             # 김프가 올라서 청산
             prices.coin_bid, prices.coin_ask = 2850.0, 2851.0
             val = broker.value_exit(pos, prices.quote())
@@ -370,7 +383,7 @@ class LiveRoundTripTest(unittest.TestCase):
 
 class UnwindTest(unittest.TestCase):
     def test_coin_buy_fails_then_unwind(self):
-        """코인 매수 실패 → 받은 원화로 USDT 되사기 + 숏 닫기 → ABORTED, 잔고 거의 원상태"""
+        """코인 매수(첫 주문) 실패 → 되돌릴 게 없음 → ABORTED, 잔고 그대로"""
         prices, up, by, broker, sf = make_live()
         up.fail.add("buy XRP/KRW limit")
         with sf() as s:
@@ -379,8 +392,9 @@ class UnwindTest(unittest.TestCase):
             pos = s.query(Position).one()
             self.assertEqual(pos.status, PositionStatus.ABORTED)
             self.assertEqual(by.short, 0.0)
-            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.5)  # 수수료·호가 간격만큼 줄어듦
-            self.assertLess(pos.net_pnl_usdt, 0)
+            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.5)   # 첫 주문이 실패라 아무것도 안 움직임
+            self.assertAlmostEqual(up.bal["KRW"], KRW0, delta=0.5)
+            self.assertEqual(pos.net_pnl_usdt, 0.0)
             self.assertTrue(broker.entries_allowed(s)[0])  # 한 번 실패는 계속 진행
 
     def test_unwind_fails_marks_error_and_blocks(self):
@@ -397,8 +411,8 @@ class UnwindTest(unittest.TestCase):
             self.assertIn("ERROR", why)
 
     def test_bybit_reject_unwinds_coin_and_usdt(self):
-        """숏 거절 (맨 마지막 단계) → 산 코인을 되팔고 원화로 USDT 되사기 (수수료 4번 + 호가 간격만 손해)
-        (2026-10-26 순서 변경: USDT → 코인 → 숏. 그 전에는 숏이 먼저라 USDT 만 되돌렸다)"""
+        """숏 거절 (USDT 되채우기와 동시) → 산 코인을 되팔고, 되채운 원화로 USDT 되사기 (수수료 4번 + 호가 간격만 손해)
+        (2026-10-30 순서: 코인 FOK → USDT 매도 ‖ 숏)"""
         prices, up, by, broker, sf = make_live()
         by.fail.add("open_short")
         with sf() as s:
@@ -441,7 +455,7 @@ class ResumeTest(unittest.TestCase):
             self.assertEqual(by.short, 0.0)
 
     def test_crash_during_entry_is_unwound_on_restart(self):
-        """숏만 들어간 상태로 꺼짐(OPENING) → 다시 켜면 숏을 닫고 ABORTED"""
+        """코인·숏은 됐는데 USDT 되채우기 중에 꺼짐(OPENING) → 다시 켜면 헷지는 완성이니 되채우기만 하고 OPEN"""
         prices, up, by, broker, sf = make_live()
 
         class Boom(Exception):
@@ -456,8 +470,38 @@ class ResumeTest(unittest.TestCase):
         broker.ex.sell_usdt = orig
         with sf() as s:
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
-            self.assertEqual(s.query(Position).one().status, PositionStatus.ABORTED)
+            pos = s.query(Position).one()
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertGreater(by.short, 0.0)
+            self.assertAlmostEqual(pos.usdt_sold, 100.0, delta=0.05)          # 되채우기가 끝나 있다
+            self.assertAlmostEqual(up.bal["KRW"], KRW0, delta=1.0)
+            self.assertEqual(up.calls.count("sell USDT/KRW"), 1)              # 중복 없음
+
+    def test_crash_before_short_is_unwound_on_restart(self):
+        """코인만 산 상태로 꺼짐(OPENING) → 다시 켜면 코인을 되팔고 ABORTED (버퍼 원화로 돌아옴)"""
+        prices, up, by, broker, sf = make_live()
+
+        class Boom(Exception):
+            pass
+
+        orig = broker.ex.open_short
+        broker.ex.open_short = lambda *a, **k: (_ for _ in ()).throw(Boom())
+        orig_sell = broker.ex.sell_usdt
+        broker.ex.sell_usdt = lambda *a, **k: (_ for _ in ()).throw(Boom())
+        with sf() as s:
+            with self.assertRaises(Boom):
+                broker.open_hedge(s, prices.quote(), 50.0)
+            self.assertEqual(s.query(Position).one().status, PositionStatus.OPENING)
+        broker.ex.open_short, broker.ex.sell_usdt = orig, orig_sell
+        with sf() as s:
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            pos = s.query(Position).one()
+            self.assertEqual(pos.status, PositionStatus.ABORTED)
             self.assertEqual(by.short, 0.0)
+            self.assertAlmostEqual(up.bal["XRP"], 0.0, places=6)
+            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.01)        # USDT 는 안 건드림
+            self.assertAlmostEqual(up.bal["KRW"], KRW0, delta=KRW0 * 0.005)  # 코인 왕복 수수료·호가만큼만 줄어듦
+            self.assertLess(pos.net_pnl_usdt, 0)                              # 그 손해가 USDT 로 기록된다
 
     def test_reconcile_mismatch_blocks_entries(self):
         """숏이 '일부' 만 어긋나면 (누가 손으로 30개 줄임) 자동으로 고치지 않고 신규 진입만 막는다.
@@ -489,19 +533,20 @@ class LegRiskTest(unittest.TestCase):
     """레그 리스크: 부분 체결, 응답 끊김, 느린 주문"""
 
     def test_partial_coin_buy_shorts_only_what_was_bought(self):
-        """코인이 80%만 사짐 → 숏은 산 개수만큼만 친다 (크기 맞추기 주문 없음), 남은 원화는 USDT 로"""
+        """코인이 80%만 사짐 → 숏은 산 금액만큼만 친다 (크기 맞추기 주문 없음), USDT 도 쓴 만큼만 판다"""
         prices, up, by, broker, sf = make_live()
         up.partial["buy XRP/KRW limit"] = 0.8   # FOK 라 실제론 없지만, 거래소가 일부만 돌려줘도 산 만큼만 헷지하는지 (방어)
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)
-            self.assertAlmostEqual(by.short, pos.upbit_qty)   # 1:1 헷지
+            self.assertAlmostEqual(by.short, value_short(pos), places=6)   # 금액 헷징
             self.assertAlmostEqual(pos.bybit_qty, by.short)   # DB = 실제
             self.assertLess(by.short, 50.0 * 0.85)
             self.assertEqual(by.calls.count("close_short"), 0)   # 맞추기 없음
-            self.assertEqual(up.calls.count("buy USDT/KRW"), 1)  # 못 쓴 원화 20% 는 USDT 로
+            self.assertEqual(up.calls.count("buy USDT/KRW"), 0)  # 안 쓴 원화는 버퍼에 그대로 → 되살 게 없다
+            self.assertAlmostEqual(pos.usdt_sold, 80.0, delta=0.1)
             self.assertAlmostEqual(pos.entry_bybit_fee_usdt, by.short * prices.perp_bid * 0.00055, places=6)
             # 청산까지 하면 잔고 변화 = DB 손익
-            start = 500 + 600
+            start = start_equity(prices)
             val = broker.value_exit(pos, prices.quote())
             pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
             self.assertAlmostEqual(equity(up, by, prices) - start, pnl.net_usdt, delta=0.01)
@@ -513,7 +558,7 @@ class LegRiskTest(unittest.TestCase):
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             self.assertEqual(up.calls.count("sell XRP/KRW"), 0)   # 코인 되팔기(trim_coin) 없음
-            self.assertAlmostEqual(by.short, pos.upbit_qty * 0.995, places=6)
+            self.assertAlmostEqual(by.short, value_short(pos) * 0.995, places=6)
 
     def test_partial_close_short_retries_remaining(self):
         """숏 닫기가 60%만 → 남은 40%만 다시 주문 → 숏 0, 손익은 두 체결 합"""
@@ -521,7 +566,7 @@ class LegRiskTest(unittest.TestCase):
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             by.partial["close_short"] = 0.6
-            start = 500 + 600
+            start = start_equity(prices)
             val = broker.value_exit(pos, prices.quote())
             pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
             self.assertEqual(pos.status, PositionStatus.CLOSED)
@@ -549,16 +594,25 @@ class LegRiskTest(unittest.TestCase):
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             self.assertEqual(pos.status, PositionStatus.OPEN)
             self.assertEqual(by.calls.count("open_short"), 1)
-            self.assertAlmostEqual(by.short, pos.upbit_qty)
+            self.assertAlmostEqual(by.short, value_short(pos), places=6)
 
     def test_rejected_and_not_found_is_failure(self):
+        """USDT 되채우기만 거절 → 헷지(코인·숏)는 완성이라 되돌리지 않는다 → OPENING + 신규 진입 막힘 → 다음 스캔에 되채우고 OPEN"""
         prices, up, by, broker, sf = make_live()
-        up.fail.add("sell USDT/KRW")  # 거절 + 조회해도 없음 → 실패 → 숏 되돌림
+        up.fail.add("sell USDT/KRW")
         with sf() as s:
             with self.assertRaises(EntryRejected):
                 broker.open_hedge(s, prices.quote(), 50.0)
-            self.assertEqual(s.query(Position).one().status, PositionStatus.ABORTED)
-            self.assertEqual(by.short, 0.0)
+            pos = s.query(Position).one()
+            self.assertEqual(pos.status, PositionStatus.OPENING)
+            self.assertGreater(by.short, 0.0)                                  # 숏은 그대로
+            self.assertFalse(broker.entries_allowed(s)[0])
+            broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
+            s.refresh(pos)
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertAlmostEqual(pos.usdt_sold, 100.0, delta=0.05)
+            self.assertAlmostEqual(up.bal["KRW"], KRW0, delta=1.0)
+            self.assertTrue(broker.entries_allowed(s)[0])
 
     def test_unknown_result_waits_then_resolves(self):
         """응답 끊김 + 조회도 안 됨 → 추측 안 하고 멈춤 → 조회되면 이어서 진입 완료"""
@@ -575,10 +629,12 @@ class LegRiskTest(unittest.TestCase):
             self.assertEqual(pos.status, PositionStatus.OPENING)
             up.lookup_down = False
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
-            # USDT 매도는 들어가 있었음 → 코인 매수 단계가 없으니 되돌림 (USDT 되사기 + 숏 닫기)
-            self.assertEqual(pos.status, PositionStatus.ABORTED)
-            self.assertEqual(by.short, 0.0)
-            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.5)
+            # USDT 매도는 들어가 있었음 → 세 다리 다 있으니 OPEN (중복으로 팔지 않는다)
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertGreater(by.short, 0.0)
+            self.assertEqual(up.calls.count("sell USDT/KRW"), 1)
+            self.assertAlmostEqual(up.bal["USDT"], 400.0, delta=0.5)
+            self.assertAlmostEqual(up.bal["KRW"], KRW0, delta=1.0)
             self.assertTrue(broker.entries_allowed(s)[0])
 
     def test_slow_order_is_cancelled_and_partial_used(self):
@@ -596,20 +652,22 @@ class LegRiskTest(unittest.TestCase):
         prices = Prices()
         broker = PaperBroker(FEES, 0.3)
         sf = make_session_factory(":memory:")
+        from kimp.executor import UPBIT_KRW
+        usdt_mid = (prices.usdt_bid + prices.usdt_ask) / 2
         with sf() as s:
             broker.ensure_initial_balances(s, 1000, 0.5)
+            broker.ex._add(s, UPBIT_KRW, KRW0)                     # 원화 버퍼 (엔진이 채우는 몫)
+            s.commit()
             broker.ex.partial_next["buy_coin_with_krw"] = 0.8
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             self.assertLess(pos.bybit_qty, 50.0)
             self.assertAlmostEqual(broker.ex.short_qty(s, "XRP"), pos.bybit_qty)
-            # 청산 뒤 페이퍼 장부 변화 = 손익 기록 (남은 원화도 USDT 로 돌아옴)
+            # 청산 뒤 페이퍼 장부 변화 = 손익 기록 (버퍼 원화는 쓴 만큼 되채워져 그대로)
             val = broker.value_exit(pos, prices.quote())
             pnl = broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
-            from kimp.executor import UPBIT_KRW
-            usdt_mid = (prices.usdt_bid + prices.usdt_ask) / 2
             total = (broker.balance(s, UPBIT_USDT) + broker.balance(s, UPBIT_KRW) / usdt_mid
                      + broker.balance(s, BYBIT_USDT))
-            self.assertAlmostEqual(total - 1000, pnl.net_usdt, delta=0.01)
+            self.assertAlmostEqual(total - 1000 - KRW0 / usdt_mid, pnl.net_usdt, delta=0.01)
 
 
 class JumpyPerpUpbit(FakeUpbit):
@@ -622,19 +680,6 @@ class JumpyPerpUpbit(FakeUpbit):
         if symbol != "USDT/KRW" and side == "buy":
             self.p.perp_bid *= self.drop
             self.p.perp_ask *= self.drop
-        return r
-
-
-class JumpyUpbit(FakeUpbit):
-    """USDT 를 판 순간(진입 첫 주문) 업비트 코인 가격이 뛴다 — 주문 세 개를 순서대로 내는 사이의 시간을 흉내"""
-
-    jump = 1.01
-
-    def create_order(self, symbol, type_, side, amount, price=None, params=None):
-        r = super().create_order(symbol, type_, side, amount, price, params)
-        if symbol == "USDT/KRW" and type_ != "limit":
-            self.p.coin_bid *= self.jump
-            self.p.coin_ask *= self.jump
         return r
 
 
@@ -892,7 +937,7 @@ class ParallelLegsTest(unittest.TestCase):
             self.assertEqual(by.short, 0.0)
 
     def test_entry_legs_run_at_the_same_time_and_short_reject_unwinds_usdt(self):
-        """숏 열기 ∥ USDT 매도. 숏이 거절되면 이미 판 USDT 를 되사서 ABORTED (중복 없음)"""
+        """코인 FOK 뒤 숏 열기 ∥ USDT 매도. 숏이 거절되면 코인을 되팔고 이미 판 USDT 를 되사서 ABORTED (중복 없음)"""
         prices, up, by, broker, sf = make_live()
         by.fail.add("open_short")
         with sf() as s:

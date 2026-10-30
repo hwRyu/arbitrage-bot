@@ -144,7 +144,7 @@ python -m kimp.webui             # 화면 '설정' 탭에 파일 크기가 나�
 |---|---|
 | `position_id` | 어느 포지션의 체결인지 |
 | `exchange` | `upbit` / `bybit` |
-| `side` | `sell_usdt`(USDT 매도) · `buy`(코인 매수) · `sell`(코인 매도) · `buy_usdt`(USDT 매수) · `open_short` · `close_short` · `liquidated` · `trim_*`(크기 맞추기) · `unwind_*`(되돌리기) |
+| `side` | `sell_usdt`(USDT 매도) · `buy`(코인 매수) · `sell`(코인 매도) · `buy_usdt`(USDT 매수) · `open_short` · `close_short` · `liquidated` · `trim_*`(크기 맞추기) · `unwind_*`(되돌리기). 2026-10-30 부터 진입은 `buy` 가 먼저고 `sell_usdt`·`open_short` 가 그 뒤 동시에 (원화 버퍼 채우기는 포지션 다리가 아니라 여기 남지 않는다 — 로그 `[원화 버퍼]`) |
 | `qty` · `avg_price` · `cost` | 개수 · 평균가 · 금액 (업비트는 원, 바이비트는 USDT) |
 | `fee` · `fee_currency` | 수수료와 통화 (`KRW` / `USDT`) |
 | `slippage_percent` | 맨 앞 호가보다 얼마나 밀렸나 (%) |

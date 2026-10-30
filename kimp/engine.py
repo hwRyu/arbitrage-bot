@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from kimp.config import Settings
 from kimp.broker import EntryMissed, EntryRejected, ExitDeferred, ExitValuation, HedgeBroker, InsufficientBalance
 from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
-from kimp.executor import BYBIT_USDT, UPBIT_USDT
+from kimp.executor import BYBIT_USDT, UPBIT_KRW, UPBIT_USDT
 from kimp.fok_sizing import EntryFit, fit_entry
 from kimp.fok_trace import classify_miss
 from kimp.market_data import MarketData
@@ -60,6 +60,8 @@ POSITION_WRITE_MIN_GAP_SEC = 1.0
 # 지정가 FOK 가 취소(놓침)된 뒤 같은 코인·포지션을 다시 시도하기까지 (초). 소켓 시세는 0.25초마다 판단하므로
 # 이게 없으면 호가가 비껴 있는 동안 초당 4번 주문·취소가 나가 업비트 요청 제한에 걸린다
 FOK_RETRY_SEC = 2.0
+# 지정가 줄 나이 기록용으로 기억하는 직전 스캔 수 (호가 복사본, 코인당)
+ASK_HIST_SCANS = 10
 
 # 강제청산 가드가 한 번에 넣는 증거금의 최소 (USDT). 이보다 작으면 넣어도 의미가 없다 → 정리로
 MIN_TOPUP_USDT = 0.5
@@ -128,6 +130,8 @@ class Engine:
         self._reentry_allowed_at: Dict[str, float] = {}
         self._tp_retry_at: Dict[int, float] = {}   # 익절 지정가가 놓친 포지션 → 이 시각까지 익절 판단 쉼
         self._miss_times: Dict[str, Deque[float]] = {}   # 코인별 최근 진입 놓침 시각 (연속 놓침 쉬기, N1)
+        # 코인별 최근 스캔의 업비트 매도 호가 (시각, 호가) — '지정가 줄 나이' 기록용 (docs/issues.md N5, 가드 아님)
+        self._ask_hist: Dict[str, Deque[Tuple[float, Sequence]]] = {}
         # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
         self._bybit_range = RangeTracker()
         self._last_status_log = 0.0
@@ -227,8 +231,9 @@ class Engine:
         """시작할 때: 페이퍼 시작 자본 나눠 넣기 + 이전 포지션 안내 + 자본 비율 확인"""
         with self.session_factory() as session:
             self.broker.ensure_initial_balances(session, self.s.paper_initial_total_usdt, self.s.upbit_target_share())
-            logger.info("잔고: 업비트 USDT %s / 바이비트 USDT %s (증거금 제외)",
+            logger.info("잔고: 업비트 USDT %s + 원화 %s원 (버퍼, %g포지션분 유지) / 바이비트 USDT %s (증거금 제외)",
                         f"{self.broker.balance(session, UPBIT_USDT):,.2f}",
+                        f"{self.broker.balance(session, UPBIT_KRW):,.0f}", self.s.upbit_krw_buffer_positions,
                         f"{self.broker.balance(session, BYBIT_USDT):,.2f}")
             positions = self.broker.open_positions(session)
             for pos in positions:
@@ -299,6 +304,7 @@ class Engine:
         now_clock = self._clock()
         for coin, q in quotes.items():
             self._bybit_range.record(coin, now_clock, q.bybit.mid)
+            self._ask_hist.setdefault(coin, deque(maxlen=ASK_HIST_SCANS)).append((now_clock, q.upbit.asks))
 
         with self.session_factory() as session:
             # 송금 도착 확인, 덜 끝난 진입·청산 이어서, 거래소와 대조 (페이퍼도 같은 흐름)
@@ -311,6 +317,8 @@ class Engine:
                 self._last_account_refresh, self._account_dirty = now_mono, False
             self._close_vanished_shorts(session, quotes)
             open_positions = {p.coin: p for p in self.broker.open_positions(session)}
+            if refresh:
+                self._maintain_krw_buffer(session, quotes, open_positions)
 
             closed_any = self._handle_close_requests(session, quotes, open_positions)
             for coin, pos in list(open_positions.items()):
@@ -793,6 +801,26 @@ class Engine:
             return 0.0
         return -pos.funding_usdt / notional * 100
 
+    def _maintain_krw_buffer(self, session: Session, quotes: Dict[str, Quote],
+                             open_positions: Dict[str, Position]) -> None:
+        """
+        업비트 원화 버퍼를 목표(가장 큰 포지션 크기 × UPBIT_KRW_BUFFER_POSITIONS)까지 채운다 (계좌를 새로 받은 스캔마다)
+
+        진입이 쓴 원화는 그 자리에서 USDT 를 되팔아 돌려놓으므로, 여기서 실제로 파는 건 기동 직후와
+        되채우기 실패·호가 1원 차이로 조금씩 줄었을 때뿐이다. 진입·청산 도중(OPENING/CLOSING) 포지션이 있으면
+        건너뛴다 — 그때 원화는 그 포지션이 쓰는 중이라 버퍼로 세면 안 된다.
+        """
+        n = self.s.upbit_krw_buffer_positions
+        if n <= 0 or not quotes or self.broker.unfinished_positions(session):
+            return
+        positions = list(open_positions.values())
+        size = max(self._position_size_usdt(session, c, positions, quotes) for c in self.coins)
+        quote = next(iter(quotes.values()))
+        if not quote.usdt.best_bid or size <= 0:
+            return
+        if self.broker.ensure_krw_buffer(session, quote, n * size * quote.usdt.best_bid, "스캔") is not None:
+            self._account_dirty = True
+
     def _check_rebalance(self, session: Session, positions: List[Position], quotes: Dict[str, Quote],
                          when: str, need: Optional[InsufficientBalance] = None) -> Optional[float]:
         """
@@ -1013,6 +1041,7 @@ class Engine:
                                    size_usdt=size, bybit_qty=bybit_qty, funding_8h=funding, now=self._now_utc())
                 continue
             quote, depth = fresh, again   # 더 새 시세로 주문한다
+            age = self._level_age(coin, fit.limit_price, fit.coin_qty)   # 기록용 (가드 아님)
             planned = self.market.round_qty(coin, size / quote.bybit.best_bid) if quote.bybit.best_bid else bybit_qty
             if fit.bybit_qty < planned * (1 - 1e-9):   # 스캔 단계에서 줄였든 확인 시세에서 더 줄였든 한 번만 남긴다
                 logger.info("[진입 크기 줄임] %s | 숏 %g → %g개 (지정가 안쪽 물량의 %g%%) | %s", coin, planned,
@@ -1039,17 +1068,18 @@ class Engine:
                 # 지정가가 비껴가 못 삼. 판 USDT 는 되샀고 숏은 없었다 → 잠시 뒤 다시 (호가가 돌아오면 그때)
                 why, detail = self._miss_reason(coin, exc.fok)
                 telemetry.decision(session, coin, "entry_miss", top, threshold, premium_depth=depth, size_usdt=size,
-                                   bybit_qty=bybit_qty, funding_8h=funding, note=f"{why} | {exc} | {detail}",
+                                   bybit_qty=bybit_qty, funding_8h=funding, note=f"{why} | {exc} | {detail} | {age}",
                                    now=self._now_utc())
                 streak = self._note_entry_miss(coin)
                 if streak is None:
                     self._reentry_allowed_at[coin] = self._clock() + FOK_RETRY_SEC
-                    logger.info("[진입 놓침] %s | %s | 이유: %s — %s | %g초 뒤 다시", coin, exc, why, detail, FOK_RETRY_SEC)
+                    logger.info("[진입 놓침] %s | %s | 이유: %s — %s | %s | %g초 뒤 다시",
+                                coin, exc, why, detail, age, FOK_RETRY_SEC)
                 else:
-                    # 연속 놓침 쉬기 (N1): 순간 신호가 켜졌다 꺼지는 장에서 2초마다 USDT 왕복 비용만 쌓이는 반복을 끊는다
+                    # 연속 놓침 쉬기 (N1): 순간 신호가 켜졌다 꺼지는 장에서 헛 FOK 가 2초마다 반복되는 것을 끊는다
                     self._reentry_allowed_at[coin] = self._clock() + self.s.entry_miss_cooldown_sec
-                    logger.warning("[진입 놓침] %s | %s | 이유: %s — %s | %g초 안 %d번째 놓침 → %g분 동안 %s 진입 쉼",
-                                   coin, exc, why, detail, self.s.entry_miss_window_sec, streak,
+                    logger.warning("[진입 놓침] %s | %s | 이유: %s — %s | %s | %g초 안 %d번째 놓침 → %g분 동안 %s 진입 쉼",
+                                   coin, exc, why, detail, age, self.s.entry_miss_window_sec, streak,
                                    self.s.entry_miss_cooldown_sec / 60, coin)
                     telemetry.decision(session, coin, "miss_cooldown", top, threshold, premium_depth=depth,
                                        note=f"{self.s.entry_miss_window_sec:g}초 안 {streak}번 놓침 → "
@@ -1069,19 +1099,19 @@ class Engine:
             session.commit()
             vol = self._bybit_range.describe(coin, self._clock())   # 변동성 기록 (docs/issues.md #5)
             telemetry.decision(session, coin, "entered", top, threshold, premium_depth=depth, size_usdt=size,
-                               bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id, note=vol,
+                               bybit_qty=bybit_qty, funding_8h=funding, position_id=pos.id, note=f"{vol} | {age}",
                                now=self._now_utc())
             notional = pos.bybit_qty * pos.entry_bybit_price_usdt
             target = estimated_exit_premium(pos.entry_premium, params.target_net_profit_percent, notional, 0.0,
                                             self.s.fees, quote.usdt_spread_percent or 0.0, coin=coin)
             logger.info(
                 "[진입] #%d %s | 김프 %+.3f%% (기준 %+.2f%%, 판단 %+.3f%%) | 목표 %.2f%% → 김프 약 %+.2f%% 필요 | "
-                "업비트 USDT %.2f개 매도 (%.1f원) → %.6g개 매수 (%s원) | 바이비트 %g개 숏 (%.6f USDT, %.0f배) | "
-                "강제청산가 %.6f | %s",
+                "업비트 %.6g개 매수 (%s원) → USDT %.2f개 매도 (%.1f원) | 바이비트 %g개 숏 (%.6f USDT, %.0f배) | "
+                "강제청산가 %.6f | %s | %s",
                 pos.id, coin, pos.entry_premium, params.entry_premium_threshold_percent, depth,
                 params.target_net_profit_percent, target,
-                pos.usdt_sold, pos.entry_usdt_price_krw, pos.upbit_qty, f"{pos.entry_upbit_price_krw:,.2f}",
-                pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage, pos.liquidation_price, vol,
+                pos.upbit_qty, f"{pos.entry_upbit_price_krw:,.2f}", pos.usdt_sold, pos.entry_usdt_price_krw,
+                pos.bybit_qty, pos.entry_bybit_price_usdt, pos.leverage, pos.liquidation_price, vol, age,
             )
             open_positions[coin] = pos
             if self.s.one_shot:
@@ -1112,6 +1142,27 @@ class Engine:
             q.clear()
             return count
         return None
+
+    def _level_age(self, coin: str, limit: Optional[float], qty: float) -> str:
+        """
+        지정가 줄 나이: '지정가 이하 매도 호가 물량 ≥ 우리 수량' 이 직전 스캔들에서 몇 번 연속으로 참이었나 (기록만, 가드 아님)
+
+        놓친 13건(2026-10-30)은 전부 기준 안에 들어오는 유일한 한 줄이 얇은 줄이었고 신호의 86% 가 1초를 못 넘겼다.
+        '오래 서 있던 줄이 더 오래 버티나' 를 체결/놓침 × 줄 나이 표로 보려고 남긴다 (docs/issues.md N5).
+        이번 스캔 호가는 빼고 센다 (이번 스캔엔 당연히 있다). 예) '줄 나이 2스캔(4.1초)' / '줄 나이 0스캔(방금 생김)'
+        """
+        hist = self._ask_hist.get(coin)
+        if limit is None or not hist or len(hist) < 2:
+            return "줄 나이 ?"
+        now = hist[-1][0]
+        scans, oldest = 0, now
+        for t, asks in reversed(list(hist)[:-1]):
+            if sum(size for price, size in asks if price <= limit) < qty:
+                break
+            scans, oldest = scans + 1, t
+        if scans == 0:
+            return "줄 나이 0스캔(방금 생김)"
+        return f"줄 나이 {scans}스캔({now - oldest:.1f}초)"
 
     def _fit_entry(self, coin: str, quote: Quote, bybit_qty: float, threshold: float, fee_rate: float) -> EntryFit:
         """업비트 지정가 FOK 진입 크기·안전 확인 (kimp/fok_sizing.py). 숏 개수는 바이비트 주문 단위로 내린다"""
@@ -1237,10 +1288,10 @@ class Engine:
         skews = [q.skew_ms for q in quotes.values() if q.skew_ms is not None]
         skew_ms = max(skews) if skews else None
         logger.info(
-            "[현황] %s | %s | 포지션 %d/%d | 자본 업비트 %s / 바이비트 %s USDT (%.1f:%.1f, 목표 %.1f:%.1f) | "
+            "[현황] %s | %s | 포지션 %d/%d | 자본 업비트 %s (원화 %s원 포함) / 바이비트 %s USDT (%.1f:%.1f, 목표 %.1f:%.1f) | "
             "스캔 %.1f초 (시세 %.1f초, 두 거래소 어긋남 %s) | 판단 %s",
             head, ", ".join(parts), len(open_positions), self.s.max_open_positions,
-            f"{upbit:,.2f}", f"{bybit:,.2f}",
+            f"{upbit:,.2f}", f"{self.broker.balance(session, UPBIT_KRW):,.0f}", f"{bybit:,.2f}",
             upbit / total * 100 if total else 0, bybit / total * 100 if total else 0,
             target * 100, (1 - target) * 100, scan_ms / 1000, self._quote_ms / 1000,
             "-" if skew_ms is None else f"{skew_ms}ms",

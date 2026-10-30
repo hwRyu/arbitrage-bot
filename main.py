@@ -31,7 +31,7 @@ from sqlalchemy import select
 from kimp.config import Settings, load_settings
 from kimp.db import make_session_factory
 from kimp.engine import Engine, _as_utc
-from kimp.executor import BYBIT_USDT, UPBIT_USDT
+from kimp.executor import BYBIT_USDT, UPBIT_KRW, UPBIT_USDT
 from kimp.fx import FxProvider
 from kimp.telemetry import end_run, install_db_log_handler, start_run
 from kimp.logging_setup import setup_logging
@@ -113,7 +113,8 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory, market
         from kimp.broker import dir_label
         positions = broker.open_positions(session)
         lines = [f"[현황] {MODE_LABEL[s.mode]} · {datetime.now(KST):%m-%d %H:%M}",
-                 f"잔고 업비트 {broker.balance(session, UPBIT_USDT):,.2f} / 바이비트 "
+                 f"잔고 업비트 {broker.balance(session, UPBIT_USDT):,.2f} USDT + 원화 "
+                 f"{broker.balance(session, UPBIT_KRW):,.0f}원 (버퍼) / 바이비트 "
                  f"{broker.balance(session, BYBIT_USDT):,.2f} USDT (포지션 제외)",
                  f"오늘 확정 손익 {broker.safety.daily_loss_usdt(session):+,.2f} USDT",
                  ("신규 진입 가능" if ok else f"신규 진입 중단 — {why}") + f" · 자리 {len(positions)} / {s.max_open_positions}",

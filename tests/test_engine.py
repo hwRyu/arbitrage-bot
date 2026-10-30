@@ -100,12 +100,16 @@ def make_engine(settings: Settings, market: FakeMarket, fx=None):
 class PaperBrokerTest(unittest.TestCase):
     """페이퍼 체결과 잔고"""
 
+    KRW0 = 2_000_000.0   # 원화 버퍼 (코인 FOK 를 먼저 낼 돈). 엔진이 유지하지만 브로커만 쓰는 테스트는 직접 넣는다
+
     def setUp(self):
-        """메모리 DB + 시작 자본 10,000 USDT 를 50:50 으로"""
+        """메모리 DB + 시작 자본 10,000 USDT 를 50:50 으로 + 원화 버퍼"""
         self.sf = make_session_factory(":memory:")
         self.broker = PaperBroker(FEES, max_slippage_percent=0.3)
         with self.sf() as s:
             self.broker.ensure_initial_balances(s, 10_000, 0.5)
+            self.broker.ex._add(s, "upbit:KRW", self.KRW0)
+            s.commit()
 
     def test_initial_split_by_ratio(self):
         """시작 자본을 목표 비율대로 나눠 넣고, 두 번째부터는 안 넣는다"""
@@ -125,7 +129,7 @@ class PaperBrokerTest(unittest.TestCase):
             pnl = self.broker.close_hedge(s, pos, val, ExitReason.TAKE_PROFIT)
 
             change = self.broker.balance(s, UPBIT_USDT) + self.broker.balance(s, BYBIT_USDT) - 10_000
-            self.assertLess(abs(self.broker.balance(s, "upbit:KRW")), 1e-6)  # 자투리 원화 거의 0
+            self.assertLess(abs(self.broker.balance(s, "upbit:KRW") - self.KRW0), 1e-3)  # 버퍼는 쓴 만큼 되채워져 그대로
             self.assertAlmostEqual(change, pnl.net_usdt + pnl.transfer_fee_usdt, places=6)
             self.assertAlmostEqual(self.broker.balance(s, coin_key("XRP")), 0)
             self.assertEqual(s.query(Fill).count(), 6)  # USDT 매도·코인 매수·숏 / 코인 매도·USDT 매수·숏 닫기
@@ -311,8 +315,9 @@ class EngineTest(unittest.TestCase):
         self.market.quotes = {"XRP": make_quote(-1.0)}
         self.engine.step()
         [pos] = self._positions()
-        self.assertAlmostEqual(pos.bybit_qty, pos.upbit_qty, places=6)   # 숏 = 실제로 산 코인 개수 (1:1 헷지)
-        self.assertGreater(pos.bybit_qty, 500.0)                           # 김프 -1% 라 500 USDT 어치가 500개보다 많다
+        # 금액 헷징: 숏 = 코인 금액 ÷ 바이비트 가격 = 코인 개수 × (1 + 진입 김프). 바이비트 주문 단위(0.1개) 내림만큼 차이
+        self.assertAlmostEqual(pos.bybit_qty, pos.upbit_qty * (1 + pos.entry_premium / 100), delta=0.1)
+        self.assertLess(pos.bybit_qty, pos.upbit_qty)                      # 김프 -1% 라 코인을 1% 더 샀다
 
         self.market.quotes = {"XRP": make_quote(0.2)}  # 1.2%p 올랐지만 비용 빼면 1% 안 됨
         self.engine.step()
@@ -474,7 +479,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """가드 구간인데 목표(1%)까지 0.3%p 이내 → 증거금을 넣고 들고 간다"""
         market, engine, sf, broker, pos = self._guard_setup()
         liq0, margin0 = pos.liquidation_price, pos.bybit_margin_usdt
-        quote = make_quote(0.4, bybit_price=1.22)       # 순손익 ≈ +0.88% (목표 1% 코앞), 강제청산까지 8.8% (1:1 헷지 기준)
+        quote = make_quote(0.2, bybit_price=1.22)       # 순손익 ≈ +0.9% (목표 1% 코앞), 강제청산까지 8.8% (금액 헷징이라 가격 항 없음)
         with sf() as s:
             net = broker.value_exit(pos, quote).pnl.net_percent
         self.assertTrue(1.0 - 0.3 <= net < 1.0, net)
@@ -526,7 +531,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
     def test_liq_guard_closes_when_topup_cap_is_zero(self):
         """추가 회차 0 이면 목표가 코앞이어도 정리"""
         market, engine, sf, broker, pos = self._guard_setup(liq_guard_topup_max_rounds=0)
-        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.2, bybit_price=1.22)}
         engine.step()
         with sf() as s:
             pos = s.query(Position).one()
@@ -535,7 +540,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
     def test_liq_guard_uses_only_the_margin_buffer(self):
         """여유분이 0% 면 넣을 돈이 0 → 목표가 코앞이어도 넣지 않고 정리 (자리 몫은 절대 안 건드린다)"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=0.0)
-        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.2, bybit_price=1.22)}
         with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
             engine.step()
         self.assertTrue(any("[증거금 추가 불가]" in m and "여유분 0.00 USDT" in m for m in logs.output))
@@ -548,7 +553,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """여유분이 1단위보다 작으면 남은 만큼만 넣는다 — 자본 10,000 × 1%/4.01 ≈ 25 USDT < 1단위 167"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=1.0)
         margin0 = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.2, bybit_price=1.22)}
         engine.step()
         with sf() as s:
             pos = s.query(Position).one()
@@ -561,7 +566,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0, liq_guard_topup_unit_ratio=0.5,
                                                             liq_guard_topup_max_rounds=2)
         margin0 = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.2, bybit_price=1.22)}
         engine.step()                                     # 1차: 0.5단위
         with sf() as s:
             pos = s.query(Position).one()
@@ -582,7 +587,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """여유분이 넉넉하면 한 번에 '원래 증거금 1단위' 를 넣는다 (1배면 청산가 2배 → 3배)"""
         market, engine, sf, broker, pos = self._guard_setup(bybit_margin_buffer_percent=300.0)
         margin0 = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.2, bybit_price=1.22)}
         engine.step()
         with sf() as s:
             pos = s.query(Position).one()
@@ -594,7 +599,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """회차 한도(1회)를 다 쓰면 다음 가드 구간에서는 정리"""
         market, engine, sf, broker, pos = self._guard_setup(liq_guard_topup_max_rounds=1, bybit_margin_buffer_percent=300.0)
         initial = pos.bybit_margin_usdt
-        market.quotes = {"XRP": make_quote(0.4, bybit_price=1.22)}
+        market.quotes = {"XRP": make_quote(0.2, bybit_price=1.22)}
         engine.step()                                     # 1차: 1단위
         with sf() as s:
             pos = s.query(Position).one()

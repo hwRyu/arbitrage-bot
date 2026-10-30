@@ -3,7 +3,7 @@
 
 왜 이 기능이 있나: 시장가는 판단 뒤 1초 사이 호가가 한 칸 비껴도 그 가격에 잡힌다 (CAP #12 2026-10-25: 140원 판단
 → 141원 체결, 한 칸 0.71%). FOK 는 판단한 가격에 전량 즉시 체결 아니면 취소라 판단보다 나쁘게는 절대 안 잡힌다.
-    진입 놓침 → 숏은 아직 없으니 판 USDT 만 되삼 (ABORTED / ENTRY_MISSED)
+    진입 놓침 → 코인이 첫 주문이라 되돌릴 것 없음, 비용 0 (ABORTED / ENTRY_MISSED, 2026-10-30 부터)
     익절 놓침 → 포지션 그대로(OPEN), 엔진이 FOK_RETRY_SEC 뒤 다시 판단
 
 실행: python -m unittest discover -s tests -v
@@ -19,7 +19,7 @@ from kimp.live_executor import LiveExecutor
 from kimp.premium import OrderBook, Quote, upbit_krw_tick, upbit_limit_price
 from kimp.safety import Safety
 from support_ticks import continuous_upbit_ticks
-from test_live_broker import DEEP, FEES, FakeBybit, FakeUpbit, JumpyUpbit, Prices, settings
+from test_live_broker import DEEP, FEES, KRW0, FakeBybit, FakeUpbit, Prices, settings, value_short
 
 
 class TickTest(unittest.TestCase):
@@ -83,11 +83,12 @@ class PaperFokTest(unittest.TestCase):
         broker = PaperBroker(FEES, 0.3)
         with self.sf() as s:
             broker.ex.ensure_initial(s, 10_000, 0.5)
+            broker.ex._add(s, "upbit:KRW", 1_000_000)     # 원화 버퍼
             s.commit()
             pos = broker.open_hedge(s, self.quote, 100.0)
             self.assertEqual(pos.status, PositionStatus.OPEN)
             self.assertEqual(pos.entry_upbit_price_krw, 1390.0)
-            self.assertAlmostEqual(pos.bybit_qty, pos.upbit_qty, places=6)
+            self.assertAlmostEqual(pos.bybit_qty, value_short(pos), places=6)   # 금액 헷징
             up2 = OrderBook(bids=[(1420.0, DEEP)], asks=[(1425.0, DEEP)])
             q2 = Quote(coin="XRP", upbit=up2, bybit=self.quote.bybit, usdt=self.quote.usdt)
             pnl = broker.close_hedge(s, pos, broker.value_exit(pos, q2), ExitReason.TAKE_PROFIT)
@@ -108,36 +109,52 @@ def make_fok_live(upbit_cls=FakeUpbit):
 
 class LiveFokEntryTest(unittest.TestCase):
     def test_entry_order_and_limit_params(self):
-        """USDT 매도 → 코인 지정가 FOK(판단가) → 산 개수만큼 숏. 주문에 time_in_force=fok 가 붙는다"""
+        """코인 지정가 FOK(판단가, 버퍼 원화로) → 쓴 만큼 USDT 매도 ‖ 금액만큼 숏. 주문에 time_in_force=fok 가 붙는다"""
         prices, up, by, broker, sf = make_fok_live()
         with sf() as s:
             pos = broker.open_hedge(s, prices.quote(), 50.0)
             self.assertEqual(pos.status, PositionStatus.OPEN)
-            self.assertEqual(up.calls[:2], ["sell USDT/KRW", "buy XRP/KRW limit"])
+            self.assertEqual(up.calls[:2], ["buy XRP/KRW limit", "sell USDT/KRW"])   # 코인이 먼저
             self.assertEqual(by.calls.count("open_short"), 1)
             self.assertEqual(up.last_limit["params"]["time_in_force"], "fok")
             self.assertEqual(up.last_limit["price"], 2805.0)                 # 판단한 매도호가 그대로
-            self.assertAlmostEqual(by.short, pos.upbit_qty)                   # 1:1 헷지
+            self.assertAlmostEqual(by.short, value_short(pos), places=6)      # 금액 헷징
             self.assertAlmostEqual(up.bal["XRP"], pos.upbit_qty)
-            self.assertLess(abs(up.bal["KRW"]), 5_000)                        # 자투리 원화만
+            self.assertAlmostEqual(up.bal["KRW"], KRW0, delta=1.0)            # 버퍼는 되채워져 그대로
 
-    def test_entry_miss_rebuys_usdt_and_opens_no_short(self):
-        """USDT 를 판 사이 코인 호가가 1% 뛰면 지정가가 안 맞아 취소 → 숏 없이 USDT 되삼 → ABORTED/ENTRY_MISSED"""
-        prices, up, by, broker, sf = make_fok_live(JumpyUpbit)
+    def test_entry_miss_costs_nothing(self):
+        """지정가가 안 맞아 취소 → 코인이 첫 주문이라 아무것도 안 움직임 → ABORTED/ENTRY_MISSED, 비용 0"""
+        prices, up, by, broker, sf = make_fok_live()
         with sf() as s:
+            q = prices.quote()
+            prices.coin_bid, prices.coin_ask = 2830.0, 2835.0                 # 판단 뒤 호가가 1% 뜀
             with self.assertRaises(EntryMissed):
-                broker.open_hedge(s, prices.quote(), 50.0)
+                broker.open_hedge(s, q, 50.0)
             pos = s.query(Position).one()
             self.assertEqual((pos.status, pos.exit_reason), (PositionStatus.ABORTED, "ENTRY_MISSED"))
             self.assertEqual(by.calls.count("open_short"), 0)                 # 숏은 시도조차 안 함
+            self.assertEqual(up.calls.count("sell USDT/KRW"), 0)              # USDT 도 안 건드림
             self.assertEqual(by.short, 0.0)
             self.assertAlmostEqual(up.bal["XRP"], 0.0)
-            self.assertAlmostEqual(up.bal["USDT"], 500.0, delta=0.3)          # USDT 왕복 수수료·호가만큼만
-            self.assertLess(pos.net_pnl_usdt, 0)
-            self.assertGreater(pos.net_pnl_usdt, -0.3)
+            self.assertEqual(up.bal["USDT"], 500.0)
+            self.assertEqual(up.bal["KRW"], KRW0)
+            self.assertEqual(pos.net_pnl_usdt, 0.0)
             sides = [f.side for f in s.query(Fill).order_by(Fill.id)]
-            self.assertEqual(sides, ["sell_usdt", "buy", "trim_buy_usdt"])
+            self.assertEqual(sides, ["buy"])
             self.assertTrue(broker.entries_allowed(s)[0])                      # 놓침은 실패가 아니다
+
+    def test_empty_buffer_is_filled_before_the_coin_order(self):
+        """버퍼 원화가 없으면(기동 직후) 먼저 USDT 를 팔아 채운 뒤 코인 FOK. 채운 원화는 포지션 다리가 아니라 잔고로만 센다"""
+        prices, up, by, broker, sf = make_fok_live()
+        up.bal["KRW"] = 0.0
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            self.assertEqual(pos.status, PositionStatus.OPEN)
+            self.assertEqual(up.calls[:3], ["sell USDT/KRW", "buy XRP/KRW limit", "sell USDT/KRW"])
+            sides = [f.side for f in s.query(Fill).order_by(Fill.id)]
+            self.assertEqual(sides.count("sell_usdt"), 1)                     # 버퍼 채우기는 기록 없음
+            self.assertAlmostEqual(pos.usdt_sold, 100.0, delta=0.1)
+            self.assertGreater(up.bal["KRW"], 0.0)                            # 채운 원화는 버퍼로 남는다
 
 
 class LiveFokExitTest(unittest.TestCase):

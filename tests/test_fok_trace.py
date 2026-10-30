@@ -10,7 +10,6 @@ from kimp.broker import EntryMissed, ExitDeferred
 from kimp.db import ExitReason, PositionStatus
 from kimp.fok_trace import classify_miss, snapshot
 from test_fok_orders import make_fok_live
-from test_live_broker import JumpyUpbit
 
 
 class SnapshotTest(unittest.TestCase):
@@ -65,11 +64,13 @@ class BrokerAttachesBookTest(unittest.TestCase):
     """브로커: 지정가 주문마다 [지정가 주문] 로그, 놓치면 예외에 주문 때 호가가 붙는다"""
 
     def test_entry_miss_carries_book(self):
-        prices, up, by, broker, sf = make_fok_live(JumpyUpbit)   # USDT 를 판 순간 코인 호가가 1% 뜀
+        prices, up, by, broker, sf = make_fok_live()
+        judged = prices.quote()
+        prices.coin_bid, prices.coin_ask = 2830.0, 2835.0        # 판단 뒤 주문이 닿기 전에 코인 호가가 1% 뜀
         with sf() as s:
             with self.assertLogs("kimp.broker", level=logging.INFO) as logs:
                 with self.assertRaises(EntryMissed) as ctx:
-                    broker.open_hedge(s, prices.quote(), 50.0)
+                    broker.open_hedge(s, judged, 50.0)
         fok = ctx.exception.fok
         self.assertIsNotNone(fok)
         self.assertEqual((fok.side, fok.limit, fok.levels_used), ("buy", 2805.0, 1))

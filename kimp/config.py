@@ -322,6 +322,13 @@ class Settings:
     #   1% 이하 차이는 그대로 둔다 (50 USDT 포지션이면 0.5 USDT. 가격 10% 움직여도 0.05 USDT)
     hedge_tolerance_percent: float = 1.0
 
+    # ★ 원화 버퍼 (2026-10-30, docs/concept.md 2번): 업비트에 '가장 큰 포지션 크기 × 이 수' 만큼을 늘 원화로 둔다.
+    #   진입은 그 원화로 코인 FOK 를 먼저 내고, 체결되면 쓴 만큼 USDT 를 되판다 → 놓쳐도 USDT 왕복 비용(0.175%)이 없고
+    #   판단 → 주문 도착이 USDT 매도 한 번(약 0.4초)만큼 빨라진다. 버퍼 원화는 어떤 포지션에도 속하지 않는 현금이라
+    #   손익엔 USDT/KRW 시세 변동 × 버퍼 금액만 남는다 (예: 2 × 300 USDT 어치, 시세 1% 에 ±6 USDT).
+    #   0 = 자동으로 채우지 않음 (첫 진입 때 모자라면 그때 채우고, 그 뒤 남는 원화를 돌려 씀)
+    upbit_krw_buffer_positions: float = 2.0
+
     # 업비트 원화 마켓 최소 주문 금액 (원). 실거래·드라이런은 시작할 때 업비트에 마켓별 값을 물어보고
     # (주문 가능 정보 API), 못 받으면 이 값을 쓴다. 페이퍼·시뮬레이션은 이 값.
     # 바이비트 최소 주문(개수·금액)은 거래소 마켓 정보에서 읽는다 (예: XRP 0.1개, 5 USDT)
@@ -662,6 +669,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         liq_guard_topup_unit_ratio=_env_float("LIQ_GUARD_TOPUP_UNIT_RATIO", d.liq_guard_topup_unit_ratio),
         rebalance_threshold_percent=_env_float("REBALANCE_THRESHOLD_PERCENT", d.rebalance_threshold_percent),
         hedge_tolerance_percent=_env_float("HEDGE_TOLERANCE_PERCENT", d.hedge_tolerance_percent),
+        upbit_krw_buffer_positions=_env_float("UPBIT_KRW_BUFFER_POSITIONS", d.upbit_krw_buffer_positions),
         upbit_min_order_krw=_env_float("UPBIT_MIN_ORDER_KRW", d.upbit_min_order_krw),
         entry_min_funding_8h_percent=(_env_optional_float("ENTRY_MIN_FUNDING_8H_PERCENT")
                                       if os.getenv("ENTRY_MIN_FUNDING_8H_PERCENT") is not None
@@ -880,6 +888,8 @@ def validate_settings(s: Settings) -> None:
             errors.append("실제 주문(LIVE_DRY_RUN=false)을 내려면 LIVE_CONFIRM=YES 를 적어야 합니다 (실수 방지)")
     if s.max_position_usdt is not None and s.max_position_usdt <= 0:
         errors.append("MAX_POSITION_USDT 는 0보다 커야 합니다")
+    if s.upbit_krw_buffer_positions < 0:
+        errors.append("UPBIT_KRW_BUFFER_POSITIONS 는 0 이상이어야 합니다")
     if s.daily_loss_limit_usdt is not None and s.daily_loss_limit_usdt <= 0:
         errors.append("DAILY_LOSS_LIMIT_USDT 는 0보다 커야 합니다")
     if s.max_funding_cost_percent < 0:
