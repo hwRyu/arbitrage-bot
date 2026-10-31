@@ -835,8 +835,8 @@ def env_snippet(ranked: Sequence[CoinScore], n: int, max_open_positions: int = 3
     skipped: List[str] = []
     for s in ranked[:n]:
         if not (s.full and s.score > 0 and not s.abnormal and not s.guard_blocked and not s.tick_edge_now
-                and not s.funding_blocked):
-            continue   # 최근펀딩: 봇의 진입 필터가 막거나 펀딩비 한도에 금방 닿는 코인은 추천하지 않는다 (2026-10-31)
+                and not s.funding_blocked and not s.tick_risk):
+            continue   # 최근펀딩·경계위험: 봇의 진입 필터·경계 위험 가드가 같은 기준으로 막는 코인은 추천하지 않는다 (2026-10-31)
         need = max(s.occupancy, MIN_OCCUPANCY)
         if used + need > budget:
             skipped.append(s.coin)

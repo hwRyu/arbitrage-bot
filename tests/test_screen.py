@@ -440,6 +440,8 @@ class RecentFundingAndTickRiskTest(unittest.TestCase):
         self.assertNotIn("경계위험", far.flags)
         self.assertGreater(risky.score, plain.score)
         self.assertEqual([x.coin for x in rank([risky, far, plain])], ["FAR", "PLAIN", "NILX"])
+        self.assertNotIn("NILX", env_snippet(rank([risky, far, plain]), 3))   # 봇 가드가 막을 코인은 추천 안 함
+        self.assertIn("FAR", env_snippet(rank([risky, far, plain]), 3))
 
     def test_evaluate_all_wires_recent_funding_and_tick_risk(self):
         """evaluate_all 이 종가·펀딩 기록에서 두 값을 계산해 넘긴다 (NIL 꼴: 97원 근처, 최근 펀딩 −0.04%/4h)"""
