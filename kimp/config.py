@@ -455,6 +455,11 @@ class Settings:
     #          봇은 선다. 주문은 늘 REST
     quote_source: str = "rest"
     quote_ws_max_age_ms: int = 5000
+    # ★ REST 요청 타임아웃 (ms, 주문·잔고·포지션·펀딩비·REST 시세 전부). ccxt 기본 10,000.
+    #   거래소가 응답을 안 줄 때 한 스캔 안의 REST 호출(잔고 2 + 포지션 코인 수 + 펀딩비)이 각각 이만큼 기다린다 — 10초면
+    #   포지션 4개에 스캔이 60~90초 멈췄다 (2026-10-28 48번, 10-30 28번, 10-31 18:48 79.7초). 5초면 그 절반.
+    #   주문 응답은 평소 0.1~0.7초라 5초를 넘기면 결과 모름(OrderUnknown) 경로로 조회해 이어 간다
+    rest_timeout_ms: int = 5000
 
     # ------------------------------------------------------------------
     # 달러 환율 (표시용. 사이트식 김프와 테더 프리미엄 보여주기, kimp/fx.py)
@@ -725,6 +730,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         orderbook_depth=_env_int("ORDERBOOK_DEPTH", d.orderbook_depth),
         quote_source=_env_str("QUOTE_SOURCE", d.quote_source).strip().lower(),
         quote_ws_max_age_ms=_env_int("QUOTE_WS_MAX_AGE_MS", d.quote_ws_max_age_ms),
+        rest_timeout_ms=_env_int("REST_TIMEOUT_MS", d.rest_timeout_ms),
         fx_refresh_sec=_env_float("FX_REFRESH_SEC", d.fx_refresh_sec),
         fixed_usd_krw=_env_optional_float("FIXED_USD_KRW"),
         paper_initial_total_usdt=_env_float("PAPER_INITIAL_TOTAL_USDT", d.paper_initial_total_usdt),
@@ -890,6 +896,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("QUOTE_SOURCE 는 rest 또는 ws 여야 합니다")
     if s.quote_ws_max_age_ms < 200:
         errors.append("QUOTE_WS_MAX_AGE_MS 는 200 이상이어야 합니다 (소켓 호가 도착 지연이 70~80 ms)")
+    if s.rest_timeout_ms < 1000:
+        errors.append("REST_TIMEOUT_MS 는 1000 이상이어야 합니다 (주문 응답이 평소 0.1~0.7초)")
     if s.sim_default_spread_percent < 0:
         errors.append("SIM_DEFAULT_SPREAD_PERCENT 는 0 이상이어야 합니다")
     if s.fx_refresh_sec < 5:

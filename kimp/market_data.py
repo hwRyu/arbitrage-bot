@@ -107,20 +107,21 @@ class MarketData:
         먼저 쓰고, 없거나 묵은 코인만 REST 로 받는다. Quote 를 만드는 곳은 여기 한 군데라 엔진은 출처를 모른다.
     """
 
-    def __init__(self, depth: int = 30, feed=None):
+    def __init__(self, depth: int = 30, feed=None, timeout_ms: int = 10_000):
         """
         Args:
             depth: 호가창을 몇 줄까지 받을지 (REST)
             feed: 웹소켓 호가 (WsFeed). books(coin) 만 쓴다. None 이면 REST 만
+            timeout_ms: REST 요청 하나의 타임아웃 (봇은 REST_TIMEOUT_MS, 수집·스크리너는 ccxt 기본 10초)
         """
         self.depth = depth
         self.feed = feed
         # enableRateLimit: 거래소 요청 간격을 ccxt 가 알아서 지켜준다
         # 업비트 시세 조회는 초당 10회까지인데 ccxt 기본값은 50ms(초당 20회)라 너무 빠르다.
         # 그대로 두면 과거 캔들을 많이 받을 때 429(요청 과다)로 끊긴다 → 110ms(초당 약 9회)로 늘린다.
-        self.upbit = ccxt.upbit({"enableRateLimit": True, "rateLimit": 110})
+        self.upbit = ccxt.upbit({"enableRateLimit": True, "rateLimit": 110, "timeout": timeout_ms})
         # defaultType=swap: 바이비트 무기한 선물을 기본으로
-        self.bybit = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+        self.bybit = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": timeout_ms})
 
         # 마켓 정보(어떤 코인이 있는지, 주문 단위 등)는 시작할 때 한 번만 받는다
         logger.info("거래소 마켓 정보 받는 중...")
@@ -130,7 +131,7 @@ class MarketData:
         # 호가 동시 수신용 바이비트 공개 연결 묶음 (마켓 정보는 위에서 받은 것을 그대로 꽂아 다시 안 받는다)
         self._bybit_pool: "queue.Queue" = queue.Queue()
         for _ in range(BYBIT_PARALLEL):
-            ex = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+            ex = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": timeout_ms})
             ex.set_markets(self.bybit.markets)
             self._bybit_pool.put(ex)
 

@@ -49,10 +49,11 @@ def make_exchanges(settings: Settings):
     """키가 들어간 ccxt 업비트·바이비트 (주문·잔고·출금용)"""
     import ccxt
 
+    # timeout: 거래소가 응답을 안 줄 때 요청 하나가 기다리는 상한 (REST_TIMEOUT_MS). 기본 10초면 스캔이 분 단위로 멈춘다
     upbit = ccxt.upbit({"apiKey": settings.upbit_access_key, "secret": settings.upbit_secret_key,
-                        "enableRateLimit": True})
+                        "enableRateLimit": True, "timeout": settings.rest_timeout_ms})
     bybit = ccxt.bybit({"apiKey": settings.bybit_api_key, "secret": settings.bybit_api_secret,
-                        "enableRateLimit": True, "options": {"defaultType": "swap"}})
+                        "enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": settings.rest_timeout_ms})
     upbit.load_markets()
     bybit.load_markets()
     return upbit, bybit
@@ -485,7 +486,7 @@ def main() -> int:
     for warning in settings.config_warnings:
         logger.warning(warning)
 
-    market = MarketData(depth=settings.orderbook_depth)
+    market = MarketData(depth=settings.orderbook_depth, timeout_ms=settings.rest_timeout_ms)
     coins = market.filter_supported(settings.coins)
     if not coins:
         logger.error("운용 가능한 코인이 없습니다 (COINS 확인)")
