@@ -143,6 +143,7 @@ class Engine:
         self._zone_positions: set = set()
         self._daily_range: Dict[str, Tuple[float, Optional[float]]] = {}
         self._range_thread: Optional[threading.Thread] = None       # 하루 변동폭 REST 를 받는 별도 스레드 (한 번에 하나)
+        self._account_was_stale = False                             # [계좌 조회 지연] → 복구 로그용
         self._range_result: Optional[Tuple[str, Optional[float], Optional[str]]] = None   # (코인, 값, 오류 문구)
         # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
         self._bybit_range = RangeTracker()
@@ -328,7 +329,19 @@ class Engine:
             self.broker.sync(session, quotes, self.coins, refresh_account=refresh)
             if refresh:
                 self._last_account_refresh, self._account_dirty = now_mono, False
-            self._close_vanished_shorts(session, quotes)
+            # 계좌 스냅샷이 오래됐나 (issues N7): 거래소가 응답을 안 주면 갱신 스레드의 값이 낡는다. 그동안은
+            # 신규 진입과 '숏 사라짐' 판정을 보류하고(조회에 성공한 값으로만 판정), 청산 판단은 마지막 값으로 계속한다
+            account_age = self.broker.account_age()
+            account_stale = account_age > self.s.account_stale_sec
+            if account_stale:
+                self._log_throttled("account-stale", logging.WARNING,
+                                    f"[계좌 조회 지연] 거래소 잔고·포지션이 {account_age:.0f}초 전 값 (한도 {self.s.account_stale_sec:g}초) | "
+                                    f"신규 진입·숏 사라짐 판정 보류, 청산 판단은 마지막 값으로 계속", cooldown_sec=60.0)
+            elif self._account_was_stale:
+                logger.info("[계좌 조회 복구] 거래소 잔고·포지션 갱신 재개 (%.0f초 전 값)", account_age)
+            self._account_was_stale = account_stale
+            if not account_stale:
+                self._close_vanished_shorts(session, quotes)
             open_positions = {p.coin: p for p in self.broker.open_positions(session)}
             if refresh:
                 self._maintain_krw_buffer(session, quotes, open_positions)
@@ -348,7 +361,7 @@ class Engine:
                 self._check_rebalance(session, list(open_positions.values()), quotes, when="청산 후")
 
             allowed, why = self.broker.entries_allowed(session)
-            if allowed:
+            if allowed and not account_stale:
                 self._try_entries(session, quotes, open_positions)
             else:
                 # 사람이 멈춘 상태는 몇 시간씩 가므로 1분마다 알리면 텔레그램이 도배된다 → 30분에 한 번

@@ -162,6 +162,10 @@ class PaperExecutor:
     def prefetch(self, coins) -> None:
         """(실거래만) 잔고·숏 미리 받아 두기. 페이퍼는 할 일 없음"""
 
+    def account_age(self) -> float:
+        """(실거래만) 계좌 스냅샷 나이. 페이퍼는 장부가 늘 최신이라 0"""
+        return 0.0
+
     def min_order_krw(self, coin: str) -> float:
         """업비트 원화 마켓 최소 주문 금액 (coin='USDT' 면 USDT/KRW). 페이퍼는 설정값"""
         return self.upbit_min_order_krw

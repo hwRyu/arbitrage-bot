@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -91,6 +92,64 @@ class FundingInfo:
     next_funding_ms: int
     mark_price: float
     interval_hours: Optional[float] = None
+
+
+class FundingCache:
+    """
+    코인별 펀딩비 정보를 뒤에서 받아 두는 캐시 (스레드 하나, 코인 순서대로)
+
+    fetch(coin) → FundingInfo 또는 None. refresh_sec 지난 코인만 다시 받는다. 실패하면 옛 값을 refresh_sec × 3 까지 쓴다
+    (펀딩비는 4~8시간마다 바뀌는 값이라 몇 분 낡아도 판단이 틀리지 않는다). 그 뒤엔 None → 부르는 쪽이 그 자리에서 받는다
+    """
+
+    def __init__(self, fetch, coins: List[str], refresh_sec: float, clock=time.monotonic):
+        self._fetch = fetch
+        self.coins = list(coins)
+        self.refresh_sec = refresh_sec
+        self._clock = clock
+        self._entries: Dict[str, Tuple[FundingInfo, float]] = {}   # 코인 → (정보, 받은 시각)
+        self._tried: Dict[str, float] = {}                          # 코인 → 마지막 시도 시각 (실패 포함)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def get(self, coin: str) -> Optional[FundingInfo]:
+        entry = self._entries.get(coin)
+        if entry is None or self._clock() - entry[1] > self.refresh_sec * 3:
+            return None
+        return entry[0]
+
+    def refresh_once(self) -> int:
+        """refresh_sec 이 지난 코인들을 한 번씩 받는다. 받은 코인 수를 돌려준다 (테스트용)"""
+        got = 0
+        for coin in list(self.coins):
+            now = self._clock()
+            if now - self._tried.get(coin, -1e18) < self.refresh_sec:
+                continue
+            self._tried[coin] = now
+            try:
+                info = self._fetch(coin)
+            except Exception as exc:   # noqa: BLE001 — 이 스레드는 죽지 않는다
+                logger.warning("[펀딩비 캐시] %s 조회 오류: %s", coin, exc)
+                info = None
+            if info is not None:
+                self._entries[coin] = (info, self._clock())
+                got += 1
+        return got
+
+    def start(self, interval_sec: float = 5.0) -> None:
+        if self._thread is not None:
+            return
+
+        def loop():
+            while not self._stop.is_set():
+                self.refresh_once()
+                self._stop.wait(interval_sec)
+
+        self._thread = threading.Thread(target=loop, name="funding-cache", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 class MarketData:
@@ -316,15 +375,36 @@ class MarketData:
         n = len(ranges)
         return ranges[n // 2] if n % 2 else (ranges[n // 2 - 1] + ranges[n // 2]) / 2
 
+    def start_funding_cache(self, coins: Iterable[str], refresh_sec: float, interval_sec: float = 5.0) -> None:
+        """
+        펀딩비 조회를 별도 스레드로 (issues N7). 엔진은 fetch_funding() 을 그대로 부르되 캐시가 있으면 REST 를 기다리지 않는다
+
+        바이비트 티커 REST 는 평소 100ms 지만 느릴 때 5초(타임아웃)까지 걸리고, 코인당 FUNDING_REFRESH_SEC 마다 판단 루프에서
+        불렀다 (10-31 18:48 '펀딩비 조회 실패' 와 스캔 79.7초가 같은 시각). 자기 ccxt 객체로 받는다 (스레드 안전이 아니라서)
+        """
+        client = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": self.bybit.timeout})
+        client.set_markets(self.bybit.markets)
+        self._funding_cache = FundingCache(lambda c: self._fetch_funding_rest(c, client), list(coins), refresh_sec)
+        self._funding_cache.start(interval_sec)
+
     def fetch_funding(self, coin: str) -> Optional[FundingInfo]:
         """
-        바이비트 펀딩비 정보 가져오기
+        바이비트 펀딩비 정보 (캐시 스레드가 있으면 그 값, 없거나 아직 없으면 그 자리에서 REST)
 
         Returns:
             FundingInfo. 실패하면 None
         """
+        cache = getattr(self, "_funding_cache", None)
+        if cache is not None:
+            info = cache.get(coin)
+            if info is not None:
+                return info
+        return self._fetch_funding_rest(coin, self.bybit)
+
+    def _fetch_funding_rest(self, coin: str, client) -> Optional[FundingInfo]:
+        """펀딩비 REST 한 번 (client 는 호출 스레드 전용 ccxt 객체)"""
         try:
-            raw = self.bybit.fetch_funding_rate(bybit_symbol(coin))
+            raw = client.fetch_funding_rate(bybit_symbol(coin))
         except Exception as exc:
             _log_repeat(f"funding-{coin}", logging.WARNING, f"[펀딩비 조회 실패] {coin} | {exc}")
             return None

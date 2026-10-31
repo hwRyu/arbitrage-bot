@@ -75,6 +75,13 @@ def make_broker(settings: Settings, coins, safety: Safety) -> HedgeBroker:
         ex = DryRunExecutor(settings.fees, settings.bybit_leverage, live)  # 최소 주문은 실제 거래소 값
     else:
         live.setup(coins, settings.bybit_leverage)  # 바이비트 단방향·격리·레버리지 맞추기
+        # 계좌 갱신 스레드 (issues N7): 잔고·숏을 별도 ccxt 객체로 2초마다 받아 두고 판단 루프는 스냅샷을 쓴다
+        from kimp.account_refresher import AccountRefresher
+        up2, by2 = make_exchanges(settings)
+        live.account = AccountRefresher(up2, by2, interval_sec=settings.scan_interval_sec)
+        live.account.watch(coins)
+        live.account.cycle()          # 첫 스냅샷은 기동 때 받아 둔다 (첫 스캔이 REST 를 기다리지 않게)
+        live.account.start()
         ex = live
     return HedgeBroker(ex, settings.fees, settings.max_slippage_percent, **common,
                        auto_transfer=settings.auto_transfer_enabled, **kw)
@@ -492,6 +499,7 @@ def main() -> int:
         logger.error("운용 가능한 코인이 없습니다 (COINS 확인)")
         return 2
     market.feed = start_quote_feed(settings, coins)   # QUOTE_SOURCE=ws 일 때만 켜진다
+    market.start_funding_cache(coins, settings.funding_refresh_sec)   # 펀딩비 REST 를 판단 루프 밖에서 (issues N7)
     # 수수료는 코인마다 다르다 (바이비트 소형 코인 2배, .env 코인별 덮어쓰기). 거래소 조회값을 설정에 채운다 —
     # 익절 판단·필요 김프·시작 메시지가 이걸 쓴다
     from kimp.fees import with_bybit_fee_rates

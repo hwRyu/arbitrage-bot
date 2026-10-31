@@ -460,6 +460,10 @@ class Settings:
     #   포지션 4개에 스캔이 60~90초 멈췄다 (2026-10-28 48번, 10-30 28번, 10-31 18:48 79.7초). 5초면 그 절반.
     #   주문 응답은 평소 0.1~0.7초라 5초를 넘기면 결과 모름(OrderUnknown) 경로로 조회해 이어 간다
     rest_timeout_ms: int = 5000
+    # ★ 계좌 스냅샷 나이 한도 (초, issues N7). 실거래는 잔고·숏을 별도 스레드가 2초마다 받아 두고 판단 루프는 그 스냅샷을 쓴다.
+    #   거래소가 응답을 안 줘 스냅샷이 이보다 오래되면: 신규 진입 보류, '숏 사라짐' 판정 보류 (조회에 성공한 값으로만 판정 —
+    #   오판하면 업비트 코인을 팔아 헷지를 깬다), 익절·손절·경계 위 청산은 마지막 값으로 계속
+    account_stale_sec: float = 10.0
 
     # ------------------------------------------------------------------
     # 달러 환율 (표시용. 사이트식 김프와 테더 프리미엄 보여주기, kimp/fx.py)
@@ -731,6 +735,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         quote_source=_env_str("QUOTE_SOURCE", d.quote_source).strip().lower(),
         quote_ws_max_age_ms=_env_int("QUOTE_WS_MAX_AGE_MS", d.quote_ws_max_age_ms),
         rest_timeout_ms=_env_int("REST_TIMEOUT_MS", d.rest_timeout_ms),
+        account_stale_sec=_env_float("ACCOUNT_STALE_SEC", d.account_stale_sec),
         fx_refresh_sec=_env_float("FX_REFRESH_SEC", d.fx_refresh_sec),
         fixed_usd_krw=_env_optional_float("FIXED_USD_KRW"),
         paper_initial_total_usdt=_env_float("PAPER_INITIAL_TOTAL_USDT", d.paper_initial_total_usdt),
@@ -898,6 +903,8 @@ def validate_settings(s: Settings) -> None:
         errors.append("QUOTE_WS_MAX_AGE_MS 는 200 이상이어야 합니다 (소켓 호가 도착 지연이 70~80 ms)")
     if s.rest_timeout_ms < 1000:
         errors.append("REST_TIMEOUT_MS 는 1000 이상이어야 합니다 (주문 응답이 평소 0.1~0.7초)")
+    if s.account_stale_sec < s.scan_interval_sec:
+        errors.append("ACCOUNT_STALE_SEC 는 SCAN_INTERVAL_SEC(계좌 갱신 주기) 이상이어야 합니다")
     if s.sim_default_spread_percent < 0:
         errors.append("SIM_DEFAULT_SPREAD_PERCENT 는 0 이상이어야 합니다")
     if s.fx_refresh_sec < 5:

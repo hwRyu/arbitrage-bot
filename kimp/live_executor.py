@@ -78,6 +78,11 @@ class LiveExecutor:
         self._shorts: Dict[str, float] = {}
         self._liq: Dict[str, Optional[float]] = {}   # 코인 → 거래소 강제청산가 (스캔당 한 번 받아 둔다)
         self._min_krw: Dict[str, float] = {}
+        # 계좌 갱신 스레드 (kimp/account_refresher.py, issues N7). 있으면 prefetch 가 스냅샷을 가져다 쓰고 REST 를 기다리지 않는다.
+        # 주문을 낸 뒤에는 그 거래소 값이 낡았으므로(dirty) 주문 뒤에 시작한 바퀴가 올 때까지 그 자리에서 받는다 (예전 방식)
+        self.account = None
+        self._up_dirty_since = 0.0
+        self._by_dirty_since = 0.0
 
     # ------------------------------------------------------------------
     # 준비 / 잔고
@@ -155,12 +160,21 @@ class LiveExecutor:
         REST 로 차례로 다시 받느라 숏 닫기가 1.1초 늦게 나갔다 (CAP #16 2026-10-28 22:40: 바이비트 다리 +0.40% 밀림,
         docs/issues.md #2). 비우는 쪽은 그대로 다음 조회 때 새로 받으므로 주문 뒤 값이 낡을 일은 없다.
         """
+        now = self.account._clock() if self.account is not None else time.monotonic()   # 갱신 스레드와 같은 시계
         if ex is self.up:
             self._up_bal = None
+            self._up_dirty_since = now
         else:
             self._by_bal = None
             self._shorts = {}
             self._liq = {}
+            self._by_dirty_since = now
+        if self.account is not None:
+            self.account.kick()
+
+    def account_age(self) -> float:
+        """계좌 스냅샷 나이 (초). 갱신 스레드가 없으면 0 (= 그 자리에서 받으므로 늘 새 값)"""
+        return self.account.age() if self.account is not None else 0.0
 
     def prefetch(self, coins: Iterable[str]) -> None:
         """
@@ -168,8 +182,13 @@ class LiveExecutor:
 
         청산 경로는 '지금 코인 잔고' 와 '숏이 살아 있나' 를 확인하는데, 캐시가 비어 있으면 그 자리에서 REST 를
         두 번 기다린다 (CAP #8 2026-10-24: 판단 → 전송 411 ms). 스캔 맨 앞에서 받아 두면 주문 경로는 캐시만 읽는다.
-        업비트 잔고 ∥ (바이비트 잔고 → 숏 한 번에) 로 동시에 받는다 (ccxt 객체는 스레드마다 다른 것).
+        계좌 갱신 스레드(account)가 있으면 그 스냅샷을 가져다 쓴다 (REST 없음). 없으면
+        업비트 잔고 ∥ (바이비트 잔고 → 숏 한 번에) 로 그 자리에서 받는다 (ccxt 객체는 스레드마다 다른 것).
         """
+        coins = list(coins)
+        if self.account is not None:
+            self._prefetch_from_snapshot(coins)
+            return
         coins = [c for c in coins if c not in self._shorts]
 
         def bybit_side():
@@ -182,6 +201,24 @@ class LiveExecutor:
             fb = pool.submit(bybit_side)
             for f in (fu, fb):
                 f.result()
+
+    def _prefetch_from_snapshot(self, coins: List[str]) -> None:
+        """
+        갱신 스레드의 스냅샷에서 가져오기. 주문 뒤(dirty)에 시작한 바퀴가 아직 안 왔으면 그 쪽은 비워 둔다
+        → 필요한 쪽이 그 자리에서 REST 로 받는다 (주문 흐름은 예전과 같은 정확성)
+        """
+        self.account.watch(coins)
+        snap = self.account.snapshot()
+        if self._up_bal is None and snap.up_bal is not None and snap.up_started >= self._up_dirty_since:
+            self._up_bal = snap.up_bal
+        if self._by_bal is None and snap.by_bal is not None and snap.by_started >= self._by_dirty_since:
+            self._by_bal = snap.by_bal
+            for coin in coins:
+                if coin in snap.shorts and coin not in self._shorts:
+                    self._shorts[coin] = snap.shorts[coin]
+                    self._liq[coin] = snap.liq.get(coin)
+        if self._up_bal is None or self._by_bal is None:
+            self.account.kick()   # 낡은 쪽이 있다 → 바로 한 바퀴
 
     def _balances_one(self, exchange: str) -> None:
         """한쪽 잔고만 받아 캐시에 넣는다 (prefetch 가 두 거래소를 동시에 받을 때)"""

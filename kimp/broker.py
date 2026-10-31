@@ -323,6 +323,14 @@ class HedgeBroker:
         """쓸 수 있는 잔고 (UPBIT_USDT / BYBIT_USDT / UPBIT_KRW / coin_key(...))"""
         return self.ex.free(session, asset)
 
+    def account_age(self) -> float:
+        """거래소 계좌 값이 몇 초 전 것인가 (실거래 계좌 갱신 스레드 기준, issues N7). 페이퍼·드라이런은 0"""
+        fn = getattr(self.ex, "account_age", None)
+        try:
+            return float(fn()) if fn else 0.0
+        except Exception:
+            return 0.0
+
     def capital_split(self, session: Session, positions: Iterable[Position],
                       quotes: Dict[str, Quote]) -> Tuple[float, float]:
         """
