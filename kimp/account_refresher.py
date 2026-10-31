@@ -76,6 +76,9 @@ class AccountRefresher:
         self._thread: Optional[threading.Thread] = None
         self._last_fail_log: Dict[str, float] = {}
         self._failing: Dict[str, bool] = {}
+        # 업비트 ∥ 바이비트를 동시에 받는 작업 스레드 2개 — 한 번 만들어 계속 쓴다 (바퀴마다 만들었다 없애면 2초마다 스레드
+        # 생성·해제가 반복돼 메모리가 분당 1.4 MB 씩 올랐다, 10-31 20:42~21:12)
+        self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="account")
 
     # ------------------------------------------------------------------ 읽기
     def snapshot(self) -> AccountSnapshot:
@@ -107,6 +110,7 @@ class AccountRefresher:
     def stop(self) -> None:
         self._stop.set()
         self._kick.set()
+        self._pool.shutdown(wait=False)
 
     # ------------------------------------------------------------------ 한 바퀴
     def cycle(self) -> AccountSnapshot:
@@ -140,11 +144,10 @@ class AccountRefresher:
                 liq[coin] = lp
             return bal, shorts, liq
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="account") as pool:
-            fu = pool.submit(up_side)
-            fb = pool.submit(by_side)
-            up_res, up_err = self._result(fu, "upbit")
-            by_res, by_err = self._result(fb, "bybit")
+        fu = self._pool.submit(up_side)
+        fb = self._pool.submit(by_side)
+        up_res, up_err = self._result(fu, "upbit")
+        by_res, by_err = self._result(fb, "bybit")
 
         now = self._clock()
         snap = self._snap
