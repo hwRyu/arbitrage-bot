@@ -72,6 +72,13 @@ def near_tick_boundary(price: float, margin_percent: float) -> Optional[Tuple[fl
     return None
 
 
+def next_tick_boundary(price: float) -> Optional[float]:
+    """이 가격 **위**에서 호가 단위가 커지는 첫 경계 (예: 97원 → 100, 150원 → 1,000). 표 밖이면 None"""
+    if price <= 0:
+        return None
+    return next((upper for upper, _tick in _UPBIT_KRW_TICKS if price < upper), None)
+
+
 def tick_boundaries_crossed(low: float, high: float) -> List[float]:
     """[low, high] 가격 구간이 넘나드는 업비트 호가 단위 경계들 (예: 93~103원 → [100]). 스크리너의 '경계왕래' 판정용"""
     if low <= 0 or high < low:

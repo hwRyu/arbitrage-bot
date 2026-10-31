@@ -841,6 +841,7 @@ async function loadLive() {
       { t: "코인 호가", tip: TIP.coinSpread, v: (r) => fmt(r.coin_spread, 3) + "%" },
       { t: "USDT 호가", tip: TIP.usdtSpread, v: (r) => fmt(r.usdt_spread, 3) + "%" },
       { t: "펀딩/8h", tip: TIP.funding, v: (r) => sign(r.funding_8h, 4) + "%", cls: (r) => cls(r.funding_8h) },
+      { t: "최근3일", tip: "최근 3일 펀딩비 평균 (8시간 환산). 봇의 진입 펀딩 필터보다 낮으면 '최근펀딩' 으로 추천 제외", v: (r) => r.funding_recent_8h == null ? "-" : sign(r.funding_recent_8h, 4) + "%", cls: (r) => cls(r.funding_recent_8h) },
       { t: "테더", tip: TIP.tether, v: (r) => sign(r.tether_premium, 3) },
       { t: "사이트 김프", tip: TIP.site, v: (r) => sign(r.site_premium, 3) },
       { t: "업비트(억)", tip: TIP.volUp, v: (r) => r.upbit_krw_24h ? (r.upbit_krw_24h / 1e8).toFixed(0) : "-" },
@@ -1302,6 +1303,7 @@ async function loadScreen() {
         cls: (r) => (r.bybit_fee_percent > 0.08 ? "minus" : "") },
       { t: "비용", v: (r) => fmt(r.cost_percent, 2) + "%" },
       { t: "펀딩/8h", tip: TIP.funding, v: (r) => sign(r.funding_8h, 4), cls: (r) => cls(r.funding_8h) },
+      { t: "최근3일", tip: "최근 3일 펀딩비 평균 (8시간 환산)", v: (r) => r.funding_recent_8h == null ? "-" : sign(r.funding_recent_8h, 4), cls: (r) => cls(r.funding_recent_8h) },
       { t: "경고", v: (r) => `<span class="flags">${(r.flags || []).join(", ")}</span>` },
     ], rows);
   } catch (e) {

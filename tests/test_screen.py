@@ -380,3 +380,87 @@ class RecentOpportunityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecentFundingAndTickRiskTest(unittest.TestCase):
+    """2026-10-31 (issues #6, NIL #41): 최근 3일 펀딩비로 추천 제외, 경계까지 거리 < 하루 변동폭이면 '경계위험' 으로 내림"""
+
+    DAY = 86_400_000
+
+    def _kw(self):
+        return dict(spread_percent=0.3, usdt_spread_percent=0.075, fixed_cost_percent=0.4, target=1.0, stop=-5.0,
+                    funding=[], live=CoinLive(), size_usdt=1000)
+
+    def test_recent_funding_helper(self):
+        from kimp.screen import recent_funding_8h_percent
+        end = 30 * self.DAY
+        # 27일간 4시간마다 +0.005%, 마지막 3일은 −0.04% (NIL 꼴) → 30일 평균은 거의 0, 최근 3일은 −0.08%/8h
+        old = [(t * 4 * 3_600_000, 0.00005) for t in range(27 * 6)]
+        new = [(27 * self.DAY + t * 4 * 3_600_000, -0.0004) for t in range(18)]
+        self.assertAlmostEqual(funding_per_8h_percent(old + new, 30), (27 * 6 * 0.005 - 18 * 0.04) / 90, places=4)
+        self.assertAlmostEqual(recent_funding_8h_percent(old + new, end), -0.08, places=4)
+        self.assertIsNone(recent_funding_8h_percent(old, end))        # 최근 3일 기록이 없으면 모른다
+
+    def test_recent_funding_blocks_recommendation(self):
+        """30일 평균은 양수여도 최근 3일이 진입 필터(−0.05%/8h) 아래면 '최근펀딩' → 가드차단 급으로 내리고 .env 추천 제외"""
+        vals = ([-1.5] * 5 + [0.8] * 5) * 40
+        days = len(vals) * BAR / self.DAY
+        kw = self._kw()
+        bad = evaluate_coin("NILX", series(vals), BAR, days=days, funding_recent_8h=-0.08, funding_floor_8h=-0.05, **kw)
+        ok = evaluate_coin("OK", series(vals), BAR, days=days, funding_recent_8h=0.01, funding_floor_8h=-0.05, **kw)
+        plain = evaluate_coin("PLAIN", series([0.0, 0.05] * 150), BAR, days=300 * BAR / self.DAY, **kw)
+        self.assertIn("최근펀딩", bad.flags)
+        self.assertNotIn("최근펀딩", ok.flags)
+        self.assertTrue(bad.funding_blocked)
+        self.assertEqual([x.coin for x in rank([bad, ok, plain])], ["OK", "PLAIN", "NILX"])   # 점수는 높아도 아래
+        self.assertNotIn("NILX", env_snippet(rank([bad, ok, plain]), 3))
+        self.assertIn("OK", env_snippet(rank([bad, ok, plain]), 3))
+
+    def test_daily_range_and_tick_gap(self):
+        from kimp.screen import daily_range_percent, tick_gap_percent
+        prices = {}
+        for d in range(5):                                    # 하루 안에 95 → 100 (5.3%) 왕복, 마지막 날만 10%
+            lo, hi = (95.0, 100.0) if d < 4 else (90.0, 99.0)
+            for i in range(10):
+                prices[d * self.DAY + i * 3_600_000] = lo if i % 2 else hi
+        self.assertAlmostEqual(daily_range_percent(prices), 100 / 95 * 100 - 100, places=6)   # 중앙값 = 보통 날
+        self.assertAlmostEqual(tick_gap_percent(97.4), (100 / 97.4 - 1) * 100)
+        self.assertAlmostEqual(tick_gap_percent(150.0), (1000 / 150 - 1) * 100)
+        self.assertIsNone(daily_range_percent({0: 100.0}))
+
+    def test_tick_risk_flag_and_rank(self):
+        """97원(100원까지 2.7%)인데 보통 하루 5% 움직이는 코인 → '경계위험', 경계왕래와 같은 급으로 내림. 60원은 아님"""
+        vals = ([-1.5] * 5 + [0.8] * 5) * 40
+        days = len(vals) * BAR / self.DAY
+        kw = self._kw()
+        risky = evaluate_coin("NILX", series(vals), BAR, days=days, tick_gap=2.7, daily_range=5.0, **kw)
+        far = evaluate_coin("FAR", series(vals), BAR, days=days, tick_gap=66.0, daily_range=5.0, **kw)
+        plain = evaluate_coin("PLAIN", series([0.0, 0.05] * 150), BAR, days=300 * BAR / self.DAY, **kw)
+        self.assertIn("경계위험", risky.flags)
+        self.assertNotIn("경계위험", far.flags)
+        self.assertGreater(risky.score, plain.score)
+        self.assertEqual([x.coin for x in rank([risky, far, plain])], ["FAR", "PLAIN", "NILX"])
+
+    def test_evaluate_all_wires_recent_funding_and_tick_risk(self):
+        """evaluate_all 이 종가·펀딩 기록에서 두 값을 계산해 넘긴다 (NIL 꼴: 97원 근처, 최근 펀딩 −0.04%/4h)"""
+        from kimp.screen import evaluate_all
+        n = 30 * 24 * 4            # 30일 15분봉
+        up, by, us = {}, {}, {}
+        for i in range(n):
+            ts = i * 900_000
+            swing = 0.03 * (1 if (i // 4) % 2 else -1)           # 하루 안에 ±3% 왕복 → 하루 변동폭 ≈ 6%
+            up[ts] = 97.0 * (1 + swing)
+            by[ts] = 0.0727
+            us[ts] = 1334.0
+        funding = [(t * 4 * 3_600_000, 0.00005) for t in range(27 * 6)] + \
+                  [(27 * self.DAY + t * 4 * 3_600_000, -0.0004) for t in range(18)]
+        scores = evaluate_all({"NILX": (up, by, funding)}, us, "15m", days=30.0, resolved={"NILX": 0.1},
+                              usdt_spread=0.075, fixed=0.4, target=1.0, stop=-5.0, live={"NILX": CoinLive()},
+                              size=1000, cycle_hours=24.0, min_funding_8h=-0.05)
+        [s] = scores
+        self.assertAlmostEqual(s.funding_recent_8h, -0.08, places=3)
+        self.assertTrue(s.funding_blocked)
+        self.assertIsNotNone(s.daily_range_percent)
+        self.assertGreater(s.daily_range_percent, 5.0)
+        self.assertLess(s.tick_gap_percent, s.daily_range_percent)   # 마지막 가격 ≈ 100원 아래 → 경계위험
+        self.assertTrue(s.tick_risk)
