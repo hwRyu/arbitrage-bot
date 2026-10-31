@@ -799,7 +799,8 @@ class HedgeBroker:
 
     def _balance_hedge(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
         """
-        양쪽 크기 맞추기 (진입 직후): 숏 금액이 코인 금액과 HEDGE_TOLERANCE_PERCENT(1%) 넘게 다르면 큰 쪽을 줄인다
+        양쪽 크기 맞추기 (진입 직후): 숏 금액이 코인 금액과 HEDGE_TOLERANCE_PERCENT(1%) 넘게 다르면 큰 쪽을 줄인다.
+        단, 바이비트 주문 단위의 절반 이하 차이와 업비트 최소 주문 미만의 되팔기는 고칠 수 없으므로 [크기 차이] 로 기록만 (2026-10-31)
 
         **금액**으로 비교한다 (금액 헷징): 숏 목표 개수 = 코인 금액(원) ÷ USDT 판 가격 ÷ 숏 평균가 = 코인 개수 × (1 + 진입 김프).
         숏이 이 개수면 손익 = 금액 × 김프 변화 라 코인 가격이 어디로 가든 손익이 0 이다.
@@ -820,19 +821,30 @@ class HedgeBroker:
             return
         target_short = coin_qty * b.avg / usdt_krw / o.avg       # 코인 금액을 숏 개수로
         diff = short_qty - target_short
-        if abs(diff) <= target_short * self.hedge_tolerance_percent / 100:
+        # 허용치: HEDGE_TOLERANCE_PERCENT 또는 바이비트 주문 단위의 절반 중 큰 쪽. 숏은 가장 가까운 단위로 열므로
+        # 반 단위 이하 차이는 애초에 고칠 수 없는 '단위 차이' 다 (2026-10-31, BEAM 100개 단위 × 20 USDT = 2.7% 가 매번 경고 나던 것)
+        step = self._qty_step(pos.coin)
+        if abs(diff) <= max(target_short * self.hedge_tolerance_percent / 100, step / 2 * (1 + 1e-6)):
             return
-        logger.warning("[크기 맞추기] #%d %s | 코인 %g개 (숏 %g개 어치) / 숏 %g개 (차이 %.2f%%) | 큰 쪽을 줄입니다",
-                       pos.id, pos.coin, coin_qty, target_short, short_qty, abs(diff) / target_short * 100)
+        pct = abs(diff) / target_short * 100
+        text = f"#{pos.id} {pos.coin} | 코인 {coin_qty:g}개 (숏 {target_short:g}개 어치) / 숏 {short_qty:g}개 (차이 {pct:.2f}%)"
         try:
             if diff > 0:
+                if step and diff < step:
+                    logger.info("[크기 차이] %s | 숏이 많지만 바이비트 주문 단위(%g개) 미만이라 그대로 둡니다", text, step)
+                    return
+                logger.warning("[크기 맞추기] %s | 남는 숏을 닫습니다", text)
                 self._leg(session, pos, "trim_short", lambda cid: self.ex.close_short(
                     session, quote, pos.coin, diff, o.avg, diff * o.avg / self.leverage, client_id=cid))
             else:
                 qty = -diff * o.avg * usdt_krw / b.avg            # 모자란 숏 금액만큼의 코인 개수
                 coin_bid = quote.upbit.best_bid if quote else None
                 if coin_bid is None or qty * coin_bid < self.ex.min_order_krw(pos.coin):
-                    return  # 업비트 최소 주문보다 작아서 못 팖 (그대로 둠) / 시세가 없어 금액을 모름
+                    # 업비트 최소 주문보다 작아서 못 팖 / 시세가 없어 금액을 모름 → 그대로 둔다 (가드 아님, 기록)
+                    logger.info("[크기 차이] %s | 숏이 적지만 되팔 코인 %g개(%s원)가 업비트 최소 주문 미만이라 그대로 둡니다",
+                                text, qty, f"{qty * coin_bid:,.0f}" if coin_bid else "?")
+                    return
+                logger.warning("[크기 맞추기] %s | 남는 코인을 팝니다", text)
                 self._leg(session, pos, "trim_coin",
                           lambda cid: self.ex.sell_coin(session, quote, pos.coin, qty, client_id=cid))
         except OrderUnknown:
@@ -841,6 +853,14 @@ class HedgeBroker:
             self.safety.record_failure(f"{pos.coin} 크기 맞추기: {exc}")
             logger.critical("[크기 맞추기 실패] #%d %s | 코인 %g개 / 숏 %g개 그대로 OPEN | %s", pos.id, pos.coin,
                             coin_qty, short_qty, exc)
+
+    def _qty_step(self, coin: str) -> float:
+        """실행기가 아는 바이비트 주문 단위 (LiveExecutor.qty_step). 페이퍼·시뮬레이션은 연속이라 0"""
+        fn = getattr(self.ex, "qty_step", None)
+        try:
+            return float(fn(coin)) if fn else 0.0
+        except Exception:
+            return 0.0
 
     def _return_leftover_krw(self, session: Session, pos: Position, quote: Optional[Quote]) -> None:
         """

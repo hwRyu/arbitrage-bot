@@ -7,6 +7,7 @@ ccxt 를 흉내 내는 가짜 업비트·바이비트를 만들어 LiveExecutor 
 import logging
 import os
 import tempfile
+import math
 import unittest
 from datetime import timedelta
 
@@ -96,15 +97,22 @@ class FakeExchange:
         o = self.orders[oid]
         o["status"], o["remaining"] = "canceled", 0.0
 
+    step = 0.0   # 주문 개수 단위 (0 = 연속). LotStepTest 가 100 으로 바꿔 BEAM 처럼 만든다
+
     def market(self, symbol):
-        return {"id": symbol.replace("/", "").split(":")[0], "symbol": symbol}
+        m = {"id": symbol.replace("/", "").split(":")[0], "symbol": symbol}
+        if self.step:
+            m["precision"] = {"amount": self.step}
+        return m
 
     @staticmethod
     def parse_order(raw, market=None):
         return raw
 
-    @staticmethod
-    def amount_to_precision(symbol, amount):
+    def amount_to_precision(self, symbol, amount):
+        """ccxt 처럼 내림 (단위가 있으면 단위로, 없으면 소수 8자리)"""
+        if self.step:
+            return f"{math.floor(amount / self.step + 1e-9) * self.step:.8f}"
         return f"{amount:.8f}"
 
     def fetch_order(self, oid, symbol, params=None):
@@ -1471,3 +1479,59 @@ class PolicyRejectTest(unittest.TestCase):
             broker.ensure_initial_balances(session, 0.0, 0.5)
             broker.transfer(session, 500.0, 0.0, reason="테스트")
             self.assertEqual(broker.safety.failures, 1)
+
+
+class LotStepTest(unittest.TestCase):
+    """바이비트 주문 단위가 큰 코인 (BEAM 100개 단위, 2026-10-31): 숏은 가장 가까운 단위로, 반 단위 이하 차이는 기록만"""
+
+    def _beam_like(self):
+        """XRP 가짜 거래소를 BEAM 처럼: 가격 1/400 (바이비트 0.005, 업비트 7원) 에 주문 단위 100개"""
+        prices, up, by, broker, sf = make_live()
+        prices.perp_bid, prices.perp_ask = 0.005, 0.0050001
+        prices.coin_bid, prices.coin_ask = 6.99, 7.0
+        by.step = 100.0
+        return prices, up, by, broker, sf
+
+    def test_short_rounds_to_nearest_lot(self):
+        """코인 3,990개(≈20 USDT) → 금액에 맞는 숏 ≈3,993개 → 숏 4,000개 (내림이면 3,900). 차이 0.2% 는 허용치 안이라 맞추기 없음"""
+        prices, up, by, broker, sf = self._beam_like()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 3990.0)
+            wanted = value_short(pos)
+            self.assertAlmostEqual(by.short, round(wanted / 100) * 100)
+            self.assertLessEqual(abs(by.short - wanted), 50 + 1e-6)         # 반 단위 이하
+            self.assertEqual(by.calls.count("close_short"), 0)
+            self.assertEqual(up.calls.count("sell XRP/KRW"), 0)
+            self.assertAlmostEqual(pos.bybit_qty, by.short)
+
+    def test_half_lot_gap_is_recorded_not_fixed(self):
+        """차이가 1% 를 넘어도 반 단위 이하면(코인 4,152개 → 숏 ≈4,148개 어치 → 숏 4,100개, 차이 1.15%) 고칠 수 없는 단위 차이 → 조용히 둔다"""
+        prices, up, by, broker, sf = self._beam_like()
+        with sf() as s:
+            with self.assertNoLogs("kimp.broker", level="WARNING"):
+                pos = broker.open_hedge(s, prices.quote(), 4152.0)
+            wanted = value_short(pos)
+            self.assertGreater(abs(by.short - wanted) / wanted, 0.01)        # 금액 허용치(1%)는 넘었지만
+            self.assertLessEqual(abs(by.short - wanted), 50 + 1e-6)         # 반 단위 이하라
+            self.assertEqual(by.calls.count("close_short"), 0)              # 숏 닫기 없음
+            self.assertEqual(up.calls.count("sell XRP/KRW"), 0)             # 코인 되팔기 없음
+
+    def test_real_shortfall_is_still_fixed(self):
+        """숏이 진짜로 크게 모자라면(절반만 체결) 단위 차이가 아니라 부분 체결이므로 예전처럼 코인을 되판다 ([크기 맞추기])"""
+        prices, up, by, broker, sf = self._beam_like()
+        by.partial["open_short"] = 0.5
+        with sf() as s:
+            with self.assertLogs("kimp.broker", level="INFO") as logs:
+                pos = broker.open_hedge(s, prices.quote(), 4000.0)
+            joined = " | ".join(logs.output)
+            # 모자란 숏 ≈2,000개 어치 = 코인 ≈2,000개 × 7원 = 14,000원 > 최소 주문 5,000원 → 실제로 되판다
+            self.assertIn("[크기 맞추기]", joined)
+            self.assertEqual(up.calls.count("sell XRP/KRW"), 1)
+            self.assertAlmostEqual(by.short, value_short(pos), delta=50 + 1e-6)   # 되판 뒤 반 단위 안
+
+    def test_xrp_without_lot_info_behaves_as_before(self):
+        """주문 단위를 모르는 거래소(step 0)면 예전처럼 소수 8자리 내림, 허용치 1%"""
+        prices, up, by, broker, sf = make_live()
+        with sf() as s:
+            pos = broker.open_hedge(s, prices.quote(), 50.0)
+            self.assertAlmostEqual(by.short, value_short(pos), places=6)

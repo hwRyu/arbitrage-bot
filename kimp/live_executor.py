@@ -31,6 +31,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, Iterable, List, Optional
 
+from ccxt.base.decimal_to_precision import TICK_SIZE
+
 from sqlalchemy.orm import Session
 
 from kimp.config import Settings
@@ -488,17 +490,42 @@ class LiveExecutor:
         """주문 단위로 내리니 0개 → 주문 안 냄 (브로커는 '더 할 게 없음' 으로 본다)"""
         return LegFill(qty=0.0, avg_price=0.0, cost=0.0, fee=0.0, order_id="")
 
+    def qty_step(self, coin: str) -> float:
+        """바이비트 주문 개수 단위 (예: BEAM 100개, XRP 0.1개). 모르면 0 (= 연속으로 본다)"""
+        try:
+            step = (self.by.market(bybit_symbol(coin)).get("precision") or {}).get("amount")
+            if not step:
+                return 0.0
+            # ccxt 바이비트는 TICK_SIZE 모드라 precision.amount 가 단위 그 자체. 다른 모드면 자릿수 → 단위로
+            return float(step) if getattr(self.by, "precisionMode", TICK_SIZE) == TICK_SIZE else 10 ** -float(step)
+        except Exception:
+            return 0.0
+
+    def _nearest_qty(self, coin: str, qty: float) -> float:
+        """
+        주문 개수를 **가장 가까운** 주문 단위로 (헷지 숏 열기용, 2026-10-31)
+
+        amount_to_precision 은 내림이라 숏이 늘 코인 금액보다 작았다 (BEAM 100개 단위 × 20 USDT 포지션 = 최대 2.7% 헷지 부족,
+        한쪽으로만). 반올림이면 ±반 단위라 노출이 절반이 되고 양쪽으로 고르다. 단위를 모르면 예전처럼 내림
+        """
+        sym = bybit_symbol(coin)
+        step = self.qty_step(coin)
+        if step > 0:
+            qty = round(qty / step) * step
+            qty *= 1 + 1e-9   # 부동소수 오차로 내림이 한 단위를 깎지 않게 아주 살짝 올려서 자른다
+        return float(self.by.amount_to_precision(sym, qty))
+
     def open_short(self, session: Session, quote: Quote, coin: str, qty: float, client_id: str = "") -> LegFill:
         """
         바이비트 USDT 무기한 시장가 숏 열기 (개수 지정)
 
         positionIdx 0 = 단방향(one-way) 모드. setup() 에서 맞춰 둔다 — 양방향 모드면
         롱·숏이 따로 잡혀서 reduceOnly 로 닫는 흐름이 깨진다.
-        amount_to_precision 으로 거래소 주문 단위에 맞추고, 그래서 0 이 되면 주문을 안 낸다.
+        개수는 가장 가까운 주문 단위로 맞추고(_nearest_qty), 그래서 0 이 되면 주문을 안 낸다.
         """
         sym = bybit_symbol(coin)
         cid = client_id or new_client_id()
-        amount = float(self.by.amount_to_precision(sym, qty))
+        amount = self._nearest_qty(coin, qty)
         if amount <= 0:
             return self._nothing()
         return self._order(self.by, sym, f"바이비트 {coin} 숏 열기", lambda: self.by.create_order(
