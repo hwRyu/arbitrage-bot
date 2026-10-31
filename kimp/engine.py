@@ -142,6 +142,8 @@ class Engine:
         # 경계 위 모드 (docs/issues.md #6): 지금 모드인 포지션 id (전환 로그용), 코인별 보통 하루 변동폭 (시각, %)
         self._zone_positions: set = set()
         self._daily_range: Dict[str, Tuple[float, Optional[float]]] = {}
+        self._range_thread: Optional[threading.Thread] = None       # 하루 변동폭 REST 를 받는 별도 스레드 (한 번에 하나)
+        self._range_result: Optional[Tuple[str, Optional[float], Optional[str]]] = None   # (코인, 값, 오류 문구)
         # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
         self._bybit_range = RangeTracker()
         self._last_status_log = 0.0
@@ -238,7 +240,8 @@ class Engine:
     # 실행
     # ------------------------------------------------------------------
     def startup(self) -> None:
-        """시작할 때: 페이퍼 시작 자본 나눠 넣기 + 이전 포지션 안내 + 자본 비율 확인"""
+        """시작할 때: 페이퍼 시작 자본 나눠 넣기 + 이전 포지션 안내 + 자본 비율 확인 + 하루 변동폭 선조회"""
+        self._refresh_daily_ranges(force=True)   # 경계 위 모드 예방 가드용 — 판단 경로 밖에서 미리 받아 둔다 (세션 불필요)
         with self.session_factory() as session:
             self.broker.ensure_initial_balances(session, self.s.paper_initial_total_usdt, self.s.upbit_target_share())
             logger.info("잔고: 업비트 USDT %s + 원화 %s원 (버퍼, %g포지션분 유지) / 바이비트 USDT %s (증거금 제외)",
@@ -273,7 +276,6 @@ class Engine:
         """
         self.startup()
         feed = getattr(self.market, "feed", None)
-        self._refresh_daily_ranges(force=True)   # 경계 위 모드 예방 가드용 하루 변동폭 — 판단 경로 밖에서 미리 받아 둔다
         logger.info("엔진 시작: 코인 %s, %s", ", ".join(self.coins),
                     f"호가가 바뀌면 즉시 판단 (최소 {EVENT_STEP_MIN_GAP_SEC:g}초 간격), 계좌 조회 {self.s.scan_interval_sec:g}초마다"
                     if feed is not None else f"{self.s.scan_interval_sec:.1f}초마다 스캔")
@@ -1277,28 +1279,59 @@ class Engine:
         """
         하루 변동폭 캐시 갱신 (경계 위 모드 예방 가드용, 2026-10-31)
 
-        기동 때(force)는 전 코인을 받고, 그 뒤로는 계좌 갱신 주기(2초)마다 DAILY_RANGE_REFRESH_SEC 가 지난 코인 **하나만** 받는다.
-        바이비트 일봉 REST 가 1건 100~150ms 라, 처음엔 진입 판단 도중에 불렀더니 여러 코인이 같은 스캔에서 만료될 때 스캔이
-        1초를 넘겼다 (10-31 15시대 최대 1.9초). 판단 경로는 캐시만 읽는다
+        기동 때(force)는 전 코인을 그 자리에서 받고, 그 뒤로는 계좌 갱신 주기(2초)마다 DAILY_RANGE_REFRESH_SEC 가 지난 코인
+        **하나를 별도 스레드**로 받는다. 처음엔 진입 판단 도중에 같은 스레드로 불렀더니 (1건 100~150ms, 거래소가 느리면 10초)
+        스캔이 1.9초, 바이비트 지연 때는 23.8초까지 막혔다 (10-31 15~18시). 판단 경로는 캐시만 읽는다
         """
         fn = getattr(self.market, "daily_range_percent", None)
         if fn is None or not self.s.tick_zone_enabled:
             return
         now = self._clock()
-        stale = [c for c in self.coins
-                 if force or c not in self._daily_range or now - self._daily_range[c][0] >= DAILY_RANGE_REFRESH_SEC]
-        for coin in (stale if force else stale[:1]):
-            value: Optional[float] = None
+        days = self.s.tick_zone_range_days
+
+        def fetch(coin: str) -> Tuple[str, Optional[float], Optional[str]]:
             try:
-                value = fn(coin, self.s.tick_zone_range_days)
-            except Exception as exc:
-                self._log_throttled(f"daily-range-{coin}", logging.WARNING,
-                                    f"{coin} 하루 변동폭 조회 실패 (경계 위 모드 예방 가드 없이 판단): {exc}", cooldown_sec=1800.0)
-            self._daily_range[coin] = (now, value)
-        if force and stale:
-            got = {c: self._daily_range[c][1] for c in stale}
+                return coin, fn(coin, days), None
+            except Exception as exc:          # noqa: BLE001 — 조회 실패는 가드 없이 판단 (기회를 버리지 않는다)
+                return coin, None, str(exc)
+
+        if force:
+            # 기동 때: 전 코인을 그 자리에서 받는다 (판단 전이라 막혀도 된다)
+            got = {}
+            for coin in self.coins:
+                _, value, err = fetch(coin)
+                if err:
+                    logger.warning("%s 하루 변동폭 조회 실패 (경계 위 모드 예방 가드 없이 판단): %s", coin, err)
+                self._daily_range[coin] = (now, value)
+                got[coin] = value
             logger.info("하루 변동폭(경계 위 모드 예방 가드): %s",
                         ", ".join(f"{c} {v:.1f}%" if v is not None else f"{c} ?" for c, v in got.items()))
+            return
+
+        # 운영 중: 별도 스레드에서 한 코인씩. 거래소가 느려 REST 가 10초(ccxt 기본 타임아웃) 막혀도 판단 루프는 멈추지 않는다
+        # (10-31 18:00:59 스캔 23.8초 — 바이비트 지연 중 일봉 조회 2건이 판단 경로에서 막힌 것)
+        if self._range_thread is not None:
+            if self._range_thread.is_alive():
+                return
+            self._range_thread = None
+            if self._range_result is not None:
+                coin, value, err = self._range_result
+                self._range_result = None
+                if err:
+                    self._log_throttled(f"daily-range-{coin}", logging.WARNING,
+                                        f"{coin} 하루 변동폭 조회 실패 (경계 위 모드 예방 가드 없이 판단): {err}", cooldown_sec=1800.0)
+                self._daily_range[coin] = (now, value)
+        stale = [c for c in self.coins
+                 if c not in self._daily_range or now - self._daily_range[c][0] >= DAILY_RANGE_REFRESH_SEC]
+        if not stale:
+            return
+        coin = stale[0]
+
+        def run() -> None:
+            self._range_result = fetch(coin)
+
+        self._range_thread = threading.Thread(target=run, name=f"daily-range-{coin}", daemon=True)
+        self._range_thread.start()
 
     def _gate(self, filters: dict, key, x: float, price: Optional[float], signal_on: bool) -> Optional[FilterState]:
         """

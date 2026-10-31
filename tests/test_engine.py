@@ -1142,6 +1142,18 @@ class TickZoneTest(unittest.TestCase):
         self._enter(engine, market, 0.6857)                                   # ≈ 960원
         self.assertEqual(len(self._positions(sf)), 1)
 
+    def test_periodic_refresh_runs_in_background_thread(self):
+        """운영 중 갱신은 별도 스레드: 만료된 코인 하나를 받아 다음 호출에서 캐시에 넣는다 (판단 루프는 REST 를 기다리지 않는다)"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, daily_ranges={"XRP": 5.0})
+        engine._daily_range["XRP"] = (engine._clock() - 4000, 5.0)      # 1시간 넘게 지난 캐시
+        market.daily_ranges = {"XRP": 2.0}
+        engine._refresh_daily_ranges()                                  # 스레드 시작 (아직 캐시는 옛 값)
+        self.assertEqual(engine._daily_range["XRP"][1], 5.0)
+        engine._range_thread.join(timeout=5)
+        engine._refresh_daily_ranges()                                  # 결과 수거
+        self.assertEqual(engine._daily_range["XRP"][1], 2.0)
+        self.assertIsNone(engine._range_thread)
+
     def test_entry_not_blocked_without_range_data(self):
         """변동폭을 못 받으면(None) 막지 않는다"""
         engine, sf, broker, market = self._engine(funding_rate=0.0001)
