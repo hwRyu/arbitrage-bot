@@ -466,3 +466,19 @@ class RecentFundingAndTickRiskTest(unittest.TestCase):
         self.assertGreater(s.daily_range_percent, 5.0)
         self.assertLess(s.tick_gap_percent, s.daily_range_percent)   # 마지막 가격 ≈ 100원 아래 → 경계위험
         self.assertTrue(s.tick_risk)
+
+
+class TickTooWideTest(unittest.TestCase):
+    def test_tick_at_or_above_target_is_excluded(self):
+        """한 칸 0.32% ≥ 목표 0.2% (312원 코인) → '칸큼', 가드차단 급으로 내리고 추천 제외. 한 칸 0.14% 는 통과"""
+        vals = ([-1.5] * 5 + [0.8] * 5) * 40
+        days = len(vals) * BAR / 86_400_000
+        kw = dict(spread_percent=0.3, usdt_spread_percent=0.075, fixed_cost_percent=0.4, target=0.2, stop=-5.0,
+                  funding=[], live=CoinLive(), size_usdt=1000)
+        wide = evaluate_coin("PONSX", series(vals), BAR, days=days, tick_now=0.32, **kw)
+        ok = evaluate_coin("OK", series(vals), BAR, days=days, tick_now=0.14, **kw)
+        self.assertIn("칸큼", wide.flags)
+        self.assertNotIn("칸큼", ok.flags)
+        self.assertEqual([x.coin for x in rank([wide, ok])], ["OK", "PONSX"])
+        self.assertNotIn("PONSX", env_snippet(rank([wide, ok]), 2))
+        self.assertIn("OK", env_snippet(rank([wide, ok]), 2))
