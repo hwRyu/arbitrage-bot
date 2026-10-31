@@ -2003,8 +2003,11 @@ function dashTables(d) {
 
 $("dbGo").onclick = loadDash;
 $("dbSrc").onchange = () => { $("dbFrom").value = ""; $("dbTo").value = ""; loadDash(); };
-$("dbFrom").onchange = loadDash;
-$("dbTo").onchange = loadDash;
+// 날짜는 '조회' 버튼(또는 Enter)으로만 조회한다 (2026-10-31). 바꾸는 즉시 조회하면 시작만 바꾼 중간 상태(종료는 옛 값)로
+// 그려져 고르지 않은 기간이 잠깐 보인다 — 사용자가 본 '조회 기간에 없는 날짜' 가 그것
+for (const id of ["dbFrom", "dbTo"]) {
+  $(id).onkeydown = (e) => { if (e.key === "Enter") loadDash(); };
+}
 
 // 코인 목록은 조회가 몇 초 걸려서 설정이 뜬 뒤에 따로 채운다
 async function loadUniverse() {
