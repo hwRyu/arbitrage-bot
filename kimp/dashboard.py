@@ -63,6 +63,7 @@ class Trade:
     funding_usdt: float
     cost_usdt: float
     notional_usdt: Optional[float]  # 포지션 금액 (= 업비트에서 판 USDT)
+    remark: Optional[str] = None    # 사람이 적은 메모 (봇 포지션만, 2026-11-01)
 
     @property
     def hold_hours(self) -> Optional[float]:
@@ -81,7 +82,7 @@ class Trade:
             "entry_premium": self.entry_premium, "exit_premium": self.exit_premium,
             "exit_reason": self.exit_reason, "net_usdt": self.net_usdt, "net_percent": self.net_percent,
             "funding_usdt": self.funding_usdt, "cost_usdt": self.cost_usdt, "gross_usdt": self.gross_usdt,
-            "notional_usdt": self.notional_usdt, "hold_hours": self.hold_hours,
+            "notional_usdt": self.notional_usdt, "hold_hours": self.hold_hours, "remark": self.remark,
         }
 
 
@@ -114,7 +115,7 @@ def _from_position(p: Position) -> Trade:
         entry_premium=p.entry_premium, exit_premium=p.exit_premium, exit_reason=p.exit_reason,
         net_usdt=p.net_pnl_usdt or 0.0, net_percent=p.net_pnl_percent,
         funding_usdt=p.funding_usdt or 0.0, cost_usdt=p.total_cost_usdt or 0.0,
-        notional_usdt=p.usdt_sold,
+        notional_usdt=p.usdt_sold, remark=p.remark,
     )
 
 
@@ -278,6 +279,26 @@ def load_transfers(settings: Settings, source: str, start_ms: int, end_ms: int) 
 # ======================================================================
 # 집계
 # ======================================================================
+def set_remark(settings: Settings, source: str, position_id: int, text: str) -> Dict[str, Any]:
+    """
+    포지션 메모 저장 (웹 대시보드 '거래 이력' 에서). 봇 기록(live / dry_run / paper)만, 시뮬레이션은 없다
+
+    빈 문자열이면 지운다. 300자 넘으면 자른다
+    """
+    source = source or default_source(settings)
+    path = None if source.startswith("sim:") else _mode_db(settings, source)
+    if not path or not os.path.exists(path):
+        return {"error": "시뮬레이션 결과나 없는 기록에는 메모를 적을 수 없습니다"}
+    sf = make_session_factory(path)
+    with sf() as s:
+        p = s.get(Position, int(position_id))
+        if p is None:
+            return {"error": f"포지션 #{position_id} 이 없습니다"}
+        p.remark = (text or "").strip()[:300] or None
+        s.commit()
+        return {"ok": True, "id": p.id, "remark": p.remark}
+
+
 def in_range(trades: Sequence[Trade], start_ms: int, end_ms: int) -> List[Trade]:
     """청산 시각이 기간 안에 있는 거래만"""
     return [t for t in trades if t.closed_ms is not None and start_ms <= t.closed_ms <= end_ms]

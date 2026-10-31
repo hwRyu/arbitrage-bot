@@ -130,6 +130,8 @@ class Position(Base):
     max_net_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     min_net_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 보유 중 순손익 최저
     min_net_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 사람이 적는 메모 (2026-11-01): "테스트 대상 변경으로 강제 청산" 처럼 손익표에서 전략 손실과 운영상 정리를 구분하려고. 웹 대시보드에서 적는다
+    remark: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
     run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 어느 실행(runs.id)에서 잡았나
     margin_added_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)  # 강제청산 가드가 더 넣은 증거금 누적 (bybit_margin_usdt 에 포함)
 

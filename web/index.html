@@ -1713,6 +1713,21 @@ async function loadDash() {
   }
 }
 
+const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+async function editRemark(id, current) {
+  // 거래 이력 메모: 손익표에서 '전략 손실' 과 '운영상 정리(테스트 대상 변경 등)' 를 구분하려고 사람이 적는다
+  const text = prompt(`#${id} 메모 (비우면 지움)`, current || "");
+  if (text === null) return;
+  const src = $("dbSrc").value ? "&source=" + encodeURIComponent($("dbSrc").value) : "";
+  try {
+    await api(`/api/remark?id=${id}&text=${encodeURIComponent(text)}${src}`);
+    loadDash();
+  } catch (e) {
+    alert("메모 저장 실패: " + e.message);
+  }
+}
+
 function dashSources(d) {
   const sel = $("dbSrc");
   sel.innerHTML = d.sources.map((s) => {
@@ -1985,6 +2000,8 @@ function dashTables(d) {
     { t: "비용", tip: TIP.dbCost, v: (r) => fmt(r.cost_usdt, 3) },
     { t: "순손익", tip: TIP.netPnl, v: (r) => sign(r.net_usdt, 3), cls: (r) => cls(r.net_usdt) },
     { t: "손익률", v: (r) => sign(r.net_percent) + "%", cls: (r) => cls(r.net_percent) },
+    { t: "메모", tip: "클릭해서 적는다. 예) 테스트 대상 변경으로 강제 청산 — 전략 손실과 운영상 정리를 구분하려고 (시뮬레이션 결과에는 못 적음)",
+      v: (r) => `<span class="remark" style="cursor:pointer" title="클릭해서 메모" onclick="editRemark(${r.id}, ${JSON.stringify(r.remark || "")})">${r.remark ? esc(r.remark) : "<span class=muted>✎</span>"}</span>` },
   ], d.trades);
 
   if (!d.transfers.length) $("dbTransfers").innerHTML = `<tr><td class="muted">이 기간에 송금 기록이 없습니다</td></tr>`;

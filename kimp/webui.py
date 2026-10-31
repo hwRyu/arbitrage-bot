@@ -866,6 +866,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(start_job(kind, {k: v[0] for k, v in query.items()}))
             elif url.path == "/api/stop":
                 self._json(stop_job(int((query.get("id") or ["0"])[0])))
+            elif url.path == "/api/remark":
+                # 거래 이력 메모 저장 (대시보드에서 클릭해 적는다). 빈 text 면 지움
+                from kimp.dashboard import set_remark
+                self._json(set_remark(self.settings, (query.get("source") or [""])[0],
+                                      int((query.get("id") or ["0"])[0]), (query.get("text") or [""])[0]))
             elif url.path == "/api/sim":
                 self._json(sim_trades(self.settings, int((query.get("id") or ["0"])[0])))
             else:
