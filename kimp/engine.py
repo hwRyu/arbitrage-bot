@@ -40,7 +40,7 @@ from kimp.fok_sizing import EntryFit, fit_entry
 from kimp.fok_trace import classify_miss
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium
-from kimp.premium import Quote, near_tick_boundary, upbit_krw_tick
+from kimp.premium import Quote, near_tick_boundary, next_tick_boundary, upbit_krw_tick
 from kimp.signal_filter import FilterParams, FilterState, SignalFilter
 from kimp.volatility import RangeTracker
 from kimp import telemetry
@@ -71,8 +71,9 @@ MIN_TOPUP_USDT = 0.5
 EXIT_LABEL = {
     ExitReason.TAKE_PROFIT: "익절", ExitReason.STOP_LOSS: "손절", ExitReason.LIQUIDATION: "강제청산",
     ExitReason.TIMEOUT: "시간 초과", ExitReason.MANUAL: "수동", ExitReason.FUNDING_COST: "펀딩비 한도",
-    ExitReason.LIQ_GUARD: "강제청산 회피",
+    ExitReason.LIQ_GUARD: "강제청산 회피", ExitReason.TICK_ZONE_EXIT: "경계 위 청산",
 }
+DAILY_RANGE_REFRESH_SEC = 3600.0   # 경계 위 모드 예방 가드의 '보통 하루 변동폭' 갱신 간격
 
 
 def _as_utc(dt):
@@ -138,6 +139,9 @@ class Engine:
                                            z_spike=settings.signal_filter_z_spike)
         self._entry_filters: Dict[str, SignalFilter] = {}
         self._tp_filters: Dict[int, SignalFilter] = {}
+        # 경계 위 모드 (docs/issues.md #6): 지금 모드인 포지션 id (전환 로그용), 코인별 보통 하루 변동폭 (시각, %)
+        self._zone_positions: set = set()
+        self._daily_range: Dict[str, Tuple[float, Optional[float]]] = {}
         # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
         self._bybit_range = RangeTracker()
         self._last_status_log = 0.0
@@ -370,13 +374,16 @@ class Engine:
 
         # 목표 / 손절은 진입할 때 포지션에 저장한 값 (들고 있는 중에 .env 를 바꿔도 처음 값으로)
         target, stop = self._exit_rules(pos)
-        # 신호 신뢰도 (docs/filter.md): 순손익 시계열에 '목표 이상' 이 켜진 순간부터 되돌림 없이 유지되는지를 점수로
-        gate = self._gate(self._tp_filters, pos.id, pnl.net_percent, quote.upbit.best_bid, pnl.net_percent >= target)
+        # 경계 위 모드 (docs/issues.md #6): 호가 한 칸 % ≥ 목표 % 인 구간에 갇히면 목표 대신 본전·최소 손해 기준으로 나온다
+        zone = self._tick_zone(pos, quote, pnl, target)
+        exit_target = zone[0] if zone else target
+        # 신호 신뢰도 (docs/filter.md): 순손익 시계열에 '기준 이상' 이 켜진 순간부터 되돌림 없이 유지되는지를 점수로
+        gate = self._gate(self._tp_filters, pos.id, pnl.net_percent, quote.upbit.best_bid, pnl.net_percent >= exit_target)
         # 익절 기준은 목표 그대로다. 업비트 코인 매도가 판단가 지정가 FOK 라 판단보다 나쁘게 팔리지 않으므로
         # 밀림 여유를 목표에 얹지 않는다 (2026-10-29 유동 여유 제거, docs/issues.md #3)
         reason: Optional[str] = None
-        if pnl.net_percent >= target:
-            reason = ExitReason.TAKE_PROFIT
+        if pnl.net_percent >= exit_target:
+            reason = ExitReason.TICK_ZONE_EXIT if zone else ExitReason.TAKE_PROFIT
         elif stop < 0 and pnl.net_percent <= stop:
             reason = ExitReason.STOP_LOSS
         elif self.s.max_funding_cost_percent:
@@ -387,29 +394,33 @@ class Engine:
                 logger.warning("[펀딩비 한도] #%d %s | 펀딩비 지출 %.3f%% (한도 %.2f%%) | 순손익 지금 %+.2f%% | 정리합니다",
                                pos.id, pos.coin, cost, self.s.max_funding_cost_percent, pnl.net_percent)
                 reason = ExitReason.FUNDING_COST
-        if reason == ExitReason.TAKE_PROFIT and self._clock() < self._tp_retry_at.get(pos.id, 0.0):
+        # 익절과 경계 위 청산은 같은 길(지정가 FOK, 신호 필터, 확인 시세, 마지막 줄 안전 확인)로 간다. 기준값·이름만 다르다
+        tp_like = reason in (ExitReason.TAKE_PROFIT, ExitReason.TICK_ZONE_EXIT)
+        label = "익절" if reason == ExitReason.TAKE_PROFIT else "경계 위 청산"
+        basis = f"목표 {target:.2f}%" if not zone else f"경계 위 기준 {exit_target:+.3f}%"
+        if tp_like and self._clock() < self._tp_retry_at.get(pos.id, 0.0):
             reason = None   # 방금 익절 지정가가 놓침 → FOK_RETRY_SEC 지나고 다시
-        if reason == ExitReason.TAKE_PROFIT and gate is not None and gate.score < self.s.signal_filter_cut:
-            # 목표를 막 넘은 신호 — 몇 초 유지되는지 보고 판다. 튐이면 곧 꺼지고, 진짜면 점수가 올라 다음 스캔에 판다
+        if reason is not None and tp_like and gate is not None and gate.score < self.s.signal_filter_cut:
+            # 기준을 막 넘은 신호 — 몇 초 유지되는지 보고 판다. 튐이면 곧 꺼지고, 진짜면 점수가 올라 다음 스캔에 판다
             self._log_throttled(
                 f"tp-gate-{pos.coin}", logging.INFO,
-                f"[익절 대기] #{pos.id} {pos.coin} | 순손익 {pnl.net_percent:+.3f}% ≥ 목표 {target:.2f}% 이지만 "
+                f"[{label} 대기] #{pos.id} {pos.coin} | 순손익 {pnl.net_percent:+.3f}% ≥ {basis} 이지만 "
                 f"{self._tp_filters[pos.id].describe(self._clock())} < 컷 {self.s.signal_filter_cut:.2f} | 유지되면 판다",
                 cooldown_sec=10.0)
-            telemetry.decision(session, pos.coin, "tp_filter_hold", pnl.net_percent, target, premium_depth=gate.score,
-                               position_id=pos.id, now=self._now_utc())
+            telemetry.decision(session, pos.coin, "tp_filter_hold", pnl.net_percent, exit_target, premium_depth=gate.score,
+                               position_id=pos.id, note=zone[1] if zone else "", now=self._now_utc())
             reason = None
-        if reason == ExitReason.TAKE_PROFIT:
+        if reason is not None and tp_like:
             # 익절만 확인 시세로 한 번 더 본다. 손절·펀딩비 한도는 늦출수록 위험하니 그대로 간다.
             fresh = self._fresh_quote(pos.coin)
             confirmed = self.broker.value_exit(pos, fresh) if fresh else None
-            if confirmed is None or confirmed.pnl.net_percent < target:
+            if confirmed is None or confirmed.pnl.net_percent < exit_target:
                 again = confirmed.pnl.net_percent if confirmed else None
                 self._log_throttled(
                     f"tp-confirm-{pos.coin}", logging.INFO,
-                    f"[익절 보류] #{pos.id} {pos.coin} | 스캔 시세 {pnl.net_percent:+.3f}% → 확인 시세 "
-                    f"{'없음' if again is None else f'{again:+.3f}%'} | 목표 {target:.2f}% | 한순간 값, 다음 스캔에 다시")
-                telemetry.decision(session, pos.coin, "tp_confirm_fail", pnl.net_percent, target,
+                    f"[{label} 보류] #{pos.id} {pos.coin} | 스캔 시세 {pnl.net_percent:+.3f}% → 확인 시세 "
+                    f"{'없음' if again is None else f'{again:+.3f}%'} | {basis} | 한순간 값, 다음 스캔에 다시")
+                telemetry.decision(session, pos.coin, "tp_confirm_fail", pnl.net_percent, exit_target,
                                    premium_depth=again, position_id=pos.id, now=self._now_utc())
                 reason = None
                 if confirmed is not None:
@@ -417,25 +428,26 @@ class Engine:
             else:
                 valuation, pnl = confirmed, confirmed.pnl       # 더 새 시세로 주문한다
                 # 안전 확인 (docs/issues.md #3 A): 익절 지정가는 우리 수량이 닿는 가장 싼 매수 호가 줄이다.
-                # 앞쪽 비싼 줄이 먼저 팔려 나가면 전부 그 가격에 팔릴 수 있으니, 그때도 목표를 넘을 때만 판다
+                # 앞쪽 비싼 줄이 먼저 팔려 나가면 전부 그 가격에 팔릴 수 있으니, 그때도 기준을 넘을 때만 판다
                 worst = self._worst_exit_percent(pos, confirmed)
-                if worst is not None and worst < target:
+                if worst is not None and worst < exit_target:
                     self._log_throttled(
                         f"tp-worst-{pos.coin}", logging.INFO,
-                        f"[익절 보류] #{pos.id} {pos.coin} | 평균 순손익 {pnl.net_percent:+.3f}% ≥ 목표 {target:.2f}% 이지만 "
+                        f"[{label} 보류] #{pos.id} {pos.coin} | 평균 순손익 {pnl.net_percent:+.3f}% ≥ {basis} 이지만 "
                         f"전부 마지막 매수 호가 줄({confirmed.plan.upbit.worst_price:g})에 팔면 {worst:+.3f}% | 다음 스캔에 다시")
-                    telemetry.decision(session, pos.coin, "tp_worst_fail", pnl.net_percent, target,
+                    telemetry.decision(session, pos.coin, "tp_worst_fail", pnl.net_percent, exit_target,
                                        premium_depth=worst, position_id=pos.id, now=self._now_utc())
                     reason = None
                 else:
                     worst_text = "?" if worst is None else f"{worst:+.3f}%"
                     vol = self._bybit_range.describe(pos.coin, self._clock())   # 변동성 기록 (docs/issues.md #5)
                     gate_text = self._tp_filters[pos.id].describe(self._clock()) if pos.id in self._tp_filters else ""
-                    logger.info("[익절 판단] #%d %s | 순손익 %+.3f%% ≥ 목표 %.2f%% (전부 마지막 줄 가격이면 %s) | %s | %s",
-                                pos.id, pos.coin, pnl.net_percent, target, worst_text, vol, gate_text)
-                    telemetry.decision(session, pos.coin, "tp_judge", pnl.net_percent, target,
-                                       premium_depth=worst, position_id=pos.id, note=f"{vol} | {gate_text}",
-                                       now=self._now_utc())
+                    zone_text = f" | {zone[1]}" if zone else ""
+                    logger.info("[%s 판단] #%d %s | 순손익 %+.3f%% ≥ %s (전부 마지막 줄 가격이면 %s) | %s | %s%s",
+                                label, pos.id, pos.coin, pnl.net_percent, basis, worst_text, vol, gate_text, zone_text)
+                    telemetry.decision(session, pos.coin, "tp_judge", pnl.net_percent, exit_target,
+                                       premium_depth=worst, position_id=pos.id,
+                                       note=f"{vol} | {gate_text}{zone_text}", now=self._now_utc())
 
         # 기록은 확인 시세 판정이 끝난 값으로 (가짜 꼭대기가 최고점·평가 기록에 남지 않게)
         pos.last_net_percent = pnl.net_percent
@@ -572,6 +584,7 @@ class Engine:
             return
         self._reentry_allowed_at[pos.coin] = self._clock() + self.s.reentry_cooldown_sec
         self._tp_filters.pop(pos.id, None)
+        self._zone_positions.discard(pos.id)
         if final is None:
             return  # 일부 단계 실패 → CLOSING 으로 남음, 다음 스캔에서 이어서 (broker.sync)
         level = logging.CRITICAL if liquidated else logging.INFO
@@ -988,6 +1001,14 @@ class Engine:
                 telemetry.decision(session, coin, "tick_edge_block", top, threshold,
                                    premium_depth=quote.upbit.best_ask, now=now_utc)
                 continue
+            # 경계 위 모드 예방 (docs/issues.md #6): 위쪽 경계까지 거리 < 보통 하루 변동폭이면 들고 있는 동안 넘을 위험이 크다
+            risk = self._tick_zone_entry_risk(coin, quote.upbit.best_ask or 0.0,
+                                              self.s.params_for(coin).target_net_profit_percent)
+            if risk is not None:
+                self._log_throttled(f"tick-zone-{coin}", logging.INFO, f"[진입 보류] {coin} | {risk}", cooldown_sec=600.0)
+                telemetry.decision(session, coin, "tick_zone_block", top, threshold,
+                                   premium_depth=quote.upbit.best_ask, note=risk, now=now_utc)
+                continue
             # 펀딩비 안전장치: 숏이 돈을 내는 쪽이 심하면 들어가지 않는다 (김프 조건을 통과한 코인만 확인)
             min_funding = self.s.entry_min_funding_8h_percent
             funding = None
@@ -1178,6 +1199,89 @@ class Engine:
             q.clear()
             return count
         return None
+
+    # ------------------------------------------------------------------
+    # 경계 위 모드 (docs/issues.md #6)
+    # ------------------------------------------------------------------
+    def _tick_zone(self, pos: Position, quote: Quote, pnl, target: float) -> Optional[Tuple[float, str]]:
+        """
+        이 포지션이 '경계 위 모드' 인가 — 그렇다면 (청산 기준 순손익 %, 설명)
+
+        모드 = 업비트 매수 호가(우리가 파는 가격) 기준 호가 한 칸 % ≥ 목표 %. 그 구간에서는 매수 호가에 파는 청산이 평균 반 칸
+        구조적으로 불리해 목표 익절이 사실상 불가능하므로 (NIL #41), 목표 대신:
+          - 펀딩비를 받는 중(비율 ≥ 0 또는 모름): 순손익 ≥ 0 — 기다릴수록 받으니 본전 이상이면 나온다
+          - 펀딩비를 내는 중(비율 < 0): 순손익(수수료 제외) ≥ −다음 정산 펀딩비 — 지금 나가는 손실이 한 번 더 들고 있는 비용보다
+            작으면 나온다. 수수료는 언제 나가든 내는 돈이라 비교에서 뺀다 (순손익에는 들어 있으므로 기준을 그만큼 내린다)
+        기준은 원래 목표보다 높아지지 않는다. 경계 아래로 돌아오면 None (원래 목표)
+        """
+        if not self.s.tick_zone_enabled or target <= 0:
+            return None
+        price = quote.upbit.best_bid
+        if not price:
+            return None
+        tick_pct = upbit_krw_tick(price) / price * 100
+        in_zone = tick_pct >= target
+        was = pos.id in self._zone_positions
+        if in_zone and not was:
+            self._zone_positions.add(pos.id)
+            logger.warning("[경계 위 모드] #%d %s 시작 | 업비트 매수 호가 %g원, 한 칸 %.2f%% ≥ 목표 %.2f%% | 목표 익절 대신 "
+                           "본전(받는 중)·최소 손해(내는 중) 기준으로 나온다", pos.id, pos.coin, price, tick_pct, target)
+        elif not in_zone and was:
+            self._zone_positions.discard(pos.id)
+            logger.info("[경계 위 모드] #%d %s 해제 | 업비트 매수 호가 %g원, 한 칸 %.2f%% < 목표 %.2f%% | 원래 목표로",
+                        pos.id, pos.coin, price, tick_pct, target)
+        if not in_zone:
+            return None
+        rate = pos.pending_funding_rate
+        if rate is None or rate >= 0:
+            exit_target = 0.0
+            mode = "펀딩비 받는 중" if rate else "펀딩비 모름·0"
+        else:
+            f_next = -rate * 100                                         # 다음 정산에 낼 펀딩비 (포지션 금액 대비 %)
+            fee_pct = pnl.total_cost_usdt / pnl.notional_usdt * 100 if pnl.notional_usdt else 0.0
+            exit_target = -(f_next + fee_pct)
+            mode = f"펀딩비 내는 중(다음 정산 {f_next:.3f}%, 수수료 {fee_pct:.2f}% 제외)"
+        exit_target = min(exit_target, target)
+        return exit_target, f"경계 위 모드({mode}, 한 칸 {tick_pct:.2f}% ≥ 목표 {target:.2f}%) → 기준 {exit_target:+.3f}%"
+
+    def _tick_zone_entry_risk(self, coin: str, ask: float, target: float) -> Optional[str]:
+        """
+        진입 전 예방: 위쪽 호가 단위 경계까지 거리 < 보통 하루 변동폭이면 이유 문구, 아니면 None
+
+        넘은 뒤 한 칸 % 가 목표보다 작은 경계(예: 1,000원 → 한 칸 1원 = 0.1%)는 위험이 아니므로 보지 않는다.
+        변동폭을 못 받았으면(None) 막지 않는다 — 데이터가 없다고 기회를 버리지는 않는다
+        """
+        if not self.s.tick_zone_enabled or ask <= 0 or target <= 0:
+            return None
+        upper = next_tick_boundary(ask)
+        if upper is None:
+            return None
+        tick_above = upbit_krw_tick(upper) / upper * 100
+        if tick_above < target:
+            return None
+        gap = (upper / ask - 1) * 100
+        rng = self._daily_range_percent(coin)
+        if rng is None or gap >= rng:
+            return None
+        return (f"위쪽 경계 {upper:g}원까지 {gap:.1f}% < 보통 하루 변동폭 {rng:.1f}% (넘으면 한 칸 {tick_above:.2f}% ≥ 목표 "
+                f"{target:.2f}%) | 들고 있는 동안 경계를 넘어 갇힐 위험 (issues #6)")
+
+    def _daily_range_percent(self, coin: str) -> Optional[float]:
+        """보통 하루 변동폭 (%, 시세 조회기가 주면). DAILY_RANGE_REFRESH_SEC 마다 갱신"""
+        now = self._clock()
+        cached = self._daily_range.get(coin)
+        if cached is not None and now - cached[0] < DAILY_RANGE_REFRESH_SEC:
+            return cached[1]
+        fn = getattr(self.market, "daily_range_percent", None)
+        value: Optional[float] = None
+        if fn is not None:
+            try:
+                value = fn(coin, self.s.tick_zone_range_days)
+            except Exception as exc:
+                self._log_throttled(f"daily-range-{coin}", logging.WARNING,
+                                    f"{coin} 하루 변동폭 조회 실패 (경계 위 모드 예방 가드 없이 판단): {exc}", cooldown_sec=1800.0)
+        self._daily_range[coin] = (now, value)
+        return value
 
     def _gate(self, filters: dict, key, x: float, price: Optional[float], signal_on: bool) -> Optional[FilterState]:
         """

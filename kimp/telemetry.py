@@ -185,6 +185,7 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
                        premium_depth = 수량 소진 김프, note = 점수)
         tp_filter_hold 순손익은 목표 이상인데 신뢰도 점수가 컷 미만이라 기다림 (premium_top = 순손익, threshold = 목표,
                        premium_depth = 점수)
+        tick_zone_block 위쪽 호가 단위 경계까지 거리가 보통 하루 변동폭보다 짧아 보류 (경계 위 모드 예방, issues #6. note 에 수치)
     """
     # 조건이 유지되는 동안 매 판단마다 같은 줄이 쌓이는 단계(near·spread_block …)는 코인·단계별로
     # REPEAT_COOLDOWN_SEC 에 한 번만 적는다. 소켓 시세로 0.25초마다 판단하면 그냥 두면 시간당 만 줄이 넘는다.
@@ -205,7 +206,7 @@ def decision(session: Session, coin: str, stage: str, premium_top: float, thresh
 
 # 반복 단계: 조건이 이어지는 동안 매 판단마다 나오는 것들 (코인·단계별로 REPEAT_COOLDOWN_SEC 에 한 번만 기록)
 REPEAT_STAGES = frozenset({"near", "spread_block", "funding_block", "size_reject", "depth_reject", "depth_fail",
-                           "no_slot", "balance_block", "filter_hold", "tp_filter_hold"})
+                           "no_slot", "balance_block", "filter_hold", "tp_filter_hold", "tick_zone_block"})
 REPEAT_COOLDOWN_SEC = 10.0
 _repeat_last: Dict[Tuple[str, str], float] = {}
 

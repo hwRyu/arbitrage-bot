@@ -9,7 +9,7 @@ import unittest
 from typing import Dict, List, Optional
 
 from kimp.config import CoinParams, FeeSettings, Settings
-from kimp.db import ExitReason, Fill, FundingEvent, Position, PositionStatus, PremiumSnapshot, make_session_factory
+from kimp.db import Decision, ExitReason, Fill, FundingEvent, Position, PositionStatus, PremiumSnapshot, make_session_factory
 from kimp.engine import Engine
 from kimp.fx import FxProvider
 from kimp.market_data import FundingInfo
@@ -76,6 +76,10 @@ class FakeMarket:
     def min_qty(self, coin: str) -> float:
         """최소 0.1개"""
         return 0.1
+
+    def daily_range_percent(self, coin: str, days: int = 7):
+        """보통 하루 변동폭 (%) — 테스트가 넣어둔 값, 없으면 None (경계 위 모드 예방 가드)"""
+        return getattr(self, "daily_ranges", {}).get(coin)
 
 
 def make_settings(**overrides) -> Settings:
@@ -1005,3 +1009,141 @@ class FundingGuardTest(unittest.TestCase):
             pos.funding_usdt = 5.0
             s.commit()
             self.assertEqual(engine._funding_cost_percent(pos), 0.0)
+
+
+class TickZoneTest(unittest.TestCase):
+    """
+    경계 위 모드 (docs/issues.md #6, 2026-10-31): 호가 한 칸 % ≥ 목표 % 인 구간에 갇히면 목표 대신 본전·최소 손해로 나온다.
+    가짜 시세의 USDT 1,400원 × 바이비트 가격 = 업비트 원화 가격. 목표 0.2%: 100~500원대(한 칸 1원 = 0.2~1%)가 모드 구간
+    """
+
+    def _engine(self, funding_rate=None, **overrides):
+        market = FakeMarket()
+        if funding_rate is not None:
+            market.funding = FundingInfo(rate=funding_rate, next_funding_ms=10 ** 14, mark_price=1.0, interval_hours=4.0)
+        engine, sf, broker = make_engine(make_settings(target_net_profit_percent=0.2, **overrides), market)
+        return engine, sf, broker, market
+
+    def _enter(self, engine, market, bybit_price):
+        market.quotes = {"XRP": make_quote(-1.0, bybit_price=bybit_price)}
+        engine.step()
+
+    def _net_at(self, broker, sf, premium, bybit_price):
+        with sf() as s:
+            p = s.query(Position).first()
+            return broker.value_exit(p, make_quote(premium, bybit_price=bybit_price)).pnl.net_percent
+
+    def _find_premium(self, broker, sf, bybit_price, lo, hi):
+        """순손익이 [lo, hi) 에 들어오는 김프 (가짜 시세로 훑어서)"""
+        for x in range(-300, 300):
+            pr = x / 100
+            net = self._net_at(broker, sf, pr, bybit_price)
+            if lo <= net < hi:
+                return pr
+        raise AssertionError("조건에 맞는 김프를 못 찾음")
+
+    def _positions(self, sf):
+        with sf() as s:
+            return s.query(Position).all()
+
+    def test_receiving_funding_exits_at_break_even(self):
+        """97원대에서 진입 → 106원대로 올라 모드 진입 (한 칸 0.94% ≥ 0.2%). 펀딩비 받는 중 → 순손익 ≥ 0 이면 TICK_ZONE_EXIT"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001)
+        self._enter(engine, market, 0.0693)                                  # ≈ 97원
+        [pos] = self._positions(sf)
+        self.assertEqual(pos.status, PositionStatus.OPEN)
+        up = 0.0757                                                           # ≈ 106원
+        below = self._find_premium(broker, sf, up, -0.3, -0.05)               # 본전 아래 → 유지
+        with self.assertLogs("kimp.engine", level="WARNING") as logs:
+            market.quotes = {"XRP": make_quote(below, bybit_price=up)}
+            engine.step()
+        self.assertTrue(any("[경계 위 모드] #%d XRP 시작" % pos.id in l for l in logs.output))
+        self.assertEqual(self._positions(sf)[0].status, PositionStatus.OPEN)
+        just = self._find_premium(broker, sf, up, 0.0, 0.15)                  # 본전 이상, 목표(0.2) 미만 → 모드 청산
+        market.quotes = {"XRP": make_quote(just, bybit_price=up)}
+        engine.step()
+        [pos] = self._positions(sf)
+        self.assertEqual(pos.exit_reason, ExitReason.TICK_ZONE_EXIT)
+        self.assertGreaterEqual(pos.net_pnl_percent, 0.0)
+        self.assertLess(pos.net_pnl_percent, 0.2)
+
+    def test_paying_funding_exits_when_loss_smaller_than_next_funding(self):
+        """펀딩비 내는 중(−0.1%/정산): 순손익(수수료 제외) ≥ −0.1% 이면 나오고, 그보다 손실이 크면 들고 있다"""
+        engine, sf, broker, market = self._engine(funding_rate=-0.001, entry_min_funding_8h_percent=None)   # 진입은 허용
+        self._enter(engine, market, 0.0693)
+        up = 0.0757
+        with sf() as s:
+            p = s.query(Position).first()
+            val = broker.value_exit(p, make_quote(0.0, bybit_price=up))
+            fee_pct = val.pnl.total_cost_usdt / val.pnl.notional_usdt * 100
+        threshold = -(0.1 + fee_pct)                                          # 순손익 기준 (수수료 몫만큼 아래)
+        deep = self._find_premium(broker, sf, up, threshold - 0.6, threshold - 0.2)
+        market.quotes = {"XRP": make_quote(deep, bybit_price=up)}
+        engine.step()
+        self.assertEqual(self._positions(sf)[0].status, PositionStatus.OPEN)   # 손실 > 펀딩비 → 들고 있다
+        ok = self._find_premium(broker, sf, up, threshold + 0.02, threshold + 0.12)
+        market.quotes = {"XRP": make_quote(ok, bybit_price=up)}
+        engine.step()
+        [pos] = self._positions(sf)
+        self.assertEqual(pos.exit_reason, ExitReason.TICK_ZONE_EXIT)
+        self.assertLess(pos.net_pnl_percent, 0.0)                             # 손해지만 최소 손해
+        self.assertGreaterEqual(pos.net_pnl_percent + fee_pct, -0.1 - 1e-6)
+
+    def test_outside_zone_keeps_normal_target(self):
+        """경계 아래(97원대, 한 칸 0.1%)에서는 본전이 돼도 팔지 않고 목표 0.2% 를 기다린다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001)
+        self._enter(engine, market, 0.0693)
+        just = self._find_premium(broker, sf, 0.0693, 0.0, 0.15)
+        market.quotes = {"XRP": make_quote(just, bybit_price=0.0693)}
+        engine.step()
+        self.assertEqual(self._positions(sf)[0].status, PositionStatus.OPEN)
+        self.assertNotIn(self._positions(sf)[0].id, engine._zone_positions)
+
+    def test_zone_releases_when_price_comes_back(self):
+        """106원대(모드) → 97원대로 돌아오면 모드 해제, 원래 목표로"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001)
+        self._enter(engine, market, 0.0693)
+        [pos] = self._positions(sf)
+        market.quotes = {"XRP": make_quote(-0.5, bybit_price=0.0757)}
+        engine.step()
+        self.assertIn(pos.id, engine._zone_positions)
+        with self.assertLogs("kimp.engine", level="INFO") as logs:
+            market.quotes = {"XRP": make_quote(-0.5, bybit_price=0.0693)}
+            engine.step()
+        self.assertNotIn(pos.id, engine._zone_positions)
+        self.assertTrue(any("해제" in l and "[경계 위 모드]" in l for l in logs.output))
+
+    def test_disabled_keeps_old_behaviour(self):
+        """TICK_ZONE_ENABLED=false 면 106원대에서 본전이 돼도 목표를 기다린다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, tick_zone_enabled=False)
+        self._enter(engine, market, 0.0693)
+        just = self._find_premium(broker, sf, 0.0757, 0.0, 0.15)
+        market.quotes = {"XRP": make_quote(just, bybit_price=0.0757)}
+        engine.step()
+        self.assertEqual(self._positions(sf)[0].status, PositionStatus.OPEN)
+
+    def test_entry_blocked_when_boundary_within_daily_range(self):
+        """97원(100원까지 3%)인데 보통 하루 5% 움직이는 코인 → 진입 안 함 (tick_zone_block). 하루 2% 면 들어간다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001)
+        market.daily_ranges = {"XRP": 5.0}
+        self._enter(engine, market, 0.0693)
+        self.assertEqual(self._positions(sf), [])
+        with sf() as s:
+            self.assertIn("tick_zone_block", [d.stage for d in s.query(Decision).all()])
+        market.daily_ranges = {"XRP": 2.0}
+        engine._daily_range.clear()
+        self._enter(engine, market, 0.0693)
+        self.assertEqual(len(self._positions(sf)), 1)
+
+    def test_entry_not_blocked_when_next_tick_is_small(self):
+        """960원(1,000원까지 4%)은 넘어도 한 칸 1원 = 0.1% < 목표 0.2% 라 위험이 아니다 → 하루 5% 움직여도 들어간다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001)
+        market.daily_ranges = {"XRP": 5.0}
+        self._enter(engine, market, 0.6857)                                   # ≈ 960원
+        self.assertEqual(len(self._positions(sf)), 1)
+
+    def test_entry_not_blocked_without_range_data(self):
+        """변동폭을 못 받으면(None) 막지 않는다"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001)
+        self._enter(engine, market, 0.0693)
+        self.assertEqual(len(self._positions(sf)), 1)

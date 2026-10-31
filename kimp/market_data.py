@@ -296,6 +296,25 @@ class MarketData:
                                  skew_ms=int(abs(t_by - t_up) * 1000))
         return quotes
 
+    def daily_range_percent(self, coin: str, days: int = 7) -> Optional[float]:
+        """
+        보통 하루 변동폭 (%): 최근 days 개 바이비트 일봉의 (고가 − 저가) / 저가 중앙값. 못 받으면 None
+
+        경계 위 모드의 예방 가드에 쓴다 (위쪽 호가 단위 경계까지 거리와 비교). 바이비트 가격으로 재지만 코인 가격 움직임은
+        두 거래소가 거의 같으니(김프는 1% 안팎) 업비트 원화 가격의 변동폭으로 봐도 된다. 마지막 봉(오늘, 미완성)은 뺀다
+        """
+        try:
+            candles = self.bybit.fetch_ohlcv(bybit_symbol(coin), "1d", limit=days + 1)
+        except Exception:
+            return None
+        if len(candles) > days:
+            candles = candles[:-1]
+        ranges = sorted((c[2] - c[3]) / c[3] * 100 for c in candles if len(c) >= 4 and c[3])
+        if not ranges:
+            return None
+        n = len(ranges)
+        return ranges[n // 2] if n % 2 else (ranges[n // 2 - 1] + ranges[n // 2]) / 2
+
     def fetch_funding(self, coin: str) -> Optional[FundingInfo]:
         """
         바이비트 펀딩비 정보 가져오기

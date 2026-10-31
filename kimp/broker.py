@@ -1064,7 +1064,8 @@ class HedgeBroker:
         # sync 로 이어서 하는 청산(plan 없음)·손절·강제청산·수동 청산은 아래 시장가 경로 그대로.
         # 익절 지정가 = 우리 수량이 닿는 가장 싼 매수 호가 줄 (#3 A). 안전 확인은 엔진의 익절 판단에서 했다
         worst_sell = plan.upbit.worst_price if plan else None
-        limit = self._coin_limit(worst_sell, "sell") if pos.exit_reason == ExitReason.TAKE_PROFIT else None
+        tp_like = pos.exit_reason in (ExitReason.TAKE_PROFIT, ExitReason.TICK_ZONE_EXIT)   # 경계 위 청산도 익절과 같은 길
+        limit = self._coin_limit(worst_sell, "sell") if tp_like else None
         try:
             if limit is not None and not s("sell", self._sums(session, pos)).qty:
                 left = min(pos.upbit_qty, self.balance(session, coin_key(pos.coin)))

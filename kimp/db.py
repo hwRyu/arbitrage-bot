@@ -69,6 +69,7 @@ class ExitReason:
     TIMEOUT = "TIMEOUT"  # 한 번만 돌리기(ONE_SHOT)에서 ONE_SHOT_MAX_HOURS 를 넘겨 시장가로 정리
     MANUAL = "MANUAL"  # 사람이 지시해서 정리 (텔레그램 /close)
     FUNDING_COST = "FUNDING_COST"  # 펀딩비로 낸 돈이 MAX_FUNDING_COST_PERCENT 를 넘어서 정리
+    TICK_ZONE_EXIT = "TICK_ZONE_EXIT"  # 경계 위 모드 청산: 호가 한 칸 % ≥ 목표 % 인 구간에 갇혀 목표 대신 본전·최소 손해로 정리 (issues #6)
 
 
 class Position(Base):

@@ -369,6 +369,17 @@ class Settings:
     #   그래서 '목표만큼(1%)' 이 아니라 '필요 김프가 범위를 벗어나는 지점(0.3%)' 으로 잡는다.
     max_funding_cost_percent: float = 0.3
 
+    # ★ 경계 위 모드 (2026-10-31, docs/issues.md #6, 사용자 결정): 업비트 호가 한 칸 % 가 목표 % 보다 큰 구간(100~500원대: 한 칸 1원 =
+    #   0.2~1%)에서는 매수 호가에 파는 청산이 평균 반 칸 구조적으로 불리해 목표 익절이 사실상 불가능하다 (NIL #41: 97원에 들어가 106원에서
+    #   청산 김프 −1.24% 에 묶였고 펀딩비 한도가 −1.7% 로 강제 청산).
+    #   - 예방: 위쪽 경계까지 거리 < 그 코인의 보통 하루 변동폭(최근 TICK_ZONE_RANGE_DAYS 일 바이비트 일봉 고저 폭 중앙값)이면 진입 안 함
+    #     (넘은 뒤 한 칸 % 가 목표보다 작은 경계, 예: 1,000원 → 0.1% 는 위험이 아니라 적용 안 함)
+    #   - 보유 중 넘으면: 펀딩비를 받는 중이면 '순손익 ≥ 0' 에 청산(본전 이상), 내는 중이면 '순손익(수수료 제외) ≥ −다음 정산 펀딩비' 에
+    #     청산(지금 나가는 손실 < 한 번 더 들고 있는 비용이면 나간다). 방향이 바뀌면 규칙도 바뀐다. 경계 아래로 돌아오면 원래 목표로.
+    #   펀딩비 누적 한도는 마지막 안전장치로 그대로 둔다
+    tick_zone_enabled: bool = True
+    tick_zone_range_days: int = 7
+
     # ★ 호가 간격 안전장치: 진입 직전 '지금 왕복 호가' 가 이 % 를 넘으면 들어가지 않는다 (0 = 보지 않음)
     #   왕복 호가 = 맨 앞 호가로 본 진입 김프 − 청산 김프 (업비트 코인 + 바이비트 + USDT/KRW 호가 간격의 합).
     #   이게 목표 순이익보다 크면 그 거래는 애초에 이익이 날 수 없다.
@@ -694,6 +705,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
                                       if os.getenv("ENTRY_MIN_FUNDING_8H_PERCENT") is not None
                                       else d.entry_min_funding_8h_percent),
         max_funding_cost_percent=_env_float("MAX_FUNDING_COST_PERCENT", d.max_funding_cost_percent),
+        tick_zone_enabled=_env_bool("TICK_ZONE_ENABLED", d.tick_zone_enabled),
+        tick_zone_range_days=_env_int("TICK_ZONE_RANGE_DAYS", d.tick_zone_range_days),
         entry_max_spread_percent=_env_float("ENTRY_MAX_SPREAD_PERCENT", d.entry_max_spread_percent),
         entry_tick_boundary_margin_percent=_env_float("ENTRY_TICK_BOUNDARY_MARGIN_PERCENT",
                                                       d.entry_tick_boundary_margin_percent),
