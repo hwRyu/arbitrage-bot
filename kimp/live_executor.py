@@ -213,9 +213,9 @@ class LiveExecutor:
             self._up_bal = snap.up_bal
         if self._by_bal is None and snap.by_bal is not None and snap.by_started >= self._by_dirty_since:
             self._by_bal = snap.by_bal
-            for coin in coins:
-                if coin in snap.shorts and coin not in self._shorts:
-                    self._shorts[coin] = snap.shorts[coin]
+            for coin, qty in snap.shorts.items():          # 스냅샷에 있는 코인 전부 (대조가 운용 코인 전부를 읽는다)
+                if coin not in self._shorts:
+                    self._shorts[coin] = qty
                     self._liq[coin] = snap.liq.get(coin)
         if self._up_bal is None or self._by_bal is None:
             self.account.kick()   # 낡은 쪽이 있다 → 바로 한 바퀴

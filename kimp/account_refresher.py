@@ -59,13 +59,17 @@ class AccountRefresher:
     interval_sec: 바퀴 간격. kick() 으로 즉시 한 바퀴 더 돌릴 수 있다 (주문 뒤)
     """
 
-    def __init__(self, upbit, bybit, interval_sec: float = 2.0, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, upbit, bybit, interval_sec: float = 2.0, clock: Callable[[], float] = time.monotonic,
+                 base_coins: Iterable[str] = ()):
         self.up = upbit
         self.by = bybit
         self.interval_sec = interval_sec
         self._clock = clock
         self._snap = AccountSnapshot()
-        self._watch: Set[str] = set()
+        # 늘 받아 두는 코인(운용 코인 전부) + 열린 포지션 코인. 10분 대조(reconcile)가 운용 코인 전부의 숏을 읽으므로
+        # 보유 코인만 받아 두면 나머지는 그 자리에서 REST 를 기다린다 (10-31 20:23 스캔 13.4초)
+        self._base: Set[str] = set(base_coins)
+        self._watch: Set[str] = set(self._base)
         self._watch_lock = threading.Lock()
         self._kick = threading.Event()
         self._stop = threading.Event()
@@ -88,7 +92,7 @@ class AccountRefresher:
     def watch(self, coins: Iterable[str]) -> None:
         """숏을 받아 둘 코인 (열린 포지션). 매 스캔 실행기가 알려준다"""
         with self._watch_lock:
-            self._watch = set(coins)
+            self._watch = self._base | set(coins)
 
     def kick(self) -> None:
         """지금 바로 한 바퀴 (주문 뒤 값이 낡았을 때)"""

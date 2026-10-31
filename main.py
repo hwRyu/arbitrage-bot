@@ -78,8 +78,7 @@ def make_broker(settings: Settings, coins, safety: Safety) -> HedgeBroker:
         # 계좌 갱신 스레드 (issues N7): 잔고·숏을 별도 ccxt 객체로 2초마다 받아 두고 판단 루프는 스냅샷을 쓴다
         from kimp.account_refresher import AccountRefresher
         up2, by2 = make_exchanges(settings)
-        live.account = AccountRefresher(up2, by2, interval_sec=settings.scan_interval_sec)
-        live.account.watch(coins)
+        live.account = AccountRefresher(up2, by2, interval_sec=settings.scan_interval_sec, base_coins=coins)
         live.account.cycle()          # 첫 스냅샷은 기동 때 받아 둔다 (첫 스캔이 REST 를 기다리지 않게)
         live.account.start()
         ex = live

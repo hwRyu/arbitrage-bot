@@ -144,6 +144,22 @@ class ExecutorSnapshotTest(unittest.TestCase):
         self.assertEqual(by.pos_calls, 1)
 
 
+class BaseCoinsTest(unittest.TestCase):
+    def test_base_coins_always_in_snapshot_so_reconcile_reads_cache(self):
+        """운용 코인 전부를 늘 받아 두면 10분 대조가 보유하지 않은 코인의 숏도 REST 없이 읽는다 (10-31 20:23 스캔 13.4초)"""
+        from kimp.live_executor import LiveExecutor
+        up, by = FakeUp(), FakeBy()
+        ex = LiveExecutor(up, by, Settings(coins=["XRP", "SOL"]), sleep=lambda _x: None, order_timeout_sec=0.01)
+        up2, by2 = FakeUp(), FakeBy()
+        ex.account = AccountRefresher(up2, by2, clock=Clock(), base_coins=["XRP", "SOL"])
+        ex.account.cycle()
+        self.assertEqual(set(ex.account.snapshot().shorts), {"XRP", "SOL"})
+        ex.refresh()
+        ex.prefetch(["XRP"])                                   # 보유는 XRP 뿐이어도
+        self.assertEqual(ex.short_qty(None, "SOL"), 0.0)       # SOL 숏도 스냅샷에서
+        self.assertEqual(by.pos_calls, 0)                      # 주문용 객체로 REST 없음
+
+
 class FundingCacheTest(unittest.TestCase):
     def test_cache_refresh_and_fallback(self):
         clock = Clock()
