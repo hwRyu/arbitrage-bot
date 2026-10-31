@@ -1017,10 +1017,12 @@ class TickZoneTest(unittest.TestCase):
     가짜 시세의 USDT 1,400원 × 바이비트 가격 = 업비트 원화 가격. 목표 0.2%: 100~500원대(한 칸 1원 = 0.2~1%)가 모드 구간
     """
 
-    def _engine(self, funding_rate=None, **overrides):
+    def _engine(self, funding_rate=None, daily_ranges=None, **overrides):
         market = FakeMarket()
         if funding_rate is not None:
             market.funding = FundingInfo(rate=funding_rate, next_funding_ms=10 ** 14, mark_price=1.0, interval_hours=4.0)
+        if daily_ranges:
+            market.daily_ranges = daily_ranges          # 기동 때 미리 받는다 (판단 경로는 캐시만 읽는다)
         engine, sf, broker = make_engine(make_settings(target_net_profit_percent=0.2, **overrides), market)
         return engine, sf, broker, market
 
@@ -1124,21 +1126,19 @@ class TickZoneTest(unittest.TestCase):
 
     def test_entry_blocked_when_boundary_within_daily_range(self):
         """97원(100원까지 3%)인데 보통 하루 5% 움직이는 코인 → 진입 안 함 (tick_zone_block). 하루 2% 면 들어간다"""
-        engine, sf, broker, market = self._engine(funding_rate=0.0001)
-        market.daily_ranges = {"XRP": 5.0}
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, daily_ranges={"XRP": 5.0})
         self._enter(engine, market, 0.0693)
         self.assertEqual(self._positions(sf), [])
         with sf() as s:
             self.assertIn("tick_zone_block", [d.stage for d in s.query(Decision).all()])
         market.daily_ranges = {"XRP": 2.0}
-        engine._daily_range.clear()
+        engine._refresh_daily_ranges(force=True)        # 1시간 뒤 갱신을 흉내
         self._enter(engine, market, 0.0693)
         self.assertEqual(len(self._positions(sf)), 1)
 
     def test_entry_not_blocked_when_next_tick_is_small(self):
         """960원(1,000원까지 4%)은 넘어도 한 칸 1원 = 0.1% < 목표 0.2% 라 위험이 아니다 → 하루 5% 움직여도 들어간다"""
-        engine, sf, broker, market = self._engine(funding_rate=0.0001)
-        market.daily_ranges = {"XRP": 5.0}
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, daily_ranges={"XRP": 5.0})
         self._enter(engine, market, 0.6857)                                   # ≈ 960원
         self.assertEqual(len(self._positions(sf)), 1)
 

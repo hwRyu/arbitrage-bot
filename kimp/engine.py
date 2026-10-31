@@ -273,6 +273,7 @@ class Engine:
         """
         self.startup()
         feed = getattr(self.market, "feed", None)
+        self._refresh_daily_ranges(force=True)   # 경계 위 모드 예방 가드용 하루 변동폭 — 판단 경로 밖에서 미리 받아 둔다
         logger.info("엔진 시작: 코인 %s, %s", ", ".join(self.coins),
                     f"호가가 바뀌면 즉시 판단 (최소 {EVENT_STEP_MIN_GAP_SEC:g}초 간격), 계좌 조회 {self.s.scan_interval_sec:g}초마다"
                     if feed is not None else f"{self.s.scan_interval_sec:.1f}초마다 스캔")
@@ -329,6 +330,7 @@ class Engine:
             open_positions = {p.coin: p for p in self.broker.open_positions(session)}
             if refresh:
                 self._maintain_krw_buffer(session, quotes, open_positions)
+                self._refresh_daily_ranges()   # 하루 변동폭 캐시: 만료된 코인 하나씩 (REST 100~150ms 를 판단 경로에 넣지 않는다)
 
             closed_any = self._handle_close_requests(session, quotes, open_positions)
             for coin, pos in list(open_positions.items()):
@@ -1267,21 +1269,36 @@ class Engine:
                 f"{target:.2f}%) | 들고 있는 동안 경계를 넘어 갇힐 위험 (issues #6)")
 
     def _daily_range_percent(self, coin: str) -> Optional[float]:
-        """보통 하루 변동폭 (%, 시세 조회기가 주면). DAILY_RANGE_REFRESH_SEC 마다 갱신"""
-        now = self._clock()
+        """보통 하루 변동폭 (%) — 캐시만 읽는다 (판단 경로에서 REST 를 부르지 않는다). 아직 없으면 None = 가드 없이 판단"""
         cached = self._daily_range.get(coin)
-        if cached is not None and now - cached[0] < DAILY_RANGE_REFRESH_SEC:
-            return cached[1]
+        return cached[1] if cached is not None else None
+
+    def _refresh_daily_ranges(self, force: bool = False) -> None:
+        """
+        하루 변동폭 캐시 갱신 (경계 위 모드 예방 가드용, 2026-10-31)
+
+        기동 때(force)는 전 코인을 받고, 그 뒤로는 계좌 갱신 주기(2초)마다 DAILY_RANGE_REFRESH_SEC 가 지난 코인 **하나만** 받는다.
+        바이비트 일봉 REST 가 1건 100~150ms 라, 처음엔 진입 판단 도중에 불렀더니 여러 코인이 같은 스캔에서 만료될 때 스캔이
+        1초를 넘겼다 (10-31 15시대 최대 1.9초). 판단 경로는 캐시만 읽는다
+        """
         fn = getattr(self.market, "daily_range_percent", None)
-        value: Optional[float] = None
-        if fn is not None:
+        if fn is None or not self.s.tick_zone_enabled:
+            return
+        now = self._clock()
+        stale = [c for c in self.coins
+                 if force or c not in self._daily_range or now - self._daily_range[c][0] >= DAILY_RANGE_REFRESH_SEC]
+        for coin in (stale if force else stale[:1]):
+            value: Optional[float] = None
             try:
                 value = fn(coin, self.s.tick_zone_range_days)
             except Exception as exc:
                 self._log_throttled(f"daily-range-{coin}", logging.WARNING,
                                     f"{coin} 하루 변동폭 조회 실패 (경계 위 모드 예방 가드 없이 판단): {exc}", cooldown_sec=1800.0)
-        self._daily_range[coin] = (now, value)
-        return value
+            self._daily_range[coin] = (now, value)
+        if force and stale:
+            got = {c: self._daily_range[c][1] for c in stale}
+            logger.info("하루 변동폭(경계 위 모드 예방 가드): %s",
+                        ", ".join(f"{c} {v:.1f}%" if v is not None else f"{c} ?" for c, v in got.items()))
 
     def _gate(self, filters: dict, key, x: float, price: Optional[float], signal_on: bool) -> Optional[FilterState]:
         """
