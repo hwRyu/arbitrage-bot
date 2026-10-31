@@ -258,8 +258,8 @@ class Settings:
     # 동시에 들고 있을 수 있는 포지션 수 (코인당 최대 1개)
     max_open_positions: int = 3
 
-    # 청산 후 같은 코인을 다시 진입하기 전 기다리는 시간 (초)
-    reentry_cooldown_sec: float = 300.0
+    # 청산 후 같은 코인 재진입 대기 시간 (초). 2026-10-31 300 → 60 (사용자 결정): 깜빡이는 신호에 재진입하는 것은 신호 필터가 막으므로, 긴 대기는 다시 벌어진 진짜 김프를 놓치는 비용만 남는다. 청산 주문 정리·잔고 반영 시간만큼만 둔다
+    reentry_cooldown_sec: float = 60.0
 
     # ★ 연속 놓침 쉬기 (docs/issues.md 놓침 후보 N1): 같은 코인의 지정가 FOK 진입 놓침이 ENTRY_MISS_WINDOW_SEC 안에
     #   ENTRY_MISS_STREAK_LIMIT 번이 되면 그 코인은 ENTRY_MISS_COOLDOWN_SEC 동안 진입하지 않는다 (limit 0 = 끔).
