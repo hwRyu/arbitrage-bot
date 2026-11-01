@@ -62,6 +62,7 @@ python main.py
 | 실거래 전 점검 (읽기만) | `python -m kimp.live_check` | 몇 초 |
 | 드라이런 / 실거래 | `PAPER_TRADING=false python main.py` ([live.md](live.md)) | |
 | 김프 전략 코인 추천 순위 | `python -m kimp.screen` | 처음 2~3분, 다음부터 수십 초 |
+| 바이비트 펀딩 지형 (캐리 재개 판단용) | `python -m kimp.funding_watch` (기록) / `--show` (추이) | 몇 초. 수집기가 하루 1회 자동 기록 |
 | 김프 전략 과거 시뮬레이션 | `python -m kimp.simulate --from 2026-09-22` | 코인당 처음 1~2분 |
 | 펀딩비 전략 코인 순위 | `python -m kimp.carry_backtest screen` | 처음 약 2분 |
 | 펀딩비 전략 과거 시뮬레이션 | `python -m kimp.carry_backtest run --from 2026-09-22` | 처음 1~2분 |

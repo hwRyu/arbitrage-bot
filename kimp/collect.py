@@ -191,7 +191,7 @@ class TickDedup:
 
 
 def run_ws(settings: Settings, coins: Sequence[str], interval_sec: float, stop: threading.Event,
-           max_hours: float = 0.0, feed=None, now_ms=None, max_rounds: int = 0) -> int:
+           max_hours: float = 0.0, feed=None, now_ms=None, max_rounds: int = 0, funding_watch=None) -> int:
     """
     --ws 모드 기록 루프: 호가가 바뀔 때마다(feed.on_update) 그 코인의 김프를 다시 계산해 달라졌으면 적는다.
     interval_sec 마다 전체를 한 번씩 훑어 이벤트를 놓쳐도 잡고, 60초 하트비트로 '조용함' 을 남긴다.
@@ -276,6 +276,8 @@ def run_ws(settings: Settings, coins: Sequence[str], interval_sec: float, stop: 
                     fresh = len(feed.fresh_coins()) if hasattr(feed, "fresh_coins") else len(coins)
                     logger.info("기록 총 %d줄 (호가 변화 %d건 처리) | 신선한 코인 %d/%d%s", written, events, fresh, len(coins),
                                 f" | {feed.status_text()}" if hasattr(feed, "status_text") else "")
+                    if funding_watch is not None:
+                        funding_watch.maybe_record()   # 하루 한 번 바이비트 펀딩 지형 (kimp/funding_watch.py, 캐리 재개 판단용)
             except Exception:
                 logger.exception("기록 실패 (다음 차례에 다시 시도)")
                 buffer = []
@@ -352,7 +354,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (AttributeError, ValueError):  # 윈도우에서 없을 수 있다
         pass
     if args.ws:
-        run_ws(settings, coins, args.interval or TICK_INTERVAL_SEC, stop, max_hours=args.hours)
+        from kimp.funding_watch import DailyFundingWatch
+
+        def bybit_public():
+            import ccxt
+            ex = ccxt.bybit({"enableRateLimit": True, "timeout": 10_000, "options": {"defaultType": "swap"}})
+            ex.load_markets()
+            return ex
+
+        watch = DailyFundingWatch(settings.snapshot_db_path, bybit_public)   # 하루 1회 펀딩 지형 기록 (캐리 재개 판단용)
+        run_ws(settings, coins, args.interval or TICK_INTERVAL_SEC, stop, max_hours=args.hours, funding_watch=watch)
     else:
         run(settings, coins, args.interval or DEFAULT_INTERVAL_SEC, stop, once=args.once, max_hours=args.hours, md=md)
     print(f"{LF}쌓인 기록 보기: python -m kimp.webui (데이터 탭) 또는 python -m kimp.report")

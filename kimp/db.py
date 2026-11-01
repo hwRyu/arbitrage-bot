@@ -26,7 +26,7 @@ import os
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, create_engine, inspect, text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -233,6 +233,26 @@ class PremiumSnapshot(Base):
     upbit_mid_krw: Mapped[float] = mapped_column(Float)
     bybit_mid_usdt: Mapped[float] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class FundingLandscape(Base):
+    """
+    바이비트 펀딩 지형 하루 요약 (kimp/funding_watch.py, 2026-11-01)
+
+    펀딩비 캐리 전략(docs/carry.md)을 다시 꺼낼 때가 왔는지 보려고 전 코인 펀딩비율의 중앙값·상위를 매일 한 줄 남긴다.
+    연환산 % = 1회 비율 × (1440 ÷ 정산 주기 분) × 365. 숏이 받는 쪽이 +.
+    """
+
+    __tablename__ = "funding_landscape"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts_ms: Mapped[int] = mapped_column(Integer, index=True)
+    coins: Mapped[int] = mapped_column(Integer)          # 집계한 USDT 무기한 수
+    positive: Mapped[int] = mapped_column(Integer)       # 플러스 펀딩 코인 수
+    median_apr: Mapped[float] = mapped_column(Float)     # 연환산 중앙값 (%)
+    p90_apr: Mapped[float] = mapped_column(Float)        # 상위 10% 경계 (%)
+    over20: Mapped[int] = mapped_column(Integer)         # 연 20% 이상 코인 수
+    top_json: Mapped[str] = mapped_column(Text)          # 상위 20개 [{coin, apr, rate, interval_min}]
 
 
 class TickPremium(Base):
