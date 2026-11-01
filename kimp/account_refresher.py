@@ -12,6 +12,10 @@
     갈아 끼운다. 스냅샷은 통째로 바꾸므로(불변 객체 교체) 읽는 쪽은 잠금 없이 일관된 값을 본다. 실패하면 옛 스냅샷을 그대로
     두고 성공 시각만 안 올린다 → 읽는 쪽은 "얼마나 오래된 값인가(age)" 로 판단한다.
 
+    바이비트 포지션은 코인마다 한 번씩이 아니라 **한 번에 전부** 받는다 (fetch_positions() 인자 없음 → settleCoin=USDT 로
+    열린 포지션 전부, 한 요청). 코인마다 받으면 바퀴 하나가 "잔고 + 코인 수" 번의 REST 라 거래소가 느릴 때(건당 2~3초)
+    10초 한도를 넘겨 [계좌 조회 지연] 이 났다 (11-01 21:37·22:15, 코인 3개). 바퀴가 slow_sec 를 넘으면 [계좌 갱신 느림] 경고.
+
     실행기(LiveExecutor)는 스캔 앞의 prefetch 에서 이 스냅샷을 가져다 쓴다. 단 **주문을 낸 뒤**에는 그 거래소 값이 낡았으므로
     (dirty), 주문 뒤에 시작한 바퀴의 스냅샷이 올 때까지는 예전처럼 그 자리에서 REST 로 받는다 — 주문 흐름의 정확성은 그대로.
 
@@ -60,12 +64,16 @@ class AccountRefresher:
     """
 
     def __init__(self, upbit, bybit, interval_sec: float = 2.0, clock: Callable[[], float] = time.monotonic,
-                 base_coins: Iterable[str] = ()):
+                 base_coins: Iterable[str] = (), slow_sec: float = 5.0):
         self.up = upbit
         self.by = bybit
         self.interval_sec = interval_sec
+        self.slow_sec = slow_sec                 # 한 바퀴가 이보다 오래 걸리면 경고 (어느 쪽이 느린지 적는다)
         self._clock = clock
         self._snap = AccountSnapshot()
+        self.last_cycle_sec = 0.0
+        self.last_up_sec = 0.0
+        self.last_by_sec = 0.0
         # 늘 받아 두는 코인(운용 코인 전부) + 열린 포지션 코인. 10분 대조(reconcile)가 운용 코인 전부의 숏을 읽으므로
         # 보유 코인만 받아 두면 나머지는 그 자리에서 REST 를 기다린다 (10-31 20:23 스캔 13.4초)
         self._base: Set[str] = set(base_coins)
@@ -124,24 +132,31 @@ class AccountRefresher:
             coins = sorted(self._watch)
 
         def up_side():
-            return self.up.fetch_balance()
+            t = self._clock()
+            bal = self.up.fetch_balance()
+            self.last_up_sec = self._clock() - t
+            return bal
 
         def by_side():
+            t = self._clock()
             bal = self.by.fetch_balance()
-            shorts: Dict[str, float] = {}
-            liq: Dict[str, Optional[float]] = {}
-            for coin in coins:
-                qty, lp = 0.0, None
-                for p in self.by.fetch_positions([bybit_symbol(coin)]):
-                    if p.get("side") != "short":
-                        continue
-                    qty += abs(float(p.get("contracts") or 0.0))
-                    try:
-                        lp = float(p.get("liquidationPrice") or 0) or None
-                    except (TypeError, ValueError):
-                        lp = None
-                shorts[coin] = qty
-                liq[coin] = lp
+            # 열린 포지션 전부 한 요청 (ccxt bybit 는 심볼 둘 이상을 거부하지만, 인자 없이 부르면 settleCoin=USDT 전체)
+            positions = self.by.fetch_positions()
+            self.last_by_sec = self._clock() - t
+            shorts: Dict[str, float] = {coin: 0.0 for coin in coins}      # 지켜보는 코인은 없으면 0 (= 받았는데 없음)
+            liq: Dict[str, Optional[float]] = {coin: None for coin in coins}
+            for p in positions:
+                if p.get("side") != "short":
+                    continue
+                sym = p.get("symbol") or ""
+                coin = sym.split("/")[0] if "/" in sym else ""
+                if not coin:
+                    continue
+                shorts[coin] = shorts.get(coin, 0.0) + abs(float(p.get("contracts") or 0.0))
+                try:
+                    liq[coin] = float(p.get("liquidationPrice") or 0) or None
+                except (TypeError, ValueError):
+                    liq[coin] = None
             return bal, shorts, liq
 
         fu = self._pool.submit(up_side)
@@ -150,6 +165,12 @@ class AccountRefresher:
         by_res, by_err = self._result(fb, "bybit")
 
         now = self._clock()
+        self.last_cycle_sec = now - started
+        if self.last_cycle_sec > self.slow_sec:
+            if now - self._last_fail_log.get("slow", -1e18) >= FAIL_LOG_COOLDOWN_SEC:
+                self._last_fail_log["slow"] = now
+                logger.warning("[계좌 갱신 느림] 한 바퀴 %.1f초 (업비트 %.1f초, 바이비트 %.1f초) | 한도 %.0f초를 넘으면 신규 진입 보류",
+                               self.last_cycle_sec, self.last_up_sec, self.last_by_sec, self.slow_sec)
         snap = self._snap
         changes = {}
         if up_err is None:

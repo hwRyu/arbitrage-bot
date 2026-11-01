@@ -49,13 +49,16 @@ class FakeBy:
             raise ConnectionError("bybit down")
         return {"USDT": {"free": 700.0, "total": 760.0}}
 
-    def fetch_positions(self, symbols):
+    def fetch_positions(self, symbols=None):
         self.pos_calls += 1
         if self.fail:
             raise ConnectionError("bybit down")
-        coin = symbols[0].split("/")[0]
-        qty = self.shorts.get(coin, 0.0)
-        return [{"side": "short", "contracts": qty, "liquidationPrice": 3.0}] if qty else []
+        if symbols:                                             # 주문용 객체(실행기)는 코인 하나씩 받는다
+            coins = [symbols[0].split("/")[0]]
+        else:                                                   # 갱신 스레드는 인자 없이 전부 한 번에
+            coins = list(self.shorts)
+        return [{"symbol": f"{c}/USDT:USDT", "side": "short", "contracts": self.shorts[c], "liquidationPrice": 3.0}
+                for c in coins if self.shorts.get(c)]
 
 
 class Clock:
@@ -249,6 +252,30 @@ class EngineStaleRuleTest(unittest.TestCase):
         engine.step()
         with sf() as s:
             self.assertEqual(s.query(Position).first().status, PositionStatus.CLOSED)
+
+
+class OnePositionsCallTest(unittest.TestCase):
+    def test_all_positions_in_one_call_and_slow_warning(self):
+        """코인이 몇 개든 바이비트 포지션은 한 요청이고, 지켜보는 코인은 없으면 0 으로 채운다. 느린 바퀴는 경고 한 줄"""
+        from kimp.account_refresher import AccountRefresher
+        up, by, clock = FakeUp(), FakeBy(), Clock()
+        by.shorts = {"XRP": 50.0, "SOL": 7.0}
+        r = AccountRefresher(up, by, interval_sec=2.0, clock=clock, base_coins=["XRP", "SOL", "ADA"], slow_sec=5.0)
+        snap = r.cycle()
+        self.assertEqual(by.pos_calls, 1)
+        self.assertEqual((snap.shorts["XRP"], snap.shorts["SOL"], snap.shorts["ADA"]), (50.0, 7.0, 0.0))
+        self.assertEqual(snap.liq["XRP"], 3.0)
+        self.assertIsNone(snap.liq["ADA"])
+        # 느린 바퀴: 바이비트 쪽이 6초 걸린 것으로 흉내
+        orig = by.fetch_positions
+        def slow(symbols=None):
+            clock.t += 6.0
+            return orig(symbols)
+        by.fetch_positions = slow
+        with self.assertLogs("kimp.account_refresher", level="WARNING") as logs:
+            r.cycle()
+        self.assertTrue(any("[계좌 갱신 느림]" in l and "바이비트 6.0초" in l for l in logs.output))
+        self.assertGreaterEqual(r.last_cycle_sec, 6.0)
 
 
 if __name__ == "__main__":
