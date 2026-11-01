@@ -52,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 # 같은 경고를 너무 자주 찍지 않으려고 두는 간격 (초)
 LOG_COOLDOWN_SEC = 60.0
+ACCOUNT_STALE_BLOCK_WHY = "거래소 잔고·포지션 조회 지연 (복구되면 자동 재개)"   # [계좌 조회 지연] 동안의 진입 보류 이유
+
 
 # 소켓 시세일 때 연속 판단 사이 최소 간격 (초). 호가는 초당 10회 넘게 바뀌는데 판단마다 평가·기록이 따라오므로
 # 이 간격으로 묶는다. 계좌 조회(REST)는 이와 무관하게 SCAN_INTERVAL_SEC 마다
@@ -144,6 +146,7 @@ class Engine:
         self._daily_range: Dict[str, Tuple[float, Optional[float]]] = {}
         self._range_thread: Optional[threading.Thread] = None       # 하루 변동폭 REST 를 받는 별도 스레드 (한 번에 하나)
         self._account_was_stale = False                             # [계좌 조회 지연] → 복구 로그용
+        self._entries_block_why = ""                                 # 마지막으로 알린 [신규 진입 중단] 이유 (재개 알림용)
         self._range_result: Optional[Tuple[str, Optional[float], Optional[str]]] = None   # (코인, 값, 오류 문구)
         # 직전 10초 바이비트 가격 범위 (변동성 가드 1단계: 기록만, kimp/volatility.py). 매 스캔·확인 시세마다 쌓는다
         self._bybit_range = RangeTracker()
@@ -361,11 +364,20 @@ class Engine:
                 self._check_rebalance(session, list(open_positions.values()), quotes, when="청산 후")
 
             allowed, why = self.broker.entries_allowed(session)
-            if allowed and not account_stale:
+            if allowed and account_stale:
+                # 계좌 스냅샷이 오래된 동안의 보류 — 이유 없이 "[신규 진입 중단]" 만 나가면 메신저에서 사람이 멈춘 것처럼
+                # 보인다 (2026-11-01 19:21 6초 순단 뒤 재개 알림이 없어 메신저에 '중단' 이 남았다)
+                allowed, why = False, ACCOUNT_STALE_BLOCK_WHY
+            if allowed:
+                if self._entries_block_why == ACCOUNT_STALE_BLOCK_WHY:
+                    # 사람이 푼 것(/resume, 대조 일치)은 safety 가 재개를 알린다. 자동 보류만 여기서 알린다
+                    logger.warning("[신규 진입 재개] 거래소 잔고·포지션 조회 복구 (자동)")
+                self._entries_block_why = ""
                 self._try_entries(session, quotes, open_positions)
             else:
                 # 사람이 멈춘 상태는 몇 시간씩 가므로 1분마다 알리면 텔레그램이 도배된다 → 30분에 한 번
                 self._log_throttled("entries-blocked", logging.WARNING, f"[신규 진입 중단] {why}", cooldown_sec=1800.0)
+                self._entries_block_why = why
             self._save_snapshots(session, quotes)
             self._log_status(session, quotes, open_positions)
             if self.s.one_shot:

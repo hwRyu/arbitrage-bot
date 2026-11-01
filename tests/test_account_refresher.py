@@ -214,6 +214,31 @@ class EngineStaleRuleTest(unittest.TestCase):
             self.assertEqual(s.query(Position).count(), 1)
         self.assertEqual(len(calls), 1)
 
+    def test_stale_block_has_reason_and_resumes_with_notice(self):
+        """보류 알림에 이유가 붙고, 스냅샷이 새것이 되면 [신규 진입 재개] 를 한 번 알린다 (메신저에 '중단' 만 남지 않게)"""
+        engine, sf, broker, market, calls, make_quote = self._setup(age=30.0)
+        market.quotes = {"XRP": make_quote(0.0)}
+        with self.assertLogs("kimp.engine", level="WARNING") as logs:
+            engine.step()
+        blocked = [l for l in logs.output if "[신규 진입 중단]" in l]
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("조회 지연", blocked[0])                    # 빈 이유가 아니다
+        broker.account_age = lambda: 1.0
+        with self.assertLogs("kimp.engine", level="WARNING") as logs:
+            engine.step()
+        self.assertEqual(sum("[신규 진입 재개]" in l for l in logs.output), 1)
+        engine.step()                                           # 다음 스캔에는 다시 알리지 않는다
+        # (assertLogs 없이 돌려도 예외 없음 = 재개 알림 반복 없음은 아래 handler 로 확인)
+        import logging
+        seen = []
+        h = logging.Handler(); h.emit = lambda r: seen.append(r.getMessage())
+        logging.getLogger("kimp.engine").addHandler(h)
+        try:
+            engine.step()
+        finally:
+            logging.getLogger("kimp.engine").removeHandler(h)
+        self.assertFalse(any("[신규 진입 재개]" in m for m in seen))
+
     def test_stale_still_takes_profit(self):
         """오래된 스냅샷이어도 익절 판단은 마지막 값으로 계속한다"""
         engine, sf, broker, market, calls, make_quote = self._setup(age=1.0)
