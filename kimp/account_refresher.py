@@ -133,16 +133,20 @@ class AccountRefresher:
 
         def up_side():
             t = self._clock()
-            bal = self.up.fetch_balance()
-            self.last_up_sec = self._clock() - t
-            return bal
+            try:
+                return self.up.fetch_balance()
+            finally:
+                self.last_up_sec = self._clock() - t      # 실패(타임아웃)해도 걸린 시간은 남긴다 — [계좌 갱신 느림] 이 어느 쪽인지 보이게
+                                                          # (11-03 17:19 바이비트 5초 타임아웃인데 "바이비트 0.2초" 로 찍혔다)
 
         def by_side():
             t = self._clock()
-            bal = self.by.fetch_balance()
-            # 열린 포지션 전부 한 요청 (ccxt bybit 는 심볼 둘 이상을 거부하지만, 인자 없이 부르면 settleCoin=USDT 전체)
-            positions = self.by.fetch_positions()
-            self.last_by_sec = self._clock() - t
+            try:
+                bal = self.by.fetch_balance()
+                # 열린 포지션 전부 한 요청 (ccxt bybit 는 심볼 둘 이상을 거부하지만, 인자 없이 부르면 settleCoin=USDT 전체)
+                positions = self.by.fetch_positions()
+            finally:
+                self.last_by_sec = self._clock() - t
             shorts: Dict[str, float] = {coin: 0.0 for coin in coins}      # 지켜보는 코인은 없으면 0 (= 받았는데 없음)
             liq: Dict[str, Optional[float]] = {coin: None for coin in coins}
             for p in positions:

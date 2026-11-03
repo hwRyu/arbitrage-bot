@@ -276,6 +276,16 @@ class OnePositionsCallTest(unittest.TestCase):
             r.cycle()
         self.assertTrue(any("[계좌 갱신 느림]" in l and "바이비트 6.0초" in l for l in logs.output))
         self.assertGreaterEqual(r.last_cycle_sec, 6.0)
+        # 실패(타임아웃)한 호출도 걸린 시간이 남는다
+        def timeout(symbols=None):
+            clock.t += 5.5                                      # slow_sec(5.0) 를 넘겨야 경고가 난다
+            raise TimeoutError("bybit timeout")
+        by.fetch_positions = timeout
+        clock.t += 61                                           # 느림 경고 쿨다운(60초) 지나게
+        with self.assertLogs("kimp.account_refresher", level="WARNING") as logs:
+            r.cycle()
+        self.assertGreaterEqual(r.last_by_sec, 5.5)
+        self.assertTrue(any("[계좌 갱신 느림]" in l and "바이비트 5.5초" in l for l in logs.output))
 
 
 if __name__ == "__main__":
