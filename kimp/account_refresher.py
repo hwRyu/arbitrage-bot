@@ -84,6 +84,11 @@ class AccountRefresher:
         self._thread: Optional[threading.Thread] = None
         self._last_fail_log: Dict[str, float] = {}
         self._failing: Dict[str, bool] = {}
+        self._fail_since: Dict[str, float] = {}   # 거래소 → 연속 실패가 시작된 시각 (점검 자동 감지용)
+        # 점검 모드 (kimp/maintenance.py): 거래소 → 찔러 보는 간격(초). None 이면 아예 안 부른다 (사람이 적은 일정),
+        # 숫자면 그 간격으로 한 번씩만 시도한다 (자동 감지 — 살아났는지 알아야 하니까)
+        self._paused: Dict[str, Optional[float]] = {}
+        self._last_probe: Dict[str, float] = {}
         # 업비트 ∥ 바이비트를 동시에 받는 작업 스레드 2개 — 한 번 만들어 계속 쓴다 (바퀴마다 만들었다 없애면 2초마다 스레드
         # 생성·해제가 반복돼 메모리가 분당 1.4 MB 씩 올랐다, 10-31 20:42~21:12)
         self._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="account")
@@ -108,6 +113,46 @@ class AccountRefresher:
     def kick(self) -> None:
         """지금 바로 한 바퀴 (주문 뒤 값이 낡았을 때)"""
         self._kick.set()
+
+    # ------------------------------------------------------------------ 점검 모드
+    def pause(self, exchange: str, probe_every_sec: Optional[float] = None) -> None:
+        """
+        그 거래소를 부르지 않는다 (점검). probe_every_sec 를 주면 그 간격으로 한 번씩만 조용히 찔러 본다
+
+        스냅샷의 옛 값은 그대로 둔다 — 읽는 쪽은 나이로 판단하고, 엔진은 점검 중엔 그 거래소 값을 쓰지 않는다
+        """
+        self._paused[exchange] = probe_every_sec
+        self._last_probe.pop(exchange, None)
+
+    def resume(self, exchange: str) -> None:
+        """다시 평소대로 받는다 (점검 종료). 첫 바퀴를 바로 돌린다"""
+        self._paused.pop(exchange, None)
+        self._fail_since.pop(exchange, None)
+        self.kick()
+
+    def paused(self, exchange: str) -> bool:
+        return exchange in self._paused
+
+    def fresh_within(self, exchange: str, max_age_sec: float) -> bool:
+        """그 거래소 값을 max_age_sec 안에 성공적으로 받았나 (점검 복구 확인용)"""
+        snap = self._snap
+        at = snap.up_at if exchange == "upbit" else snap.by_at
+        return at >= 0 and self._clock() - at <= max_age_sec
+
+    def failing_for(self, exchange: str) -> float:
+        """그 거래소가 연속으로 실패한 시간 (초). 실패 중이 아니면 0 (점검 자동 감지용)"""
+        since = self._fail_since.get(exchange)
+        return self._clock() - since if since is not None else 0.0
+
+    def _should_call(self, exchange: str, now: float) -> bool:
+        """이번 바퀴에 그 거래소를 부를까 — 점검이 아니면 늘, 자동 감지 점검이면 간격마다 한 번"""
+        if exchange not in self._paused:
+            return True
+        every = self._paused[exchange]
+        if every is None or now - self._last_probe.get(exchange, -1e18) < every:
+            return False
+        self._last_probe[exchange] = now
+        return True
 
     def start(self) -> None:
         if self._thread is not None:
@@ -163,14 +208,16 @@ class AccountRefresher:
                     liq[coin] = None
             return bal, shorts, liq
 
-        fu = self._pool.submit(up_side)
-        fb = self._pool.submit(by_side)
-        up_res, up_err = self._result(fu, "upbit")
-        by_res, by_err = self._result(fb, "bybit")
+        # 점검 중인 거래소는 부르지 않는다 (자동 감지 점검이면 간격마다 한 번만, 그것도 조용히)
+        call_up, call_by = self._should_call("upbit", started), self._should_call("bybit", started)
+        fu = self._pool.submit(up_side) if call_up else None
+        fb = self._pool.submit(by_side) if call_by else None
+        up_res, up_err = self._result(fu, "upbit", quiet=self.paused("upbit")) if fu else (None, "점검 중 (부르지 않음)")
+        by_res, by_err = self._result(fb, "bybit", quiet=self.paused("bybit")) if fb else (None, "점검 중 (부르지 않음)")
 
         now = self._clock()
         self.last_cycle_sec = now - started
-        if self.last_cycle_sec > self.slow_sec:
+        if self.last_cycle_sec > self.slow_sec and not self._paused:
             if now - self._last_fail_log.get("slow", -1e18) >= FAIL_LOG_COOLDOWN_SEC:
                 self._last_fail_log["slow"] = now
                 logger.warning("[계좌 갱신 느림] 한 바퀴 %.1f초 (업비트 %.1f초, 바이비트 %.1f초) | 한도 %.0f초를 넘으면 신규 진입 보류",
@@ -179,31 +226,34 @@ class AccountRefresher:
         changes = {}
         if up_err is None:
             changes.update(up_bal=up_res, up_started=started, up_at=now, up_error="")
-        else:
+        elif fu is not None:
             changes.update(up_error=up_err)
         if by_err is None:
             bal, shorts, liq = by_res
             changes.update(by_bal=bal, shorts=shorts, liq=liq, by_started=started, by_at=now, by_error="")
-        else:
+        elif fb is not None:
             changes.update(by_error=by_err)
         self._snap = replace(snap, **changes)
         return self._snap
 
-    def _result(self, future, name: str):
-        """future 결과와 오류 문구. 실패는 60초에 한 번만 경고, 다시 되면 알림"""
+    def _result(self, future, name: str, quiet: bool = False):
+        """future 결과와 오류 문구. 실패는 60초에 한 번만 경고, 다시 되면 알림 (quiet: 점검 중 찔러 보기 — 아무 말 안 함)"""
         try:
             value = future.result()
         except Exception as exc:   # noqa: BLE001 — 어떤 오류든 이 스레드는 죽지 않는다
             text = str(exc)
             now = self._clock()
-            if now - self._last_fail_log.get(name, -1e18) >= FAIL_LOG_COOLDOWN_SEC:
+            self._fail_since.setdefault(name, now)
+            if not quiet and now - self._last_fail_log.get(name, -1e18) >= FAIL_LOG_COOLDOWN_SEC:
                 self._last_fail_log[name] = now
                 logger.warning("[계좌 갱신 실패] %s | %s | 마지막 성공값으로 계속 (엔진은 나이로 판단)", name, text[:200])
             self._failing[name] = True
             return None, text
+        self._fail_since.pop(name, None)
         if self._failing.get(name):
             self._failing[name] = False
-            logger.info("[계좌 갱신 복구] %s", name)
+            if not quiet:
+                logger.info("[계좌 갱신 복구] %s", name)
         return value, None
 
     def _loop(self) -> None:

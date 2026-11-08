@@ -464,6 +464,15 @@ class Settings:
     #   거래소가 응답을 안 줘 스냅샷이 이보다 오래되면: 신규 진입 보류, '숏 사라짐' 판정 보류 (조회에 성공한 값으로만 판정 —
     #   오판하면 업비트 코인을 팔아 헷지를 깬다), 익절·손절·경계 위 청산은 마지막 값으로 계속
     account_stale_sec: float = 10.0
+    # ★ 거래소 점검 모드 (kimp/maintenance.py, 2026-11-08). 텔레그램 /maint 로 일정을 적으면:
+    #   시작 maint_pre_sec 전부터 신규 진입·송금 보류 → 점검 중 그 거래소 호출 전부 중단(다른 쪽만 감시) →
+    #   종료 뒤 응답·대조 확인 → maint_recover_hold_sec 동안 진입만 보류 뒤 재개.
+    #   공지 없는 장애: 계좌 갱신 스레드가 maint_auto_detect_sec 넘게 한 거래소에서 실패만 하면 자동 점검 모드 (0 이면 끔),
+    #   그 뒤 maint_probe_sec 마다 한 번만 살아났는지 확인 (복구 확인 간격도 같다)
+    maint_pre_sec: float = 1800.0
+    maint_recover_hold_sec: float = 600.0
+    maint_auto_detect_sec: float = 180.0
+    maint_probe_sec: float = 300.0
 
     # ------------------------------------------------------------------
     # 달러 환율 (표시용. 사이트식 김프와 테더 프리미엄 보여주기, kimp/fx.py)
@@ -736,6 +745,10 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         quote_ws_max_age_ms=_env_int("QUOTE_WS_MAX_AGE_MS", d.quote_ws_max_age_ms),
         rest_timeout_ms=_env_int("REST_TIMEOUT_MS", d.rest_timeout_ms),
         account_stale_sec=_env_float("ACCOUNT_STALE_SEC", d.account_stale_sec),
+        maint_pre_sec=_env_float("MAINT_PRE_SEC", d.maint_pre_sec),
+        maint_recover_hold_sec=_env_float("MAINT_RECOVER_HOLD_SEC", d.maint_recover_hold_sec),
+        maint_auto_detect_sec=_env_float("MAINT_AUTO_DETECT_SEC", d.maint_auto_detect_sec),
+        maint_probe_sec=_env_float("MAINT_PROBE_SEC", d.maint_probe_sec),
         fx_refresh_sec=_env_float("FX_REFRESH_SEC", d.fx_refresh_sec),
         fixed_usd_krw=_env_optional_float("FIXED_USD_KRW"),
         paper_initial_total_usdt=_env_float("PAPER_INITIAL_TOTAL_USDT", d.paper_initial_total_usdt),
@@ -905,6 +918,12 @@ def validate_settings(s: Settings) -> None:
         errors.append("REST_TIMEOUT_MS 는 1000 이상이어야 합니다 (주문 응답이 평소 0.1~0.7초)")
     if s.account_stale_sec < s.scan_interval_sec:
         errors.append("ACCOUNT_STALE_SEC 는 SCAN_INTERVAL_SEC(계좌 갱신 주기) 이상이어야 합니다")
+    if s.maint_pre_sec < 0 or s.maint_recover_hold_sec < 0 or s.maint_auto_detect_sec < 0:
+        errors.append("MAINT_PRE_SEC · MAINT_RECOVER_HOLD_SEC · MAINT_AUTO_DETECT_SEC 는 0 이상이어야 합니다")
+    if s.maint_probe_sec < 30:
+        errors.append("MAINT_PROBE_SEC 는 30 이상이어야 합니다 (점검 중 거래소를 너무 자주 찌르지 않게)")
+    if 0 < s.maint_auto_detect_sec < s.account_stale_sec:
+        errors.append("MAINT_AUTO_DETECT_SEC 는 ACCOUNT_STALE_SEC 이상이어야 합니다 (짧은 지연과 점검을 구분하려고)")
     if s.sim_default_spread_percent < 0:
         errors.append("SIM_DEFAULT_SPREAD_PERCENT 는 0 이상이어야 합니다")
     if s.fx_refresh_sec < 5:

@@ -64,6 +64,20 @@ USDT_KRW_SYMBOL = "USDT/KRW"
 BYBIT_PARALLEL = 4
 
 
+@dataclass(frozen=True)
+class UpbitBooks:
+    """업비트만 받은 두 장 (코인 원화 호가, USDT/KRW 호가) — 바이비트 점검 중 감시용 (kimp/maintenance.py)"""
+    coin: OrderBook
+    usdt: OrderBook
+
+    @property
+    def est_bybit_price(self) -> Optional[float]:
+        """업비트 가격을 USDT 로 환산한 '추정 바이비트 가격' (김프 1% 안팎 차이는 그대로 들어 있다)"""
+        if self.coin.mid is None or not self.usdt.mid:
+            return None
+        return self.coin.mid / self.usdt.mid
+
+
 def upbit_symbol(coin: str) -> str:
     """업비트 원화 마켓 이름. 예) XRP → 'XRP/KRW'"""
     return f"{coin}/KRW"
@@ -111,6 +125,7 @@ class FundingCache:
         self._tried: Dict[str, float] = {}                          # 코인 → 마지막 시도 시각 (실패 포함)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.paused = False   # 바이비트 점검 중엔 REST 를 아예 안 보낸다 (kimp/maintenance.py)
 
     def get(self, coin: str) -> Optional[FundingInfo]:
         entry = self._entries.get(coin)
@@ -121,6 +136,8 @@ class FundingCache:
     def refresh_once(self) -> int:
         """refresh_sec 이 지난 코인들을 한 번씩 받는다. 받은 코인 수를 돌려준다 (테스트용)"""
         got = 0
+        if self.paused:
+            return 0
         for coin in list(self.coins):
             now = self._clock()
             if now - self._tried.get(coin, -1e18) < self.refresh_sec:
@@ -193,6 +210,115 @@ class MarketData:
             ex = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": timeout_ms})
             ex.set_markets(self.bybit.markets)
             self._bybit_pool.put(ex)
+        self._paused: set = set()   # 점검 중인 거래소 (kimp/maintenance.py) — 그쪽 REST·소켓·펀딩을 전부 안 부른다
+
+    # ------------------------------------------------------------------
+    # 점검 모드 (kimp/maintenance.py)
+    # ------------------------------------------------------------------
+    def pause_exchange(self, exchange: str) -> None:
+        """그 거래소를 부르지 않는다: 웹소켓 끊기, 펀딩 캐시 멈추기, fetch_quotes 는 빈 결과 (엔진은 한쪽 모드로 돈다)"""
+        self._paused = getattr(self, "_paused", set())   # 테스트는 __init__ 없이 만들기도 한다
+        self._paused.add(exchange)
+        if self.feed is not None and hasattr(self.feed, "pause_exchange"):
+            self.feed.pause_exchange(exchange)
+        cache = getattr(self, "_funding_cache", None)
+        if cache is not None and exchange == "bybit":
+            cache.paused = True
+
+    def resume_exchange(self, exchange: str) -> None:
+        """다시 부른다 (점검 종료). 소켓은 다음 바퀴에 붙고, 그동안은 REST 로 받는다"""
+        getattr(self, "_paused", set()).discard(exchange)
+        if self.feed is not None and hasattr(self.feed, "resume_exchange"):
+            self.feed.resume_exchange(exchange)
+        cache = getattr(self, "_funding_cache", None)
+        if cache is not None and exchange == "bybit":
+            cache.paused = False
+
+    def paused_exchanges(self) -> set:
+        return set(getattr(self, "_paused", ()))
+
+    def probe(self, exchange: str) -> bool:
+        """그 거래소가 응답하나 — 가벼운 REST 하나 (점검 복구 확인용, 비실거래). 실패하면 False, 로그 없음"""
+        try:
+            if exchange == "upbit":
+                return bool(self.upbit.fetch_order_book(USDT_KRW_SYMBOL, 5).get("bids"))
+            ex = self._bybit_pool.get()
+            try:
+                return bool(ex.fetch_time())
+            finally:
+                self._bybit_pool.put(ex)
+        except Exception:   # noqa: BLE001
+            return False
+
+    def fetch_upbit_books(self, coins: List[str]) -> Dict[str, "UpbitBooks"]:
+        """
+        업비트만: 코인 원화 호가 + USDT/KRW 호가 (바이비트 점검 중 엔진이 '추정 바이비트 가격' 을 내는 데 쓴다)
+
+        소켓 호가가 신선하면 그걸, 아니면 REST 한 번. 못 받은 코인은 빠진다. USDT/KRW 가 없으면 빈 결과
+        """
+        out: Dict[str, UpbitBooks] = {}
+        missing = list(coins)
+        if self.feed is not None and hasattr(self.feed, "book"):
+            missing = []
+            usdt = self.feed.book("upbit", USDT_KRW_SYMBOL)
+            for coin in coins:
+                up = self.feed.book("upbit", upbit_symbol(coin))
+                if up is None or usdt is None:
+                    missing.append(coin)
+                else:
+                    out[coin] = UpbitBooks(coin=up, usdt=usdt)
+        if missing:
+            try:
+                books = self.upbit.fetch_order_books([upbit_symbol(c) for c in missing] + [USDT_KRW_SYMBOL], self.depth)
+            except Exception as exc:   # noqa: BLE001
+                _log_repeat("upbit-books", logging.WARNING, f"[업비트 호가 조회 실패] {exc} | 점검 모드 감시용")
+                return out
+            _log_recovered("upbit-books", "업비트 호가 조회")
+            usdt_raw = books.get(USDT_KRW_SYMBOL)
+            if not usdt_raw:
+                return out
+            usdt_book = self._to_orderbook(usdt_raw)
+            for coin in missing:
+                raw = books.get(upbit_symbol(coin))
+                if raw:
+                    out[coin] = UpbitBooks(coin=self._to_orderbook(raw), usdt=usdt_book)
+        return out
+
+    def fetch_bybit_books(self, coins: List[str]) -> Dict[str, OrderBook]:
+        """
+        바이비트만: 코인 USDT 무기한 호가 (업비트 점검 중 엔진이 강제청산 거리를 재는 데 쓴다)
+
+        소켓 호가가 신선하면 그걸, 아니면 REST (코인마다 하나, 동시에). 못 받은 코인은 빠진다
+        """
+        out: Dict[str, OrderBook] = {}
+        missing = list(coins)
+        if self.feed is not None and hasattr(self.feed, "book"):
+            missing = []
+            for coin in coins:
+                by = self.feed.book("bybit", bybit_symbol(coin))
+                if by is None:
+                    missing.append(coin)
+                else:
+                    out[coin] = by
+        if not missing:
+            return out
+
+        def get_bybit(coin):
+            ex = self._bybit_pool.get()
+            try:
+                return self._to_orderbook(ex.fetch_order_book(bybit_symbol(coin), self.depth))
+            finally:
+                self._bybit_pool.put(ex)
+
+        with ThreadPoolExecutor(max_workers=min(len(missing), BYBIT_PARALLEL) or 1) as pool:
+            futures = {coin: pool.submit(get_bybit, coin) for coin in missing}
+            for coin, f in futures.items():
+                try:
+                    out[coin] = f.result()
+                    _log_recovered(f"bybit-{coin}", f"{coin} 바이비트 호가 조회")
+                except Exception as exc:   # noqa: BLE001
+                    _log_repeat(f"bybit-{coin}", logging.WARNING, f"[바이비트 호가 조회 실패] {coin} | {exc} | 점검 모드 감시용")
+        return out
 
     # ------------------------------------------------------------------
     # 마켓 정보
@@ -256,6 +382,8 @@ class MarketData:
             {코인: Quote}. 어느 쪽으로도 못 받은 코인은 빠진다.
         """
         quotes: Dict[str, Quote] = {}
+        if getattr(self, "_paused", None):
+            return quotes   # 점검 중: 한쪽이라도 없으면 Quote 를 만들 수 없다 → REST 도 보내지 않는다 (엔진은 한쪽 모드)
         missing = list(coins)
         if self.feed is not None:
             missing = []
@@ -399,6 +527,8 @@ class MarketData:
             info = cache.get(coin)
             if info is not None:
                 return info
+        if "bybit" in getattr(self, "_paused", ()):
+            return None   # 바이비트 점검 중엔 REST 를 보내지 않는다
         return self._fetch_funding_rest(coin, self.bybit)
 
     def _fetch_funding_rest(self, coin: str, client) -> Optional[FundingInfo]:

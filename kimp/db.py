@@ -16,6 +16,7 @@ DB 테이블 정의 (SQLite 파일 하나에 저장)
 - position_snapshots: 보유 중 포지션 평가 기록 (1분마다 순손익·청산 김프·펀딩·강제청산 거리)
 - engine_snapshots  : 양쪽 자본과 스캔 소요 시간 (1분마다)
 - events            : WARNING 이상 로그 전부 (예외는 traceback 까지) — "언제 무슨 문제가 있었나"
+- maintenance_windows: 거래소 점검 일정 (텔레그램 /maint 로 등록, 자동 감지 포함) — kimp/maintenance.py
 
 시간은 모두 UTC(세계 표준시)로 저장한다. (한국 시간 = UTC + 9시간)
 old 봇은 저장할 때와 읽을 때 시간대가 달라서 날짜가 9시간 밀렸었다.
@@ -369,6 +370,26 @@ class Event(Base):
     exc_text: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # 예외였으면 traceback
     run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class MaintenanceWindow(Base):
+    """
+    거래소 점검 일정 한 건 (kimp/maintenance.py). 봇을 다시 켜도 남는다
+
+    exchange: 'upbit' / 'bybit'. start_at·end_at 은 UTC. end_at 이 비어 있으면 자동 감지(종료 미정 — 살아나면 적는다)
+    source: 'manual'(텔레그램 /maint) / 'auto'(응답 없음 감지). cancelled_at 이 있으면 사람이 /maint off 로 푼 것
+    """
+
+    __tablename__ = "maintenance_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    exchange: Mapped[str] = mapped_column(String(10), index=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    end_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    source: Mapped[str] = mapped_column(String(10), default="manual")
+    note: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class TransferStatus:

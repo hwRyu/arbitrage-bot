@@ -97,6 +97,10 @@ Engine.step()  (스캔 한 번)
 ### `kimp/safety.py` — 안전장치 `Safety`
 - `entries_allowed()`: 비상정지 파일, 텔레그램 /stop, 연속 실패, `ERROR` 포지션, 대조 불일치, 하루 손실 한도 → 하나라도 있으면 신규 진입 중단
 
+### `kimp/maintenance.py` — 거래소 점검 모드 (2026-11-08)
+- 텔레그램 `/maint` 일정 해석·검증(날짜·시각 형식, 종료 > 시작, 지난 시각·48시간 초과 거절)과 DB(`maintenance_windows`) 저장·해제
+- `MaintenanceManager.update()`: 엔진이 매 스캔 묻는다. 예고 → 점검(그 거래소 pause: 웹소켓·REST·펀딩·계좌 갱신) → 복구 확인(응답 + 대조) → 안정화. `Safety.maintenance_reason` 으로 진입을 막고, 엔진은 `_step_maintenance` 로 한쪽 모드를 돈다. 공지 없는 장애는 계좌 갱신 스레드의 연속 실패 시간으로 자동 감지
+
 ### `kimp/notify.py` — 텔레그램
 - `TelegramLogHandler`: 경고 이상 + 진입·청산·송금 로그를 텔레그램으로 / `TelegramCommands`: `/status` `/stop` `/resume`
 

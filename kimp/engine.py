@@ -20,6 +20,11 @@
 3) 청산이 있었으면 양쪽 자본 비율 확인 → 많이 벗어났으면 리밸런싱 알림
 4) 새 진입: 김프가 기준보다 낮은 코인에 진입 (포지션 크기는 설정값 또는 자동)
 5) 김프 기록 저장 + 현황 로그
+
+거래소 점검 (kimp/maintenance.py, 2026-11-08): 한 거래소가 점검 중이거나 점검 뒤 복구 확인 중이면 위 흐름 대신
+_step_maintenance 가 돈다 — 그 거래소는 아예 부르지 않고, 다른 거래소 시세만으로 강제청산 거리를 감시한다
+(업비트 점검이면 바이비트 가격으로 증거금 추가까지, 바이비트 점검이면 업비트 가격으로 추정해 경고만).
+진입·청산·숏 사라짐 판정·송금은 하지 않는다. 예고·안정화 구간에는 평소 흐름에서 진입·송금만 막힌다
 """
 from __future__ import annotations
 
@@ -38,6 +43,7 @@ from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumS
 from kimp.executor import BYBIT_USDT, UPBIT_KRW, UPBIT_USDT
 from kimp.fok_sizing import EntryFit, fit_entry
 from kimp.fok_trace import classify_miss
+from kimp.maintenance import LABEL as EX_LABEL, MaintenanceManager, MaintStatus
 from kimp.market_data import MarketData
 from kimp.pnl import estimated_exit_premium
 from kimp.premium import Quote, near_tick_boundary, next_tick_boundary, upbit_krw_tick
@@ -170,6 +176,14 @@ class Engine:
         self._step_started = 0.0                     # 이번 스캔 시작 (monotonic)
         self._quote_ms = 0.0                         # 이번 스캔의 시세 조회 소요 (ms)
         self._steps_since_status = 0                 # 마지막 [현황] 뒤 판단 횟수 (소켓이면 분당 수십~수백 회)
+
+        # 거래소 점검 모드 (kimp/maintenance.py). 실거래는 계좌 갱신 스레드로 살아났는지 보고, 아니면 시세 조회기로 찔러 본다.
+        # 시세 조회기·갱신 스레드에 pause/resume 이 없으면(테스트 가짜) 조용히 건너뛴다
+        refresher = getattr(broker.ex, "account", None)
+        self.maint = MaintenanceManager(
+            settings, session_factory, clock=clock, safety=broker.safety, pausers=[market], refresher=refresher,
+            probe=getattr(market, "probe", None) if refresher is None else None,
+            confirm=self._maint_confirm, on_recovered=self._on_maint_recovered)
 
     def request_close(self, coins: Optional[Sequence[str]] = None) -> str:
         """
@@ -311,6 +325,11 @@ class Engine:
         """스캔 한 번 (순서는 파일 맨 위 설명 참고)"""
         self._step_started = time.monotonic()
         self._steps_since_status += 1
+        # 거래소 점검: 단계를 옮기고(예고 → 점검 → 복구 → 안정화), 거래가 안 되는 거래소가 있으면 한쪽 모드로
+        maint = self.maint.update()
+        if not maint.normal:
+            self._step_maintenance(maint)
+            return
         # 환율은 테더 프리미엄·사이트식 김프를 보여주는 데만 쓴다. 없으면 그 칸만 빈다
         fx_krw = self.fx.get() if self.fx else None
         t_quote = time.monotonic()
@@ -375,8 +394,10 @@ class Engine:
                 self._entries_block_why = ""
                 self._try_entries(session, quotes, open_positions)
             else:
-                # 사람이 멈춘 상태는 몇 시간씩 가므로 1분마다 알리면 텔레그램이 도배된다 → 30분에 한 번
-                self._log_throttled("entries-blocked", logging.WARNING, f"[신규 진입 중단] {why}", cooldown_sec=1800.0)
+                # 사람이 멈춘 상태는 몇 시간씩 가므로 1분마다 알리면 텔레그램이 도배된다 → 30분에 한 번.
+                # 거래소 점검(예고·안정화)은 점검 모듈이 시작·종료를 알리므로 여기서 또 알리지 않는다
+                if not why.startswith("거래소 점검"):
+                    self._log_throttled("entries-blocked", logging.WARNING, f"[신규 진입 중단] {why}", cooldown_sec=1800.0)
                 self._entries_block_why = why
             self._save_snapshots(session, quotes)
             self._log_status(session, quotes, open_positions)
@@ -924,6 +945,12 @@ class Engine:
                     "진입 보류: 양쪽 비율을 맞춰도 자리가 없음 (포지션 크기 × 최대 개수가 자본에 비해 큼) → 송금 안 함",
                 )
                 return None
+        if self.maint.transfers_blocked():
+            # 점검 예고·점검·복구 중: 입출금이 막히거나 늦어지므로 보내지 않는다 (끝나면 다음 청산·진입 때 다시 본다)
+            self._log_throttled("rebalance-maint", logging.INFO,
+                                f"[송금 보류] 거래소 점검 중에는 송금을 보내지 않습니다 ({direction} {abs(move):,.2f} USDT 필요)",
+                                cooldown_sec=1800.0)
+            return None
         if self.auto_transfer:
             if self.broker.pending_transfers(session):
                 return None  # 송금 중 → 도착할 때까지 기다림
@@ -1438,6 +1465,165 @@ class Engine:
     # ------------------------------------------------------------------
     # 기록 / 로그
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 거래소 점검 — 한쪽 모드 (kimp/maintenance.py)
+    # ------------------------------------------------------------------
+    def _step_maintenance(self, maint: MaintStatus) -> None:
+        """
+        한 거래소가 점검 중(또는 복구 확인 중)일 때의 스캔. 그 거래소는 부르지 않는다
+
+            바이비트 점검: 바이비트는 매칭이 멈춰 강제청산도 안 난다. 업비트 가격 ÷ USDT/KRW 로 바이비트 가격을 추정해
+                           복귀 때 강제청산가까지 얼마나 남을지 보고, 가드 구간이면 경고·메모만 (지금은 할 수 있는 게 없다)
+            업비트 점검:   바이비트 숏은 살아 있어 강제청산이 날 수 있다. 바이비트 매도 호가로 거리를 재고 가드 구간이면
+                           증거금을 추가한다 (코인을 못 팔아 정리는 불가 → 증거금 추가만). 가격이 강제청산가를 넘었으면
+                           '강제청산 추정' 으로 알리고, 업비트가 돌아오면 평소 흐름(숏 사라짐 → 코인 정리)이 마무리한다
+            둘 다 점검:    현황만
+        진입·익절·손절·숏 사라짐 판정·송금·대조는 하지 않는다 (두 다리가 필요하다)
+        """
+        down = maint.down
+        with self.session_factory() as session:
+            positions = self.broker.open_positions(session)
+            notes: List[str] = []
+            if positions and "upbit" not in down and "bybit" in down:
+                self._maint_watch_with_upbit(session, positions, notes)
+            elif positions and "bybit" not in down and "upbit" in down:
+                self._maint_guard_with_bybit(session, positions, notes)
+            session.commit()
+            now = self._clock()
+            if now - self._last_status_log >= self.s.snapshot_interval_sec:
+                self._last_status_log, self._steps_since_status = now, 0
+                logger.info("[현황 · 점검] %s | 포지션 %d/%d%s | 진입·청산·송금 없음",
+                            maint.text, len(positions), self.s.max_open_positions,
+                            (" | " + ", ".join(notes)) if notes else "")
+
+    def _maint_watch_with_upbit(self, session: Session, positions: List[Position], notes: List[str]) -> None:
+        """바이비트 점검 중: 업비트 가격으로 추정한 강제청산 거리 (경고·메모만)"""
+        fetch = getattr(self.market, "fetch_upbit_books", None)
+        books = fetch([p.coin for p in positions]) if fetch else {}
+        for pos in positions:
+            b = books.get(pos.coin)
+            est = b.est_bybit_price if b is not None else None
+            liq = pos.liquidation_price
+            if not est or not liq or pos.leverage <= 0:
+                continue
+            distance = (liq / est - 1) * 100
+            pos.last_liq_distance_percent = distance
+            notes.append(f"{pos.coin} 강제청산까지(추정) {distance:.0f}%")
+            if distance < self.s.liq_guard_percent:
+                text = (f"#{pos.id} {pos.coin} 추정 바이비트 {est:.6g} → 강제청산가 {liq:.6g} 까지 {distance:.1f}%")
+                self.maint.note_risk("bybit", text)
+                self._log_throttled(f"maint-liq-{pos.coin}", logging.CRITICAL,
+                                    f"[점검 중 강제청산 위험] {text} (업비트 가격 기준 추정) | 바이비트 점검 중이라 지금은 못 함 — "
+                                    f"복구 즉시 가드가 증거금 추가·정리를 판단합니다", cooldown_sec=1800.0)
+            elif distance < self.s.liq_warn_percent:
+                self._log_throttled(f"maint-liq-{pos.coin}", logging.WARNING,
+                                    f"[점검 중 강제청산 임박] #{pos.id} {pos.coin} | 추정 거리 {distance:.1f}% (업비트 가격 기준) | "
+                                    f"바이비트 복구 뒤 가드가 봅니다", cooldown_sec=1800.0)
+
+    def _maint_guard_with_bybit(self, session: Session, positions: List[Position], notes: List[str]) -> None:
+        """업비트 점검 중: 바이비트 가격으로 강제청산 거리를 재고, 가드 구간이면 증거금 추가 (정리는 불가)"""
+        fetch = getattr(self.market, "fetch_bybit_books", None)
+        books = fetch([p.coin for p in positions]) if fetch else {}
+        for pos in positions:
+            b = books.get(pos.coin)
+            price = b.best_ask if b is not None else None
+            if not price or pos.leverage <= 0:
+                continue
+            try:
+                ex_liq = self.broker.ex.position_liq_price(session, pos.coin)
+            except Exception as exc:   # noqa: BLE001
+                self._log_throttled(f"liq-read-{pos.coin}", logging.WARNING,
+                                    f"[강제청산가 조회 실패] #{pos.id} {pos.coin} | {exc} | 봇 계산값으로 봅니다")
+                ex_liq = None
+            if ex_liq and ex_liq > 0:
+                pos.liquidation_price = ex_liq
+            liq = pos.liquidation_price
+            if not liq:
+                continue
+            if price >= liq:
+                text = f"#{pos.id} {pos.coin} 바이비트 {price:.6g} ≥ 강제청산가 {liq:.6g}"
+                self.maint.note_risk("upbit", text + " (강제청산 추정)")
+                self._log_throttled(f"maint-liq-{pos.coin}", logging.CRITICAL,
+                                    f"[점검 중 강제청산 추정] {text} | 업비트 점검 중이라 코인을 못 팝니다 — 복구 즉시 "
+                                    f"'숏 사라짐' 으로 코인을 정리합니다 (그동안 코인은 가격에 노출)", cooldown_sec=1800.0)
+                continue
+            distance = (liq / price - 1) * 100
+            pos.last_liq_distance_percent = distance
+            notes.append(f"{pos.coin} 강제청산까지 {distance:.0f}%")
+            if distance < self.s.liq_guard_percent:
+                self._maint_topup(session, pos, positions, price, distance)
+            elif distance < self.s.liq_warn_percent:
+                self._log_throttled(f"maint-liq-{pos.coin}", logging.WARNING,
+                                    f"[점검 중 강제청산 임박] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% "
+                                    f"(지금 {price:.6g} / 강제청산가 {liq:.6g}) | {self.s.liq_guard_percent:.0f}% 안으로 오면 증거금 추가",
+                                    cooldown_sec=1800.0)
+
+    def _maint_topup(self, session: Session, pos: Position, positions: List[Position], price: float, distance: float) -> None:
+        """
+        업비트 점검 중 가드: 평소 가드(_liq_guard)와 같은 돈·회수 규칙으로 증거금만 추가한다
+
+        평소엔 '목표에 가깝거나 역프가 깊을 때만' 넣고 아니면 정리하는데, 지금은 정리를 못 하니 조건 없이 넣는다
+        (여유분·회수 한도 안에서). 한도를 다 썼으면 긴급 알림만 — 사람이 바이비트 앱에서 직접 넣을 시간을 준다
+        """
+        added = pos.margin_added_usdt or 0.0
+        initial = pos.bybit_margin_usdt - added
+        unit = initial * self.s.liq_guard_topup_unit_ratio
+        rounds_used = int(round(added / unit)) if unit > 0 else 0
+        blocked = None
+        if unit <= 0 or rounds_used >= self.s.liq_guard_topup_max_rounds:
+            blocked = f"이미 {rounds_used}회 넣음 (최대 {self.s.liq_guard_topup_max_rounds}회)"
+        else:
+            upbit, bybit = self.broker.capital_split(session, positions, {})
+            b = self.s.bybit_margin_buffer_percent / 100
+            buffer = (upbit + bybit) * b / (self.s.bybit_leverage + 1 + b)
+            used = sum(p.margin_added_usdt or 0.0 for p in positions)
+            free = self.broker.balance(session, BYBIT_USDT)
+            add = min(unit, max(0.0, buffer - used), max(0.0, free))
+            if add < MIN_TOPUP_USDT:
+                blocked = f"여유분 {buffer:.2f} USDT 중 {used:.2f} 사용, 바이비트 잔고 {free:.2f}"
+            else:
+                try:
+                    self._account_dirty = True
+                    self.broker.add_margin(session, pos, add)
+                except Exception as exc:   # noqa: BLE001
+                    blocked = f"거래소 거절: {exc}"
+                else:
+                    session.commit()
+                    logger.warning("[점검 중 증거금 추가] #%d %s | 강제청산까지 %.1f%% 였음 | +%.2f USDT (%d/%d회) | 새 강제청산가 %.6g | "
+                                   "업비트 점검 중이라 정리 대신 증거금으로 버팁니다",
+                                   pos.id, pos.coin, distance, add, rounds_used + 1, self.s.liq_guard_topup_max_rounds,
+                                   pos.liquidation_price)
+                    return
+        self.maint.note_risk("upbit", f"#{pos.id} {pos.coin} 강제청산까지 {distance:.1f}%, 증거금 추가 불가 ({blocked})")
+        self._log_throttled(f"maint-topup-{pos.coin}", logging.CRITICAL,
+                            f"[점검 중 강제청산 위험] #{pos.id} {pos.coin} | 강제청산까지 {distance:.1f}% | 증거금 추가 불가: {blocked} | "
+                            f"업비트 점검 중이라 정리도 못 합니다 — 필요하면 바이비트 앱에서 직접 증거금을 넣으세요", cooldown_sec=1800.0)
+
+    def _maint_confirm(self, exchange: str) -> Tuple[bool, str]:
+        """
+        점검 종료 뒤 '진짜 돌아왔나' — 거래소 실제 잔고·숏이 DB 와 맞고, 열린 포지션의 숏이 전부 보여야 한다
+
+        점검 직후 거래소가 빈 포지션 목록을 정상 응답으로 주면 평소 흐름은 강제청산으로 오판해 코인을 판다.
+        그래서 맞을 때까지 한쪽 모드를 유지한다 (kimp/maintenance.py)
+        """
+        with self.session_factory() as session:
+            self.broker.ex.refresh()
+            issues = list(self.broker.reconcile(session, set(self.coins)))
+            if exchange == "bybit":
+                for pos in self.broker.open_positions(session):
+                    if pos.bybit_qty > 0 and self.broker.ex.short_qty(session, pos.coin) <= 0:
+                        issues.append(f"{pos.coin} 숏이 보이지 않음 (DB {pos.bybit_qty:g}개)")
+        if issues:
+            return False, "대조 불일치: " + " / ".join(issues)
+        return True, "잔고·숏 대조 일치"
+
+    def _on_maint_recovered(self, exchange: str) -> None:
+        """복구 확인 뒤: 신호 필터를 비워 처음부터 다시 쌓고, 계좌를 꼭 새로 받는다 (점검 전 점수로 바로 팔지 않게)"""
+        self._tp_filters.clear()
+        self._entry_filters.clear()
+        self._account_dirty = True
+        self._last_account_refresh = 0.0
+
     def _log_throttled(self, key: str, level: int, message: str, cooldown_sec: float = LOG_COOLDOWN_SEC) -> None:
         """같은 종류의 로그는 cooldown_sec(기본 LOG_COOLDOWN_SEC)에 한 번만 (로그 도배 방지)"""
         now = self._clock()

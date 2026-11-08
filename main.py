@@ -106,7 +106,7 @@ def start_quote_feed(settings: Settings, coins) -> Optional["WsFeed"]:
     return feed
 
 
-def status_text(settings: Settings, broker: HedgeBroker, session_factory, market=None) -> str:
+def status_text(settings: Settings, broker: HedgeBroker, session_factory, market=None, engine=None) -> str:
     """
     /status 답장과 하루 요약에 쓰는 현황
 
@@ -130,6 +130,9 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory, market
             lines.append(f"⚠️ #{p.id} {p.coin} {p.status} — 다음 스캔에 이어서 처리")
         for t in broker.pending_transfers(session):
             lines.append(f"송금 중 #{t.id} {dir_label(t.direction)} {t.amount_usdt:,.2f} USDT")
+        maint = getattr(engine, "maint", None)
+        if maint is not None:
+            lines += [ln for ln in maint.status_lines(session) if not ln.endswith("등록된 점검 없음")]
         for p in positions:
             lines += position_status_lines(s, broker, session, p)
     return LF.join(lines)
@@ -181,6 +184,7 @@ HELP_TEXT = (
     "/stop     신규 진입 중단 (청산·관리는 계속)" + LF +
     "/resume   재개 (수동 정지·연속 실패 해제, 비상정지 파일 data/STOP 도 삭제)" + LF +
     "/collect  시세 수집 현황 (/collect start 40 · /collect stop)" + LF +
+    "/maint    거래소 점검 일정 (/maint bybit 11-12 02:00 11-12 04:00 · 조회 /maint · 해제 /maint off bybit)" + LF +
     "/help     이 목록"
 )
 
@@ -291,13 +295,14 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
         return "재개했습니다 — " + ", ".join(cleared) + ". 다른 이유로 막혀 있으면 /status 에 나옵니다"
 
     TelegramCommands(notifier, {
-        "/status": lambda: status_text(settings, broker, session_factory, market),
+        "/status": lambda: status_text(settings, broker, session_factory, market, engine),
         "/stop": stop,
         "/resume": resume,
         "/premium": lambda: premium_text(settings, market),
         "/close": lambda args: (engine.request_close(args.split(",") if args else None) if engine
                                 else "엔진이 아직 준비되지 않았습니다"),
         "/collect": lambda args: collect_command(settings, args),
+        "/maint": lambda args: (engine.maint.command(args) if engine else "엔진이 아직 준비되지 않았습니다"),
         "/help": lambda: HELP_TEXT,
     }).start(stop_event)
 
@@ -314,7 +319,7 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
             if now.hour == 9 and sent_for != now.date():
                 sent_for = now.date()
                 try:
-                    logger.info("[하루 요약]\n%s", status_text(settings, broker, session_factory, market))
+                    logger.info("[하루 요약]\n%s", status_text(settings, broker, session_factory, market, engine))
                 except Exception:
                     logger.exception("하루 요약 실패")
 

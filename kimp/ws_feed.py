@@ -120,6 +120,28 @@ class WsFeed:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started_at: Optional[float] = None
+        # 점검 모드 (kimp/maintenance.py): 여기 든 거래소는 소켓을 끊고 다시 붙지 않는다. books() 는 그 거래소를 죽은 것으로 본다
+        self._paused: set = set()
+        self._pause_closed: set = set()   # 바이비트 ccxt.pro 연결을 점검 때 한 번만 닫으려고
+
+    # ------------------------------------------------------------------
+    # 점검 모드
+    # ------------------------------------------------------------------
+    def pause_exchange(self, exchange: str) -> None:
+        """그 거래소 소켓을 끊고 재접속하지 않는다. 즉시 '죽음' 으로 표시해 books() 가 None 을 주게 한다"""
+        with self._lock:
+            self._paused.add(exchange)
+            self._pause_closed.discard(exchange)
+        self._mark_dead(exchange)
+
+    def resume_exchange(self, exchange: str) -> None:
+        """다시 붙는다 (받기 루프가 다음 번에 바로 연결한다). 호가는 첫 메시지가 와야 쓸 수 있다"""
+        with self._lock:
+            self._paused.discard(exchange)
+
+    def is_paused(self, exchange: str) -> bool:
+        with self._lock:
+            return exchange in self._paused
 
     # ------------------------------------------------------------------
     # 읽기 (메인 스레드)
@@ -144,6 +166,23 @@ class WsFeed:
         (up, t_up), (by, t_by), (us, t_us) = got
         return FeedBooks(upbit=up, bybit=by, usdt=us, age_ms=int(round((now - min(t_up, t_by, t_us)) * 1000)),
                          skew_ms=int(round(abs(t_up - t_by) * 1000)))
+
+    def book(self, exchange: str, symbol: str) -> Optional[OrderBook]:
+        """
+        한 거래소의 호가 한 장만 (점검 모드 한쪽 감시용). 그 거래소 연결이 살아 있고 심볼이 묵지 않았을 때만, 아니면 None
+
+        books() 는 세 장이 다 있어야 주지만, 다른 거래소가 점검 중일 때는 한 장만으로 감시해야 한다
+        """
+        now = self._clock()
+        with self._lock:
+            if exchange in self._paused:
+                return None
+            got = self._books.get((exchange, symbol))
+            last = self._last_any.get(exchange)
+        if got is None or last is None or (now - last) * 1000 > self.max_age_ms:
+            return None
+        book, t = got
+        return None if now - t > SYMBOL_SILENT_MAX_SEC else book
 
     def wait_change(self, timeout: float) -> bool:
         """
@@ -271,12 +310,19 @@ class WsFeed:
         backoff = 1.0
         log_key = "ws-upbit"
         while not self._stop.is_set():
+            if self.is_paused("upbit"):
+                # 점검: 연결하지 않고 기다린다 (호출 0, 경고 0). 재개되면 다음 바퀴에 바로 붙는다
+                await asyncio.sleep(1.0)
+                backoff = 1.0
+                continue
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(UPBIT_WS_URL, heartbeat=UPBIT_WS_HEARTBEAT_SEC) as ws:
                         await ws.send_json([{"ticket": f"kimp-{uuid.uuid4().hex[:8]}"},
                                             {"type": "orderbook", "codes": codes}, {"format": "DEFAULT"}])
                         async for msg in ws:
+                            if self.is_paused("upbit"):
+                                break   # 점검 시작 → 연결을 닫고 위에서 기다린다
                             if msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
                                 if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                     raise ConnectionError(f"업비트 소켓 종료 {msg.type.name}")
@@ -291,11 +337,16 @@ class WsFeed:
                             backoff = 1.0
                             _log_recovered(log_key, "웹소켓 호가 upbit")
                             self._store(key, book)
+                        if self.is_paused("upbit"):
+                            self._mark_dead("upbit")
+                            continue
                         raise ConnectionError("업비트 소켓이 닫혔습니다")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self._mark_dead("upbit")
+                if self.is_paused("upbit"):
+                    continue   # 점검 중에 끊긴 것은 당연하다 — 경고 없이 위에서 기다린다
                 if self._clock() - (self._started_at or 0.0) < WARMUP_SEC:
                     logger.debug("[웹소켓 호가] 시작 중 재접속 upbit: %s", exc)
                     await asyncio.sleep(0.5)
@@ -305,17 +356,37 @@ class WsFeed:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, RETRY_BACKOFF_MAX_SEC)
 
+    async def _close_for_pause(self, ex, exchange: str) -> None:
+        """점검 시작 때 그 거래소 ccxt.pro 연결을 한 번만 닫는다 (심볼마다 작업이 있어 첫 번째만 닫고 나머지는 지나간다)"""
+        with self._lock:
+            if exchange in self._pause_closed:
+                return
+            self._pause_closed.add(exchange)
+        try:
+            await ex.close()
+        except Exception as exc:   # noqa: BLE001 — 닫다가 난 오류는 중요하지 않다
+            logger.debug("[웹소켓 호가] 점검 때 %s 연결 닫기: %s", exchange, exc)
+        self._mark_dead(exchange)
+
     async def _watch(self, ex, key: Key, symbol: str) -> None:
         """(바이비트) 심볼 하나를 ccxt.pro 로 끝없이 받는다. 예외가 나면 묶어서 알리고 잠깐 쉬었다 다시 (그동안은 REST 가 받는다)"""
         backoff = 1.0
         log_key = f"ws-{key[0]}"   # 거래소 단위로 묶는다 — 연결 하나가 끊기면 심볼 전부가 같이 끊기므로 한 줄이면 된다
         while not self._stop.is_set():
+            if self.is_paused(key[0]):
+                # 점검: 연결을 한 번 닫고(심볼 작업 중 하나만), 재개될 때까지 기다린다. ccxt.pro 는 다음 watch 에서 다시 붙는다
+                await self._close_for_pause(ex, key[0])
+                await asyncio.sleep(1.0)
+                backoff = 1.0
+                continue
             try:
                 raw = await ex.watch_order_book(symbol)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self._mark_dead(key[0])
+                if self.is_paused(key[0]):
+                    continue   # 점검 중 끊김은 당연하다 — 경고 없이 위에서 기다린다
                 if self._clock() - (self._started_at or 0.0) < WARMUP_SEC:
                     logger.debug("[웹소켓 호가] 시작 중 재접속 %s %s: %s", key[0], symbol, exc)
                     await asyncio.sleep(0.5)

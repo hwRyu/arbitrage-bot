@@ -10,6 +10,8 @@
 - 대조 불일치 (거래소 실제 잔고·포지션 ≠ DB) → 다음 대조에서 맞으면 자동 재개
 - 하루(한국 시간 0시부터) 확정 손실이 DAILY_LOSS_LIMIT_USDT 를 넘음 → 다음 날 자동 재개
   예) 한도 10 USDT, 오늘 −4, −7 → 합 −11 → 오늘은 그만
+- 거래소 점검 (예고·점검·복구·안정화, kimp/maintenance.py) → 단계가 끝나면 자동 재개. 알림은 점검 모듈이 보내므로
+  여기서는 이유 글자만 들고 있다 (maintenance_reason)
 """
 from __future__ import annotations
 
@@ -63,6 +65,7 @@ class Safety:
         self.manual_stop = False
         self.failures = 0
         self._blocks: Dict[str, str] = {}
+        self.maintenance_reason = ""   # 점검 모듈이 매 스캔 넣어 준다 (비어 있으면 점검 아님)
 
     @classmethod
     def from_settings(cls, settings, clock: Callable[[], float] = time.time) -> "Safety":
@@ -155,6 +158,8 @@ class Safety:
             return False, f"비상정지 파일 {self.stop_file} 있음 (지우면 재개)"
         if self.manual_stop:
             return False, "텔레그램 /stop (재개: /resume)"
+        if self.maintenance_reason:
+            return False, self.maintenance_reason
         if self.failures >= self.max_failures:
             return False, f"주문 연속 {self.failures}번 실패 (재개: /resume)"
         if self._blocks:
