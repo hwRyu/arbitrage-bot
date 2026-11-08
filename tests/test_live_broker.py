@@ -1091,6 +1091,7 @@ class LiveTransferTest(unittest.TestCase):
             # 바이비트에 입금 도착
             by.deposits.append({"status": "ok", "amount": 99.0})
             by.free_usdt += 99.0
+            broker._last_transfer_poll.clear()   # 도착 확인은 TRANSFER_POLL_SEC 마다 — 테스트는 시계가 안 가니 바로 묻게 한다
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
             self.assertEqual(t.status, TransferStatus.CONFIRMED)
 
@@ -1129,6 +1130,7 @@ class LiveTransferTest(unittest.TestCase):
             t = s.query(Transfer).one()
             t.requested_at = utcnow() - timedelta(minutes=90)
             s.commit()
+            broker._last_transfer_poll.clear()   # 도착 확인은 TRANSFER_POLL_SEC 마다 — 테스트는 시계가 안 가니 바로 묻게 한다
             with self.assertLogs("kimp.broker", level=logging.CRITICAL):
                 broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
             self.assertEqual(t.alerted, 1)

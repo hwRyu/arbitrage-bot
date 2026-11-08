@@ -109,6 +109,8 @@ from kimp.safety import Safety, kst_midnight_utc
 LF = chr(10)
 
 TRANSFER_DECIMALS = 4
+# 송금 도착 확인 간격 (초). 입금은 몇 분 걸리고, 매 스캔(0.25초) 물으면 바이비트 요청 제한(10006)에 걸린다 (2026-11-08 송금 #10)
+TRANSFER_POLL_SEC = 15.0
 
 # 거래소가 '규정상 지금은 안 된다' 고 거절할 때 나오는 말들.
 # 우리 잘못이 아니므로 연속 실패로 세지 않고(세면 신규 진입이 막힌다) 잠시 뒤 다시 시도한다.
@@ -293,6 +295,7 @@ class HedgeBroker:
         self.limit_on_tick = limit_on_tick
         self._last_reconcile = -1e18
         self._last_repeat: Dict[str, float] = {}   # 반복 알림 억제용 {키: 마지막으로 알린 시각}
+        self._last_transfer_poll: Dict[int, float] = {}   # 송금별 마지막 도착 확인 시각 (TRANSFER_POLL_SEC 마다만 묻는다)
 
     @property
     def is_paper(self) -> bool:
@@ -1444,15 +1447,27 @@ class HedgeBroker:
         return send if to_bybit else -send
 
     def _poll_transfers(self, session: Session) -> None:
-        """송금 중인 건이 받는 쪽에 들어왔는지 확인. 늦으면 한 번 긴급 알림"""
+        """
+        송금 중인 건이 받는 쪽에 들어왔는지 확인 (송금마다 TRANSFER_POLL_SEC 에 한 번). 늦으면 한 번 긴급 알림
+
+        예전엔 매 스캔 물었다. 소켓 시세로 0.25초마다 스캔하면 바이비트 입금 내역을 초당 4번 불러 요청 제한(10006)에
+        걸렸고, 성공·실패가 번갈아 나며 '실패 알림 억제' 키가 매번 풀려 2분에 경고 183통이 텔레그램으로 갔다
+        (2026-11-08 21:05 송금 #10). 입금은 몇 분 걸리니 15초에 한 번이면 충분하다. 억제 키는 '도착/실패로 끝났을 때' 만 푼다
+        """
+        now_sec = self._now().timestamp()
         for t in self.pending_transfers(session):
+            if now_sec - self._last_transfer_poll.get(t.id, -1e18) < TRANSFER_POLL_SEC:
+                continue
+            self._last_transfer_poll[t.id] = now_sec
             try:
                 arrived = self.ex.transfer_arrived(session, t)
             except Exception as exc:  # 조회 실패는 다음에 다시 (거래소가 한참 안 되면 5분에 한 번만 알림)
                 self._log_repeat(f"transfer-{t.id}", logging.WARNING,
-                                 f"[송금 확인 실패] #{t.id} {dir_label(t.direction)} | {exc} | 다음 스캔에 다시")
+                                 f"[송금 확인 실패] #{t.id} {dir_label(t.direction)} | {exc} | {TRANSFER_POLL_SEC:.0f}초 뒤 다시")
                 continue
-            self._last_repeat.pop(f"transfer-{t.id}", None)
+            if arrived is not None:
+                self._last_repeat.pop(f"transfer-{t.id}", None)   # 끝났으니 다음 송금에서 또 막히면 바로 알린다
+                self._last_transfer_poll.pop(t.id, None)
             requested = t.requested_at if t.requested_at.tzinfo else t.requested_at.replace(tzinfo=timezone.utc)
             minutes = (self._now() - requested).total_seconds() / 60
             if arrived:

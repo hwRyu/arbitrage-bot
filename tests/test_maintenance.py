@@ -352,6 +352,10 @@ class EngineOneSideTest(unittest.TestCase):
         market = FakeMarket()
         market.quotes = {"XRP": make_quote(-1.0)}
         engine, sf, broker = make_engine(settings, market)
+        # 시계를 먼저 고정한다 — /maint 등록 검증("이미 지난 시각")이 이 시계를 쓰므로 진짜 시각이면 테스트가 날짜에 따라 깨진다
+        self.clock = Clock(NOW.timestamp())
+        engine._clock = self.clock
+        engine.maint._clock = self.clock
         engine.step()                                             # 진입
         with sf() as s:
             pos = broker.open_positions(s)
@@ -362,9 +366,8 @@ class EngineOneSideTest(unittest.TestCase):
         engine, sf, broker, market, make_quote = self._engine()
         market.quotes = {"XRP": make_quote(+2.0)}                 # 평소라면 익절
         market.fetch_upbit_books = lambda coins: {}
-        engine.maint.command("bybit 11-08 12:00 11-08 13:00")
-        engine._clock = lambda: NOW.timestamp() + 60              # 점검 중
-        engine.maint._clock = engine._clock
+        self.assertIn("등록:", engine.maint.command("bybit 11-08 12:00 11-08 13:00"))
+        self.clock.t = NOW.timestamp() + 60                       # 점검 중
         engine.step()
         with sf() as s:
             self.assertEqual(broker.open_positions(s)[0].status, PositionStatus.OPEN)   # 안 팔았다
@@ -377,9 +380,8 @@ class EngineOneSideTest(unittest.TestCase):
         price = liq / 1.05                                        # 강제청산까지 5% (가드 10% 안)
         market.fetch_bybit_books = lambda coins: {
             "XRP": OrderBook(bids=[(price * 0.999, 1e9)], asks=[(price, 1e9)], timestamp_ms=1)}
-        engine.maint.command("upbit 11-08 12:00 11-08 13:00")
-        engine._clock = lambda: NOW.timestamp() + 60
-        engine.maint._clock = engine._clock
+        self.assertIn("등록:", engine.maint.command("upbit 11-08 12:00 11-08 13:00"))
+        self.clock.t = NOW.timestamp() + 60
         with self.assertLogs("kimp.engine", level=logging.WARNING) as cm:
             engine.step()
         self.assertTrue(any("점검 중 증거금 추가" in line for line in cm.output), cm.output)
@@ -395,9 +397,10 @@ class EngineOneSideTest(unittest.TestCase):
         market = FakeMarket()
         market.quotes = {"XRP": make_quote(-1.0)}
         engine, sf, broker = make_engine(settings, market)
-        engine.maint.command("bybit 11-08 12:20 11-08 13:00")
-        engine._clock = lambda: NOW.timestamp()                   # 12:00 — 예고 구간 (20분 전)
-        engine.maint._clock = engine._clock
+        clock = Clock(NOW.timestamp())                            # 12:00 — 예고 구간 (20분 전)
+        engine._clock = clock
+        engine.maint._clock = clock
+        self.assertIn("등록:", engine.maint.command("bybit 11-08 12:20 11-08 13:00"))
         engine.step()
         with sf() as s:
             self.assertEqual(len(broker.open_positions(s)), 0)    # 예고라 진입 안 함
