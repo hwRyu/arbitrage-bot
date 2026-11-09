@@ -62,7 +62,7 @@ def with_bybit_fee_rates(settings: Settings, coins: Iterable[str], bybit=None) -
             return settings
         import ccxt
         bybit = ccxt.bybit({"apiKey": settings.bybit_api_key, "secret": settings.bybit_api_secret,
-                            "enableRateLimit": True, "options": {"defaultType": "swap"}})
+                            "enableRateLimit": True, "options": {"defaultType": "swap", "adjustForTimeDifference": True}})
         bybit.load_markets()
     fetched = fetch_bybit_taker_rates(bybit, [c for c in coins if c not in settings.fees.bybit_taker_fee_rates])
     manual = dict(settings.fees.bybit_taker_fee_rates)          # .env 코인별 값은 조회값보다 우선

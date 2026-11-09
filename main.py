@@ -52,8 +52,12 @@ def make_exchanges(settings: Settings):
     # timeout: 거래소가 응답을 안 줄 때 요청 하나가 기다리는 상한 (REST_TIMEOUT_MS). 기본 10초면 스캔이 분 단위로 멈춘다
     upbit = ccxt.upbit({"apiKey": settings.upbit_access_key, "secret": settings.upbit_secret_key,
                         "enableRateLimit": True, "timeout": settings.rest_timeout_ms})
+    # adjustForTimeDifference: 바이비트는 요청 시각이 서버보다 1초 넘게 앞서면 거절한다 (retCode 10002, recv_window 는 '뒤' 쪽만
+    # 넓힌다). 재부팅 뒤 PC 시계가 1초쯤 빨라 잔고·포지션 조회가 간헐적으로 실패했다 (2026-11-09 18:24). ccxt 가 마켓을 받을 때
+    # 서버 시각과의 차이를 재서 요청 시각에서 빼 준다
     bybit = ccxt.bybit({"apiKey": settings.bybit_api_key, "secret": settings.bybit_api_secret,
-                        "enableRateLimit": True, "options": {"defaultType": "swap"}, "timeout": settings.rest_timeout_ms})
+                        "enableRateLimit": True, "options": {"defaultType": "swap", "adjustForTimeDifference": True},
+                        "timeout": settings.rest_timeout_ms})
     upbit.load_markets()
     bybit.load_markets()
     return upbit, bybit
