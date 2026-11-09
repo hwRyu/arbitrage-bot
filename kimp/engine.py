@@ -282,7 +282,18 @@ class Engine:
                     logger.warning("[한 번만 돌리기] 포지션 하나를 잡고, 청산되면 종료합니다"
                                    "%s", f" (최대 보유 {self.s.one_shot_max_hours:g}시간)"
                                    if self.s.one_shot_max_hours else " (목표에 닿을 때까지 기다립니다)")
-            self._check_rebalance(session, positions, {}, when="시작")
+            # 시작 리밸런싱 확인은 시세를 받은 뒤에. 시세 없이 재면 원화 버퍼(USDT 환산 불가)와 보유 코인 평가가 빠져 업비트가
+            # 작게 잡힌다 — 2026-11-09 18:31 재기동 때 실제 43.1:56.9 였는데 33:67 로 보고 112.61 USDT 를 거꾸로 보냈다 (수수료 1.3).
+            # 시세를 못 받으면 건너뛴다 (다음 청산 때 다시 본다). 점검 모드 중에도 시세가 비어 자연히 건너뛴다
+            try:
+                quotes = self.market.fetch_quotes(self.coins, self.fx.get() if self.fx else None)
+            except Exception as exc:   # noqa: BLE001 — 시작을 막을 일은 아니다
+                logger.warning("[시작 시세 조회 실패] %s", exc)
+                quotes = {}
+            if quotes:
+                self._check_rebalance(session, positions, quotes, when="시작")
+            else:
+                logger.warning("[리밸런싱 확인 생략 · 시작] 시세가 없어 자본 비율을 정확히 알 수 없음 → 다음 청산 때 다시 봅니다")
 
     def run(self, stop_event: threading.Event) -> None:
         """

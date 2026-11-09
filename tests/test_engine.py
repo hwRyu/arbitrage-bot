@@ -624,7 +624,9 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         broker = PaperBroker(FEES, 0.3)
         with sf() as s:
             broker.ensure_initial_balances(s, 10_000, 1.0)  # 전부 업비트
-        engine = Engine(settings, FakeMarket(), None, broker, sf, ["XRP"])
+        market = FakeMarket()
+        market.quotes = {"XRP": make_quote(0.0)}   # 시작 리밸런싱은 시세가 있어야 잰다 (원화 버퍼 환산 때문)
+        engine = Engine(settings, market, None, broker, sf, ["XRP"])
         with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
             engine.startup()
         msg = next(m for m in logs.output if "리밸런싱" in m)
@@ -635,6 +637,7 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         """시작 자본 10,000 USDT 가 전부 업비트에 있는 엔진"""
         settings = make_settings(**overrides)
         market = FakeMarket()
+        market.quotes = {"XRP": make_quote(0.0)}   # 시작 리밸런싱은 시세가 있어야 잰다 (원화 버퍼 환산 때문)
         sf = make_session_factory(":memory:")
         broker = PaperBroker(FEES, 0.3)
         with sf() as s:
@@ -688,7 +691,9 @@ class LeverageAndRebalanceTest(unittest.TestCase):
         broker = PaperBroker(FEES, 0.3)
         with sf() as s:
             broker.ensure_initial_balances(s, 10_000, 0.0)  # 전부 바이비트에
-        engine = Engine(settings, FakeMarket(), None, broker, sf, ["XRP"])
+        market = FakeMarket()
+        market.quotes = {"XRP": make_quote(0.0)}   # 시작 리밸런싱은 시세가 있어야 잰다
+        engine = Engine(settings, market, None, broker, sf, ["XRP"])
         engine.startup()
         import math
 
