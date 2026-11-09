@@ -174,9 +174,9 @@ def live_windows(session: Session, now: datetime) -> List[MaintenanceWindow]:
 
 
 def add_window(session: Session, exchange: str, start_at: datetime, end_at: Optional[datetime],
-               source: str = "manual", note: str = "") -> MaintenanceWindow:
-    """일정 하나 저장. 같은 거래소에 겹치는 일정이 있으면 ValueError"""
-    now = utcnow()
+               source: str = "manual", note: str = "", now: Optional[datetime] = None) -> MaintenanceWindow:
+    """일정 하나 저장. 같은 거래소에 겹치는 일정이 있으면 ValueError. now 는 호출자 시계 (테스트는 가짜 시계)"""
+    now = now or utcnow()
     for w in live_windows(session, now):
         if w.exchange != exchange:
             continue
@@ -306,7 +306,7 @@ class MaintenanceManager:
                     return "해제할 점검 일정이 없습니다" + (f" ({LABEL[cmd.exchange]})" if cmd.exchange else "")
                 return "해제: " + ", ".join(fmt_window(w) for w in done) + "\n점검 중이었으면 다음 스캔부터 복구 확인으로 넘어갑니다"
             try:
-                w = add_window(session, cmd.exchange, cmd.start_at, cmd.end_at, source="manual")
+                w = add_window(session, cmd.exchange, cmd.start_at, cmd.end_at, source="manual", now=now)
             except ValueError as exc:
                 return f"등록 안 됨: {exc}"
             self._dirty.set()
@@ -461,7 +461,7 @@ class MaintenanceManager:
         with self.session_factory() as session:
             try:
                 w = add_window(session, exchange, now_dt - timedelta(seconds=failing), None, source="auto",
-                               note=f"{failing:.0f}초 응답 없음")
+                               note=f"{failing:.0f}초 응답 없음", now=now_dt)
             except ValueError:
                 return None
         self._dirty.set()
