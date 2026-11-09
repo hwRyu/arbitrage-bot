@@ -22,7 +22,7 @@ Engine.step()  (스캔 한 번)
       _update_funding()                  지난 펀딩비 정산 반영, 다음 정산 정보 받기
       _check_liquidation()               강제청산 가격 도달 → 업비트도 즉시 정리 / 가까우면 증거금 추가 경고
       _manage_position()                 "지금 청산하면?" → 목표 넘으면 익절, 손절선 아래면 손절
- 3. 청산이 있었으면 _check_rebalance()    양쪽 비율이 목표에서 10%p 넘게 벗어나면 옮길 USDT 알림
+ 3. 청산이 있었으면 _check_rebalance()    양쪽 비율이 목표에서 15%p 넘게 벗어나면 옮길 USDT 알림
  4. _try_entries()                       김프 ≤ 기준인 코인 진입 (크기: 설정값 또는 자동)
  5. _save_snapshots() / _log_status()    김프 기록, 현황 한 줄 로그
 ```

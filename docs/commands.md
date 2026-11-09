@@ -363,7 +363,7 @@ python -m kimp.simulate --from 2026-09-22 --coins MEW,CAP
 | `POSITION_SIZE_USDT` | 자동 | 포지션 하나 크기 |
 | `BYBIT_LEVERAGE` | 1 | 김프 전략 숏 레버리지 (자본 비율 자동) |
 | `LIQ_WARN_PERCENT` | 15 | 강제청산까지 남은 상승폭이 이보다 작으면 경고 (두 전략 공통) |
-| `REBALANCE_THRESHOLD_PERCENT` | 10 | 양쪽 비율이 이만큼 깨지면 리밸런싱 |
+| `REBALANCE_THRESHOLD_PERCENT` | 15 | 양쪽 비율이 이만큼 깨지면 리밸런싱 (10 → 15, 2026-11-09: 바이비트→업비트 송금 수수료 1.3 USDT 가 소액 포지션에선 익절 3번 이익과 같아서) |
 | `ENTRY_MIN_FUNDING_8H_PERCENT` | -0.05 | 8시간 기준 펀딩비율이 이보다 나쁘면 진입 안 함 (비우면 끔) |
 | `MAX_FUNDING_COST_PERCENT` | 0.3 | 펀딩비로 낸 돈이 포지션 금액의 이 %를 넘으면 정리 (0 = 무제한). 펀딩비만큼 필요 청산 김프가 올라가서, 0.3%면 이미 도달이 어려워진다 |
 | `TRANSFER_FEE_UPBIT_TO_BYBIT_USDT` | 0 | 업비트 → 바이비트 송금 수수료 (업비트 USDT(TRX) 출금 무료) |
@@ -414,6 +414,6 @@ Remove-Item data\STOP                         # 재개
 텔레그램: `/status` `/premium` `/close` `/stop` `/resume` `/collect` `/maint` `/help` → 자세한 설명은 [live.md](live.md) 6번
 
 ## 8. 송금(리밸런싱)은 누가 하나
-- 페이퍼·시뮬레이션: 필요한 순간(청산 후 비율이 10%p 넘게 깨짐 / 진입하려는데 한쪽이 모자람) **사용자가 보냈다고 치고** 바로 옮기고 수수료 1번 (`PAPER_AUTO_REBALANCE`)
+- 페이퍼·시뮬레이션: 필요한 순간(청산 후 비율이 15%p 넘게 깨짐 / 진입하려는데 한쪽이 모자람) **사용자가 보냈다고 치고** 바로 옮기고 수수료 1번 (`PAPER_AUTO_REBALANCE`)
 - 실거래: `AUTO_TRANSFER_ENABLED=true` 면 봇이 출금하고 도착을 확인한다. false(기본)면 알림만 하고 직접 보낸다 ([live.md](live.md) 4번)
 - 펀딩비 전략은 바이비트 안에서 끝나서 송금이 필요 없다.
