@@ -297,8 +297,17 @@ class FakeBybit(FakeExchange):
     def fetch_deposit_address(self, code, params=None):
         return {"address": "BYBIT-ADDR", "tag": None}
 
+    fund_usdt = 0.0   # 펀딩(FUND) 계좌 USDT — 예전 출금 코드가 남긴 돈 흉내 (2026-11-09)
+
     def transfer(self, code, amount, from_, to_):
+        self._maybe_fail("transfer")
         self.calls.append(("transfer", from_, to_))
+        if from_ == "funding" and to_ == "unified":
+            self.fund_usdt -= amount
+            self.free_usdt += amount
+
+    def privateGetV5AssetTransferQueryAccountCoinsBalance(self, params):
+        return {"result": {"balance": [{"coin": "USDT", "transferBalance": str(self.fund_usdt)}]}}
 
     def withdraw(self, code, amount, address, params=None):  # ccxt 와 같은 인자 (태그는 params['tag'])
         self._maybe_fail("withdraw")
@@ -1095,8 +1104,8 @@ class LiveTransferTest(unittest.TestCase):
             broker.sync(s, {"XRP": prices.quote()}, ["XRP"])
             self.assertEqual(t.status, TransferStatus.CONFIRMED)
 
-    def test_bybit_withdraw_failure_moves_funds_back(self):
-        """바이비트 출금이 거절되면 펀딩 계좌로 옮겼던 돈을 통합 계좌로 되돌린다"""
+    def test_bybit_withdraw_failure_leaves_nothing_in_funding(self):
+        """바이비트 출금이 거절돼도 우리가 먼저 옮기는 게 없으니 펀딩 계좌로 가는 돈이 없다 (되돌릴 것도 없다)"""
         prices, up, by, broker, sf = make_live()
         by.fail.add("withdraw")
         with sf() as s:
@@ -1104,14 +1113,35 @@ class LiveTransferTest(unittest.TestCase):
             sent = broker.transfer(s, -50.0, 1.3, reason="테스트")
             self.assertEqual(sent, 0.0)
             moves = [c for c in by.calls if isinstance(c, tuple) and c[0] == "transfer"]
-            self.assertEqual(moves, [("transfer", "unified", "funding"), ("transfer", "funding", "unified")])
+            self.assertEqual(moves, [])
             self.assertEqual(s.query(Transfer).one().status, TransferStatus.FAILED)
 
-    def test_bybit_to_upbit_moves_to_funding_first(self):
+    def test_bybit_to_upbit_does_not_pre_transfer_and_sweeps_funding(self):
+        """
+        바이비트 → 업비트 출금은 거래소가 금액+수수료를 알아서 펀딩 계좌로 옮기므로 우리가 먼저 옮기지 않는다.
+        예전 코드가 남긴 펀딩 계좌 잔액(313 USDT 사고, 2026-11-09)은 출금 뒤 통합 계좌로 되돌린다
+        """
         prices, up, by, broker, sf = make_live()
+        by.fund_usdt = 73.68
+        free_before = by.free_usdt
         with sf() as s:
             self.assertEqual(broker.transfer(s, -100.0, 1.0), -100.0)
-            self.assertIn(("transfer", "unified", "funding"), by.calls)
+            self.assertNotIn(("transfer", "unified", "funding"), by.calls)
+            self.assertIn(("transfer", "funding", "unified"), by.calls)
+            self.assertAlmostEqual(by.fund_usdt, 0.0)
+            self.assertAlmostEqual(by.free_usdt, free_before - 100.0 + 73.68)
+
+    def test_sweep_funding_skips_dust_and_tolerates_errors(self):
+        prices, up, by, broker, sf = make_live()
+        by.fund_usdt = 0.005
+        self.assertEqual(broker.ex.sweep_funding("시작"), 0.0)           # 0.01 미만은 그대로
+        self.assertNotIn(("transfer", "funding", "unified"), by.calls)
+        by.fund_usdt = 20.0
+        by.fail.add("transfer")
+        self.assertEqual(broker.ex.sweep_funding("시작"), 0.0)           # 실패해도 예외를 올리지 않는다
+        by.fail.discard("transfer")
+        self.assertAlmostEqual(broker.ex.sweep_funding("시작"), 20.0)
+        self.assertAlmostEqual(by.fund_usdt, 0.0)
 
     def test_daily_cap_and_min(self):
         prices, up, by, broker, sf = make_live()

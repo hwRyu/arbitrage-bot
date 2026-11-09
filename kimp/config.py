@@ -318,7 +318,7 @@ class Settings:
     liq_guard_topup_unit_ratio: float = 1.0
 
     # 양쪽 자본 비율이 목표에서 이 %p 넘게 벗어나면 리밸런싱 알림 (청산 직후 확인)
-    rebalance_threshold_percent: float = 10.0
+    rebalance_threshold_percent: float = 15.0
 
     # 진입 뒤 양쪽 금액(업비트 코인 값 vs 바이비트 숏 금액) 차이가 이 %보다 크면 큰 쪽을 줄여서 맞춘다
     #   예) 숏 100 USDT, 코인 80 USDT 어치만 체결 → 숏 20 USDT 만큼 닫기 (비용 약 0.02 USDT)

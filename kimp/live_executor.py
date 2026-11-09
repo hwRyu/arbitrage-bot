@@ -99,6 +99,8 @@ class LiveExecutor:
             self._ignore_not_modified(f"{coin} 격리 마진",
                                       lambda: self.by.set_margin_mode("isolated", sym, {"leverage": leverage}))
             self._ignore_not_modified(f"{coin} 레버리지 {leverage:g}배", lambda: self.by.set_leverage(leverage, sym))
+        # 펀딩 계좌에 굳어 있던 USDT 를 거래 계좌로 (예전 출금 코드가 남긴 것, 2026-11-09). 자본 비율 계산이 통합 계좌만 본다
+        self.sweep_funding("시작")
 
     def min_order_krw(self, coin: str) -> float:
         """
@@ -725,27 +727,51 @@ class LiveExecutor:
                     params["tag"] = tag
                 r = self.up.withdraw("USDT", amount_usdt, address, params)
             else:
-                # 바이비트는 거래(통합) 계좌 → 펀딩 계좌로 옮긴 뒤 출금.
-                # 출금이 거절되면 펀딩 계좌에 남은 돈을 도로 옮긴다 — 안 그러면 봇이 보는 free 잔고에서
-                # 그 돈이 사라진 채 굳는다 (2026-10-24: 73.68 USDT 가 펀딩 계좌에 남았던 사고)
-                self.by.transfer("USDT", amount_usdt, "unified", "funding")
+                # 바이비트 출금은 ccxt 가 accountType=UTA 로 보내고, 거래소가 '금액 + 수수료' 를 통합 → 펀딩 계좌로 알아서
+                # 옮긴 뒤 출금한다. 예전엔 우리가 먼저 금액을 펀딩 계좌로 옮겼는데, 거래소도 또 옮겨서 출금마다 금액만큼이
+                # 펀딩 계좌에 남았다 (11-06 127.14, 11-09 112.61 … 합 313 USDT 가 봇이 안 보는 계좌에 굳어 자본 비율을
+                # 바이비트 쪽이 작게 보이게 했다, 2026-11-09 발견). 이제 우리는 옮기지 않고, 끝난 뒤 펀딩 계좌에 남은 것을 되돌린다
                 params = {"network": self.s.bybit_transfer_network}
                 if tag:
                     params["tag"] = tag
                 try:
                     r = self.by.withdraw("USDT", amount_usdt, address, params)
-                except Exception as exc:
-                    try:
-                        self.by.transfer("USDT", amount_usdt, "funding", "unified")
-                        logger.warning("바이비트 출금 실패 → 펀딩 계좌로 옮겼던 %.4f USDT 를 통합 계좌로 되돌림", amount_usdt)
-                    except Exception as back:
-                        logger.critical("바이비트 출금 실패 뒤 펀딩 → 통합 되돌리기도 실패: %s (펀딩 계좌에 %.4f USDT 남음)",
-                                        back, amount_usdt)
-                    raise
+                finally:
+                    self.sweep_funding("출금 뒤")
         except Exception as exc:
             raise OrderFailed(f"출금 실패: {exc}") from exc
         self.refresh()
         return str(r.get("id") or "")
+
+    def funding_usdt(self) -> Optional[float]:
+        """바이비트 펀딩(FUND) 계좌의 USDT (옮길 수 있는 양). 조회가 안 되면 None"""
+        get = getattr(self.by, "privateGetV5AssetTransferQueryAccountCoinsBalance", None)
+        if get is None:
+            return None
+        r = get({"accountType": "FUND", "coin": "USDT"})
+        for row in ((r.get("result") or {}).get("balance") or []):
+            if row.get("coin") == "USDT":
+                return float(row.get("transferBalance") or 0.0)
+        return 0.0
+
+    def sweep_funding(self, when: str) -> float:
+        """
+        바이비트 펀딩 계좌에 남은 USDT 를 통합(거래) 계좌로 되돌린다. 봇은 통합 계좌만 자본으로 세기 때문이다
+
+        시작할 때와 출금 뒤에 부른다. 0.01 USDT 미만은 그대로 둔다. 실패해도 봇은 멈추지 않는다 (경고만)
+        Returns: 옮긴 양 (못 옮겼으면 0)
+        """
+        try:
+            amount = self.funding_usdt()
+            if amount is None or amount < 0.01:
+                return 0.0
+            self.by.transfer("USDT", float(f"{amount:.4f}"), "funding", "unified")
+        except Exception as exc:   # noqa: BLE001
+            logger.warning("[펀딩 계좌 정리 실패 · %s] %s", when, exc)
+            return 0.0
+        logger.warning("[펀딩 계좌 정리 · %s] 바이비트 펀딩 계좌에 남아 있던 %.4f USDT 를 통합 계좌로 되돌림", when, amount)
+        self.refresh()
+        return amount
 
     def transfer_arrived(self, session: Session, transfer) -> Optional[bool]:
         """
