@@ -1141,6 +1141,20 @@ class TickZoneTest(unittest.TestCase):
         self._enter(engine, market, 0.0693)
         self.assertEqual(len(self._positions(sf)), 1)
 
+    def test_entry_blocked_when_already_in_zone(self):
+        """106원(한 칸 1원 = 0.94% ≥ 목표 0.2%)은 들어가는 순간 경계 위 모드 → 변동폭 자료가 없어도 진입 안 함 (WAVES #60·#61, 11-10)"""
+        engine, sf, broker, market = self._engine(funding_rate=0.0001)      # daily_ranges 없음 = 변동폭 가드는 쉬는 상태
+        with self.assertLogs("kimp.engine", level="INFO") as logs:
+            self._enter(engine, market, 0.0757)                              # ≈ 106원
+        self.assertEqual(self._positions(sf), [])
+        self.assertTrue(any("[진입 보류]" in l and "이미 경계 위 구간" in l for l in logs.output))
+        with sf() as s:
+            self.assertIn("tick_zone_block", [d.stage for d in s.query(Decision).all()])
+        # 끄면 예전처럼 들어간다
+        engine, sf, broker, market = self._engine(funding_rate=0.0001, tick_zone_enabled=False)
+        self._enter(engine, market, 0.0757)
+        self.assertEqual(len(self._positions(sf)), 1)
+
     def test_entry_not_blocked_when_next_tick_is_small(self):
         """960원(1,000원까지 4%)은 넘어도 한 칸 1원 = 0.1% < 목표 0.2% 라 위험이 아니다 → 하루 5% 움직여도 들어간다"""
         engine, sf, broker, market = self._engine(funding_rate=0.0001, daily_ranges={"XRP": 5.0})

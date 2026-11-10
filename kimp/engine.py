@@ -1313,13 +1313,19 @@ class Engine:
 
     def _tick_zone_entry_risk(self, coin: str, ask: float, target: float) -> Optional[str]:
         """
-        진입 전 예방: 위쪽 호가 단위 경계까지 거리 < 보통 하루 변동폭이면 이유 문구, 아니면 None
+        진입 전 예방: 지금 가격이 이미 경계 위 구간이거나, 위쪽 호가 단위 경계까지 거리 < 보통 하루 변동폭이면 이유 문구, 아니면 None
 
-        넘은 뒤 한 칸 % 가 목표보다 작은 경계(예: 1,000원 → 한 칸 1원 = 0.1%)는 위험이 아니므로 보지 않는다.
-        변동폭을 못 받았으면(None) 막지 않는다 — 데이터가 없다고 기회를 버리지는 않는다
+        ① 지금 매도 호가의 한 칸 % 가 이미 목표 % 이상이면 들어가는 순간 경계 위 모드라 최선이 본전이다 → 변동폭과 무관하게 막는다
+           (2026-11-10 WAVES #60·#61: 240원대, 한 칸 1원 = 0.42% ≥ 목표 0.40% 인데 위쪽 경계 1,000원까지 315% 라 통과해 3분에 3번 진입).
+        ② 넘은 뒤 한 칸 % 가 목표보다 작은 경계(예: 1,000원 → 한 칸 1원 = 0.1%)는 위험이 아니므로 보지 않는다.
+        변동폭을 못 받았으면(None) ②는 막지 않는다 — 데이터가 없다고 기회를 버리지는 않는다
         """
         if not self.s.tick_zone_enabled or ask <= 0 or target <= 0:
             return None
+        tick_now = upbit_krw_tick(ask) / ask * 100
+        if tick_now >= target:
+            return (f"지금 매도 호가 {ask:g}원이 이미 경계 위 구간 (한 칸 {tick_now:.2f}% ≥ 목표 {target:.2f}%) | "
+                    f"들어가면 바로 경계 위 모드라 목표 익절이 불가능, 본전이 최선 (issues #6)")
         upper = next_tick_boundary(ask)
         if upper is None:
             return None
