@@ -29,6 +29,7 @@ _step_maintenance 가 돈다 — 그 거래소는 아예 부르지 않고, 다�
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -39,7 +40,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from kimp.config import Settings
 from kimp.broker import EntryMissed, EntryRejected, ExitDeferred, ExitValuation, HedgeBroker, InsufficientBalance
-from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot
+from kimp.db import ExitReason, FundingEvent, Position, PositionStatus, PremiumSnapshot, Transfer, TransferStatus
 from kimp.executor import BYBIT_USDT, UPBIT_KRW, UPBIT_USDT
 from kimp.fok_sizing import EntryFit, fit_entry
 from kimp.fok_trace import classify_miss
@@ -82,6 +83,8 @@ EXIT_LABEL = {
     ExitReason.LIQ_GUARD: "강제청산 회피", ExitReason.TICK_ZONE_EXIT: "경계 위 청산",
 }
 DAILY_RANGE_REFRESH_SEC = 3600.0   # 경계 위 모드 예방 가드의 '보통 하루 변동폭' 갱신 간격
+CLEAN_RETRY_SEC = 600.0            # 정리 모드(/clean) 송금이 안 나갔을 때 다시 시도하는 간격 (거래소 규정 거절 재시도와 같음)
+CLEAN_MARKER = "CLEAN"             # 정리 모드 마커 파일 이름 (STOP 파일과 같은 폴더, 재기동해도 정리 모드가 이어진다)
 
 
 def _as_utc(dt):
@@ -161,6 +164,20 @@ class Engine:
         # 사람이 지시한 강제 청산 요청 (텔레그램 /close). 다른 스레드에서 직접 청산하면
         # 엔진과 같은 포지션을 동시에 건드릴 수 있어서, 요청만 적어두고 다음 스캔에서 엔진이 처리한다.
         self._close_requests: set = set()   # 코인 이름들. "*" 이면 전부
+        # 정리 모드 (텔레그램 /clean): 전부 청산 → 바이비트 USDT 전부 업비트로 → 신규 진입 없음. /resume 이 풀고 재분배한다.
+        # 단계: closing(포지션·송금 끝나길 기다림) → sent(정리 송금 도착 대기) → done. 마커 파일로 재기동 뒤에도 이어진다
+        self._clean = False
+        self._clean_stage = "closing"
+        self._clean_transfer_id: Optional[int] = None
+        self._clean_retry_at = 0.0
+        self._resume_rebalance = False      # /resume 으로 정리 모드를 풀었다 → 다음 스캔에 자본을 목표 비율로 재분배
+        self._clean_file = os.path.join(os.path.dirname(settings.stop_file) or ".", CLEAN_MARKER)
+        if os.path.exists(self._clean_file):
+            self._clean = True
+            self._close_requests.add("*")
+            broker.safety.manual_stop = True
+            logger.warning("[정리 모드 이어서] 마커 %s 가 있어 정리 모드로 시작합니다 | 포지션이 있으면 청산 → 바이비트 USDT 전부 업비트로 | "
+                           "신규 진입 없음 (재개: /resume)", self._clean_file)
 
         # 한 번만 돌리기(ONE_SHOT): 포지션 하나를 끝까지 보고 종료한다
         self._one_shot_opened = False  # 이번 실행에서 포지션을 잡았나 (또는 이미 있던 걸 이어받았나)
@@ -242,6 +259,157 @@ class Engine:
         if "*" in self._close_requests and not open_positions:
             self._close_requests.clear()
         return closed
+
+    # ------------------------------------------------------------------
+    # 정리 모드 (텔레그램 /clean): 전부 청산 → 바이비트 USDT 전부 업비트로 → 신규 진입 없음. /resume 이 풀고 재분배
+    # ------------------------------------------------------------------
+    @property
+    def clean_mode(self) -> bool:
+        """정리 모드인가 (/status 표시용)"""
+        return self._clean
+
+    def _write_clean_marker(self, on: bool) -> None:
+        """마커 파일 만들기/지우기 — 재기동해도 정리 모드가 이어지게. 파일을 못 건드려도 봇은 멈추지 않는다 (경고만)"""
+        try:
+            if on:
+                os.makedirs(os.path.dirname(self._clean_file) or ".", exist_ok=True)
+                with open(self._clean_file, "w", encoding="utf-8") as f:
+                    f.write("텔레그램 /clean 정리 모드. 지우거나 /resume 하면 해제" + LF)
+            elif os.path.exists(self._clean_file):
+                os.remove(self._clean_file)
+        except OSError as exc:
+            logger.warning("[정리 모드 마커 %s 실패] %s | %s (재기동하면 정리 모드가 %s)", "저장" if on else "삭제",
+                           self._clean_file, exc, "풀립니다" if on else "다시 켜집니다")
+
+    def request_clean(self) -> str:
+        """
+        텔레그램 /clean — 정리 모드 시작
+
+        ① 신규 진입을 멈추고(/stop 과 같음) ② 들고 있는 포지션을 전부 강제 청산 요청하고(/close 와 같음, 사유 MANUAL)
+        ③ 포지션·송금이 모두 끝나면 바이비트 USDT 를 전부(출금 수수료만 남기고) 업비트로 보낸다 (_run_clean).
+        그 뒤로도 신규 진입은 막힌 채다. /resume 이 정리 모드를 풀고 자본을 목표 비율로 다시 나눈다 (cancel_clean).
+        실제 청산·송금은 다음 스캔에서 엔진이 한다 (텔레그램 스레드가 포지션을 직접 건드리면 엔진과 충돌한다).
+        """
+        self.broker.safety.manual_stop = True
+        self._clean = True
+        self._clean_stage = "closing"
+        self._clean_transfer_id = None
+        self._clean_retry_at = 0.0
+        self._resume_rebalance = False
+        self._write_clean_marker(True)
+        with self.session_factory() as session:
+            holding = self.broker.open_positions(session)
+            pending = self.broker.pending_transfers(session)
+        logger.warning("[정리 모드 시작] 텔레그램 /clean | 포지션 %d개 청산 → 바이비트 USDT 전부 업비트로 | 신규 진입 없음 (재개: /resume)",
+                       len(holding))
+        if holding:
+            self._close_requests.add("*")
+            step = (f"포지션 {len(holding)}개({', '.join(p.coin for p in holding)})를 다음 스캔({self.s.scan_interval_sec:.0f}초 안)에 "
+                    f"지금 시세로 청산한 뒤")
+        elif pending:
+            step = "진행 중인 송금이 도착한 뒤"
+        else:
+            step = "포지션이 없어서 다음 스캔에 바로"
+        return (f"정리 모드: 신규 진입을 멈췄습니다.{LF}{step} 바이비트 USDT 를 전부(출금 수수료 "
+                f"{self.s.transfer_fee_usdt(False):g} 제외) 업비트로 보냅니다. 도착하면 알립니다."
+                f"{LF}다시 돌리려면 /resume — 자본을 목표 비율로 재분배한 뒤 기존처럼 진입합니다")
+
+    def cancel_clean(self) -> str:
+        """
+        텔레그램 /resume 에서: 정리 모드를 풀고, 다음 스캔에 자본을 목표 비율로 다시 나누게 한다 (_rebalance_after_resume)
+
+        Returns: 답장에 덧붙일 문장. 정리 모드가 아니었으면 빈 글자
+        """
+        if not self._clean:
+            return ""
+        self._clean = False
+        self._clean_stage = "closing"
+        self._clean_transfer_id = None
+        self._resume_rebalance = True
+        self._write_clean_marker(False)
+        logger.warning("[정리 모드 해제] 텔레그램 /resume | 다음 스캔에 자본을 목표 비율로 재분배합니다 (업비트 → 바이비트)")
+        return "정리 모드를 풀었습니다 — 다음 스캔에 자본을 목표 비율로 재분배하고(업비트 → 바이비트, 도착 확인 뒤) 기존처럼 진입합니다"
+
+    def _run_clean(self, session: Session, quotes: Dict[str, Quote], open_positions: Dict[str, Position]) -> None:
+        """
+        정리 모드 진행 (매 스캔): 포지션·송금이 모두 끝났으면 바이비트 USDT 를 전부 업비트로 보내고, 도착하면 완료를 알린다
+
+        - 보내는 양 = 바이비트 USDT − 출금 수수료 (바이비트는 '금액 + 수수료' 를 통합 계좌에서 빼므로 전액을 적으면 거절된다)
+        - 하루 송금 한도(TRANSFER_MAX_USDT_PER_DAY)는 보지 않는다 — 사람이 지시한 한 번의 이동이고, 둘로 나누면 수수료를 두 번 낸다
+        - 최소 금액(TRANSFER_MIN_USDT) 미만이면 그대로 두고 완료로 친다. 자동 송금이 꺼져 있으면 직접 옮기라고 알린다
+        - 안 나갔으면(규정 거절·실패) CLEAN_RETRY_SEC 뒤 다시. 실패로 끝난 송금은 다시 보낸다
+        """
+        if not self._clean or self._clean_stage == "done":
+            return
+        if open_positions or self.broker.unfinished_positions(session):
+            self._log_throttled("clean-wait", logging.INFO,
+                                f"[정리 중] 포지션 {len(open_positions)}개가 끝나면 바이비트 USDT 를 업비트로 보냅니다", cooldown_sec=600.0)
+            return
+        if self.broker.pending_transfers(session):
+            return   # 도착 확인은 broker.sync 가 한다 (15초마다)
+        if self._clean_stage == "sent":
+            t = session.get(Transfer, self._clean_transfer_id) if self._clean_transfer_id else None
+            if t is not None and t.status == TransferStatus.FAILED:
+                self._clean_stage = "closing"   # 브로커가 [송금 실패] 를 알렸다 → 다시 보낸다
+                self._clean_retry_at = self._clock() + CLEAN_RETRY_SEC
+            else:
+                self._clean_stage = "done"
+                got = (t.amount_usdt - t.fee_usdt) if t is not None else 0.0
+                logger.warning("[정리 완료] 바이비트 → 업비트 %s USDT 도착 | 지금 업비트 %s / 바이비트 %s USDT | "
+                               "신규 진입은 멈춘 채 (재개: /resume → 목표 비율로 재분배)",
+                               f"{got:,.2f}", f"{self.broker.balance(session, UPBIT_USDT):,.2f}",
+                               f"{self.broker.balance(session, BYBIT_USDT):,.2f}")
+                return
+        if self._clock() < self._clean_retry_at:
+            return
+        if self.maint.transfers_blocked():
+            self._log_throttled("clean-maint", logging.INFO, "[정리 보류] 거래소 점검 중에는 송금을 보내지 않습니다 (끝나면 보냅니다)",
+                                cooldown_sec=1800.0)
+            return
+        bybit = self.broker.balance(session, BYBIT_USDT)
+        fee = self.s.transfer_fee_usdt(False)
+        send = bybit - fee
+        if send <= 0 or send < max(self.s.transfer_min_usdt, fee):
+            self._clean_stage = "done"
+            logger.warning("[정리 완료] 바이비트 USDT %s 는 최소 송금액 %g(+수수료 %g) 미만이라 그대로 둡니다 | 신규 진입은 멈춘 채 (재개: /resume)",
+                           f"{bybit:,.2f}", self.s.transfer_min_usdt, fee)
+            return
+        if not self.auto_transfer:
+            self._clean_stage = "done"
+            logger.warning("[정리 · 직접 송금] 자동 송금이 꺼져 있습니다 (AUTO_TRANSFER_ENABLED) — 바이비트 → 업비트로 USDT %s 를 직접 옮기세요 | "
+                           "신규 진입은 멈춘 채 (재개: /resume)", f"{bybit:,.2f}")
+            return
+        sent = self.broker.transfer(session, -send, fee, reason="정리", ignore_daily_limit=True)
+        if not sent:
+            self._clean_retry_at = self._clock() + CLEAN_RETRY_SEC   # 이유는 브로커가 알렸다 (규정 거절·실패) → 10분 뒤 다시
+            return
+        self._account_dirty = True
+        row = session.scalar(select(Transfer).where(Transfer.reason == "정리").order_by(Transfer.id.desc()).limit(1))
+        self._clean_transfer_id = row.id if row is not None else None
+        self._clean_stage = "sent"
+        logger.warning("[정리 송금] 바이비트 → 업비트 %s USDT (수수료 %g, 바이비트 잔고 %s 전부) | 도착하면 [정리 완료] 로 알립니다",
+                       f"{abs(sent):,.2f}", fee, f"{bybit:,.2f}")
+
+    def _rebalance_after_resume(self, session: Session, quotes: Dict[str, Quote], open_positions: Dict[str, Position]) -> None:
+        """
+        /resume 으로 정리 모드를 푼 뒤 첫 스캔들: 자본을 목표 비율로 다시 나눈다 (업비트 → 바이비트, 하루 한도 무시)
+
+        거래소 규정(업비트 출금지연제)으로 못 보냈으면 브로커가 10분 뒤 재시도하도록 막아 두므로, 비율이 맞거나 송금이 나갈
+        때까지 매 스캔 다시 본다 (자동 송금이 꺼져 있으면 알림 한 번으로 끝). 송금 중이면 도착을 기다린다
+        """
+        if not self._resume_rebalance or not quotes:
+            return
+        positions = list(open_positions.values())
+        if self.broker.pending_transfers(session):
+            return
+        sent = self._check_rebalance(session, positions, quotes, when="재개", ignore_daily_limit=True)
+        if sent is not None or not self.auto_transfer:
+            self._resume_rebalance = False
+            return
+        upbit, bybit = self.broker.capital_split(session, positions, quotes)
+        total = upbit + bybit
+        if total <= 0 or abs(upbit / total - self.s.upbit_target_share()) * 100 <= self.s.rebalance_threshold_percent:
+            self._resume_rebalance = False   # 맞출 게 없다
 
     @property
     def transfers(self) -> list:
@@ -392,6 +560,8 @@ class Engine:
 
             if closed_any:
                 self._check_rebalance(session, list(open_positions.values()), quotes, when="청산 후")
+            self._run_clean(session, quotes, open_positions)                 # 정리 모드(/clean): 다 끝났으면 바이비트 → 업비트 전부
+            self._rebalance_after_resume(session, quotes, open_positions)    # /resume 뒤: 목표 비율로 재분배
 
             allowed, why = self.broker.entries_allowed(session)
             if allowed and account_stale:
@@ -917,7 +1087,8 @@ class Engine:
             self._account_dirty = True
 
     def _check_rebalance(self, session: Session, positions: List[Position], quotes: Dict[str, Quote],
-                         when: str, need: Optional[InsufficientBalance] = None) -> Optional[float]:
+                         when: str, need: Optional[InsufficientBalance] = None,
+                         ignore_daily_limit: bool = False) -> Optional[float]:
         """
         양쪽 자본 비율을 목표와 비교해서, 많이 벗어났으면 옮길 USDT 를 알려준다
 
@@ -935,6 +1106,8 @@ class Engine:
         Returns:
             옮겨야 할 양 (USDT, + 면 업비트 → 바이비트). 맞출 필요 없으면 None
         """
+        if self._clean:
+            return None   # 정리 모드: 돈은 _run_clean 이 업비트로 모으는 중 — 목표 비율로 되돌려 보내면 안 된다
         upbit, bybit = self.broker.capital_split(session, positions, quotes)
         total = upbit + bybit
         if total <= 0:
@@ -966,7 +1139,7 @@ class Engine:
             if self.broker.pending_transfers(session):
                 return None  # 송금 중 → 도착할 때까지 기다림
             fee = self.s.transfer_fee_usdt(move > 0)  # 보내는 거래소가 떼므로 방향별로 다르다
-            sent = self.broker.transfer(session, move, fee, reason=when)
+            sent = self.broker.transfer(session, move, fee, reason=when, ignore_daily_limit=ignore_daily_limit)
             if sent:
                 logger.warning(
                     "[송금 · %s] %s | 금액 %s USDT (수수료 %s) | 전: 업비트 %s / 바이비트 %s (%.1f : %.1f) | 목표 %.1f : %.1f",

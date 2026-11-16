@@ -1394,12 +1394,18 @@ class HedgeBroker:
         return list(session.scalars(select(Transfer).where(Transfer.status != TransferStatus.FAILED)
                                     .order_by(Transfer.id)))
 
-    def transfer(self, session: Session, amount_usdt: float, fee_usdt: float, reason: str = "") -> float:
+    def transfer(self, session: Session, amount_usdt: float, fee_usdt: float, reason: str = "",
+                 ignore_daily_limit: bool = False) -> float:
         """
         송금 요청: amount 가 + 면 업비트 → 바이비트, − 면 바이비트 → 업비트
 
         보내는 쪽 '남는 USDT' 까지만, 하루 한도까지만, 최소 금액 이상만. 송금 중이면 안 보냄.
         예) 업비트 → 바이비트 30 USDT, 수수료 1 → 업비트 −30, (도착하면) 바이비트 +29
+
+        Args:
+            ignore_daily_limit: 하루 한도(TRANSFER_MAX_USDT_PER_DAY)를 보지 않는다. 사람이 텔레그램으로 지시한 한 번의 이동
+                (/clean 정리, /resume 재분배)에만 쓴다 — 한도는 봇이 알아서 보내는 리밸런싱의 사고 상한이고, 지시한
+                이동을 둘로 쪼개면 수수료를 두 번 낸다
 
         Returns:
             실제로 요청한 양 (부호 포함). 안 보냈으면 0
@@ -1413,7 +1419,7 @@ class HedgeBroker:
             return 0.0
         to_bybit = amount_usdt > 0
         send = min(abs(amount_usdt), self.balance(session, UPBIT_USDT if to_bybit else BYBIT_USDT))
-        if self.transfer_max_usdt_per_day is not None:
+        if self.transfer_max_usdt_per_day is not None and not ignore_daily_limit:
             since = kst_midnight_utc(self._now().timestamp())
             today = session.scalar(select(func.coalesce(func.sum(Transfer.amount_usdt), 0.0)).where(
                 Transfer.status != TransferStatus.FAILED, Transfer.requested_at >= since)) or 0.0

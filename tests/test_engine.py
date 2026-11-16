@@ -4,6 +4,7 @@
 실행: python -m unittest discover -s tests -v
 """
 import logging
+import os
 import time
 import unittest
 from typing import Dict, List, Optional
@@ -887,6 +888,164 @@ class CloseRequestTest(unittest.TestCase):
         engine, sf, _ = make_engine(make_settings(), market)
         engine.startup()
         self.assertIn("들고 있는 포지션이 없습니다", engine.request_close())
+
+
+class CleanCommandTest(unittest.TestCase):
+    """
+    텔레그램 /clean — 정리 모드: 전부 청산 → 바이비트 USDT 전부 업비트로 → 신규 진입 없음. /resume 이 풀고 재분배
+
+    마커 파일(data/CLEAN)은 STOP 파일과 같은 폴더에 생기므로 테스트는 임시 폴더를 쓴다 (repo 의 data/ 를 건드리지 않게)
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.stop_file = os.path.join(self._tmp.name, "STOP")
+        self.clean_file = os.path.join(self._tmp.name, "CLEAN")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _engine(self, coins=("XRP", "SOL"), upbit_share=None, enter=True, **broker_kwargs):
+        """시작 자본 10,000 USDT 를 목표 비율(또는 upbit_share)로 나눈 페이퍼 엔진. enter 면 두 코인 모두 진입해 둔다"""
+        market = FakeMarket()
+        settings = make_settings(coins=list(coins), max_open_positions=len(coins), reentry_cooldown_sec=0,
+                                 stop_file=self.stop_file)
+        sf = make_session_factory(":memory:")
+        broker = PaperBroker(FEES, 0.3, **broker_kwargs)
+        with sf() as s:
+            broker.ensure_initial_balances(s, 10_000, settings.upbit_target_share() if upbit_share is None else upbit_share)
+        engine = Engine(settings, market, None, broker, sf, list(coins))
+        market.quotes = {c: make_quote(-1.0 if enter else 0.0, coin=c) for c in coins}
+        if enter:
+            engine.startup()
+            engine.step()
+            with sf() as s:
+                self.assertEqual(len(broker.open_positions(s)), len(coins))
+        return engine, sf, broker, market
+
+    def _balances(self, sf, broker):
+        """업비트 USDT / 바이비트 USDT 잔고 (원화 버퍼 제외)"""
+        with sf() as s:
+            return broker.balance(s, UPBIT_USDT), broker.balance(s, BYBIT_USDT)
+
+    def _capital(self, sf, broker, market):
+        """양쪽 자본 (업비트는 원화 버퍼·보유 코인 포함, 바이비트는 증거금 포함) — 비율 판단에 쓰는 값"""
+        with sf() as s:
+            return broker.capital_split(s, broker.open_positions(s), market.quotes)
+
+    def test_clean_closes_all_then_sweeps_bybit_to_upbit(self):
+        """/clean: 포지션 전부 MANUAL 청산 → 같은 스캔에 바이비트 USDT 를 수수료만 남기고 업비트로 → 재진입 없음 → 다음 스캔에 완료 알림"""
+        engine, sf, broker, market = self._engine()
+        msg = engine.request_clean()
+        self.assertIn("정리 모드", msg)
+        self.assertIn("포지션 2개", msg)
+        self.assertTrue(broker.safety.manual_stop)
+        self.assertTrue(engine.clean_mode)
+        self.assertTrue(os.path.exists(self.clean_file))
+        engine.step()                                   # 김프는 여전히 -1% (기준 아래) — 청산만 하고 다시 들어가지 않는다
+        with sf() as s:
+            self.assertEqual(broker.open_positions(s), [])
+            from sqlalchemy import select
+            for p in s.scalars(select(Position)).all():
+                self.assertEqual(p.exit_reason, ExitReason.MANUAL)
+        transfers = engine.transfers
+        self.assertEqual([t.reason for t in transfers], ["정리"])          # 청산 후 리밸런싱 송금은 없다 (정리 모드)
+        self.assertEqual(transfers[0].direction, "bybit->upbit")
+        fee = engine.s.transfer_fee_usdt(False)
+        self.assertEqual(transfers[0].fee_usdt, fee)
+        _, bybit = self._balances(sf, broker)
+        self.assertLessEqual(bybit, fee + 0.001)                            # 수수료 몫만 남는다 (페이퍼는 받는 쪽에서 뗀다)
+        upbit_cap, bybit_cap = self._capital(sf, broker, market)
+        self.assertGreater(upbit_cap, 9_990)                                # 전 자본(원화 버퍼 포함)이 업비트에 (청산 비용 몇 USDT 제외)
+        self.assertLessEqual(bybit_cap, fee + 0.001)
+        with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
+            engine.step()                               # 도착(페이퍼는 즉시) → 완료 알림 한 번
+        self.assertTrue(any("[정리 완료]" in m for m in logs.output))
+        engine.step()                                   # 그 뒤로는 조용하고, 여전히 들어가지 않는다
+        with sf() as s:
+            self.assertEqual(broker.open_positions(s), [])
+        self.assertEqual(len(engine.transfers), 1)
+
+    def test_resume_rebalances_to_target_then_trades_again(self):
+        """/resume: 정리 모드 해제 → 다음 스캔에 업비트 → 바이비트 재분배(수수료 0) → 기존처럼 진입. 마커 파일도 지운다"""
+        engine, sf, broker, market = self._engine(coins=("XRP",))
+        engine.request_clean()
+        engine.step()                                   # 청산 + 정리 송금
+        self.assertEqual(len(engine.transfers), 1)
+        market.quotes = {"XRP": make_quote(0.0)}        # 재분배가 먼저인지 보려고 진입 신호는 꺼 둔다
+        note = engine.cancel_clean()                    # 텔레그램 /resume 의 앞부분
+        self.assertIn("재분배", note)
+        self.assertFalse(engine.clean_mode)
+        self.assertFalse(os.path.exists(self.clean_file))
+        broker.safety.resume()
+        engine.step()
+        transfers = engine.transfers
+        self.assertEqual([t.reason for t in transfers], ["정리", "재개"])
+        self.assertEqual(transfers[1].direction, "upbit->bybit")
+        self.assertEqual(transfers[1].fee_usdt, 0.0)
+        upbit_cap, bybit_cap = self._capital(sf, broker, market)            # 비율은 원화 버퍼까지 넣은 자본으로 잰다
+        self.assertAlmostEqual(bybit_cap / (upbit_cap + bybit_cap), 1 - engine.s.upbit_target_share(), delta=0.01)
+        market.quotes = {"XRP": make_quote(-1.0)}
+        engine.step()
+        with sf() as s:
+            self.assertEqual(len(broker.open_positions(s)), 1)
+        self.assertEqual(len(engine.transfers), 2)      # 재분배는 한 번만
+
+    def test_resume_without_clean_changes_nothing(self):
+        """정리 모드가 아니면 cancel_clean 은 빈 글자, 송금도 없다"""
+        engine, sf, broker, market = self._engine(coins=("XRP",), enter=False)
+        engine.startup()
+        self.assertEqual(engine.cancel_clean(), "")
+        engine.step()
+        self.assertEqual(engine.transfers, [])
+
+    def test_clean_without_positions_sweeps_immediately(self):
+        """포지션이 없으면 다음 스캔에 바로 보낸다"""
+        engine, sf, broker, market = self._engine(coins=("XRP",), enter=False)
+        engine.startup()
+        msg = engine.request_clean()
+        self.assertIn("포지션이 없어서", msg)
+        engine.step()
+        self.assertEqual([t.reason for t in engine.transfers], ["정리"])
+        _, bybit = self._balances(sf, broker)
+        self.assertLessEqual(bybit, engine.s.transfer_fee_usdt(False) + 0.001)
+
+    def test_clean_ignores_daily_transfer_limit(self):
+        """하루 송금 한도(100)보다 큰 바이비트 잔고(약 5,650)도 한 번에 보낸다 — 사람이 지시한 이동은 쪼개면 수수료만 두 번"""
+        engine, sf, broker, market = self._engine(coins=("XRP",), enter=False, transfer_max_usdt_per_day=100.0)
+        engine.startup()
+        engine.request_clean()
+        engine.step()
+        transfers = engine.transfers
+        self.assertEqual(len(transfers), 1)
+        self.assertGreater(transfers[0].amount_usdt, 5_000)
+
+    def test_clean_leaves_dust_below_minimum(self):
+        """바이비트 잔고가 최소 송금액 미만이면 보내지 않고 완료로 친다 (수수료만 버리지 않게)"""
+        # 바이비트에 5 USDT 만. request_clean 을 startup 보다 먼저 — 정리 모드에서는 시작 리밸런싱도 하지 않는다
+        engine, sf, broker, market = self._engine(coins=("XRP",), enter=False, upbit_share=0.9995, transfer_min_usdt=10.0)
+        engine.request_clean()
+        engine.startup()
+        with self.assertLogs("kimp.engine", level=logging.WARNING) as logs:
+            engine.step()
+        self.assertTrue(any("최소 송금액" in m and "[정리 완료]" in m for m in logs.output))
+        self.assertEqual(engine.transfers, [])
+        _, bybit = self._balances(sf, broker)
+        self.assertAlmostEqual(bybit, 5.0, delta=0.01)
+
+    def test_clean_marker_survives_restart(self):
+        """마커 파일이 있으면 새 엔진도 정리 모드로 시작한다 (신규 진입 막힘 + 남은 포지션 청산 요청)"""
+        engine, sf, broker, market = self._engine(coins=("XRP",))
+        engine.request_clean()                          # 청산은 아직 (step 전) — 재기동 상황
+        broker.safety.manual_stop = False               # 메모리 상태는 재기동하면 사라진다
+        engine2 = Engine(engine.s, market, None, broker, sf, ["XRP"])
+        self.assertTrue(engine2.clean_mode)
+        self.assertTrue(broker.safety.manual_stop)
+        engine2.step()                                  # 남아 있던 포지션을 청산하고 바로 정리 송금
+        with sf() as s:
+            self.assertEqual(broker.open_positions(s), [])
+        self.assertEqual([t.reason for t in engine2.transfers], ["정리"])
 
 
 class FundingGuardTest(unittest.TestCase):

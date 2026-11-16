@@ -130,6 +130,8 @@ def status_text(settings: Settings, broker: HedgeBroker, session_factory, market
                  f"오늘 확정 손익 {broker.safety.daily_loss_usdt(session):+,.2f} USDT",
                  ("신규 진입 가능" if ok else f"신규 진입 중단 — {why}") + f" · 자리 {len(positions)} / {s.max_open_positions}",
                  quote_source_text(s, market)]
+        if getattr(engine, "clean_mode", False):
+            lines.append("🧹 정리 모드 — 전부 청산 뒤 바이비트 USDT 를 업비트로 보냅니다 (신규 진입 없음, 재개: /resume)")
         for p in broker.unfinished_positions(session):
             lines.append(f"⚠️ #{p.id} {p.coin} {p.status} — 다음 스캔에 이어서 처리")
         for t in broker.pending_transfers(session):
@@ -185,6 +187,7 @@ HELP_TEXT = (
     "/status   잔고·포지션·진입 가능 여부" + LF +
     "/premium  지금 김프 (가운데·진입·청산, 기준까지 얼마 남았나)" + LF +
     "/close    강제 청산 + 신규 진입 중단 (예: /close 또는 /close CAP,SEI → 재개는 /resume)" + LF +
+    "/clean    정리: 전부 청산 → 바이비트 USDT 전부 업비트로 → 신규 진입 없음 (/resume 이 재분배 후 재개)" + LF +
     "/stop     신규 진입 중단 (청산·관리는 계속)" + LF +
     "/resume   재개 (수동 정지·연속 실패 해제, 비상정지 파일 data/STOP 도 삭제)" + LF +
     "/collect  시세 수집 현황 (/collect start 40 · /collect stop)" + LF +
@@ -293,7 +296,11 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
         return "신규 진입을 멈췄습니다 (가진 포지션은 계속 관리). 재개: /resume"
 
     def resume() -> str:
+        # 정리 모드(/clean)였으면 먼저 푼다 — 엔진이 다음 스캔에 자본을 목표 비율로 재분배한 뒤 기존처럼 진입한다
+        clean_note = engine.cancel_clean() if engine else ""
         cleared = broker.safety.resume()
+        if clean_note:
+            return clean_note + LF + "풀었습니다: " + ", ".join(cleared)
         if not cleared:
             return "풀 게 없었습니다 (수동 정지·연속 실패·비상정지 파일 모두 없음). 다른 이유로 막혀 있으면 /status 에 나옵니다"
         return "재개했습니다 — " + ", ".join(cleared) + ". 다른 이유로 막혀 있으면 /status 에 나옵니다"
@@ -305,6 +312,7 @@ def start_telegram(settings: Settings, broker: HedgeBroker, session_factory, sto
         "/premium": lambda: premium_text(settings, market),
         "/close": lambda args: (engine.request_close(args.split(",") if args else None) if engine
                                 else "엔진이 아직 준비되지 않았습니다"),
+        "/clean": lambda: (engine.request_clean() if engine else "엔진이 아직 준비되지 않았습니다"),
         "/collect": lambda args: collect_command(settings, args),
         "/maint": lambda args: (engine.maint.command(args) if engine else "엔진이 아직 준비되지 않았습니다"),
         "/help": lambda: HELP_TEXT,

@@ -13,6 +13,7 @@
   /status   잔고·포지션·진입 가능 여부        /premium  지금 김프 (가운데·진입·청산, 기준까지 남은 폭)
   /stop     신규 진입 중단 (청산은 계속)        /resume   재개
   /close    강제 청산 + 신규 진입 중단 (/close, /close CAP,SEI)   /collect  수집 현황 (start 40 · stop)
+  /clean    정리: 전부 청산 → 바이비트 USDT 전부 업비트로 → 신규 진입 없음 (/resume 이 재분배 후 재개)
   /help     명령 목록
 
   명령에 인자를 붙일 수 있다 (/close CAP,SEI). 핸들러가 인자를 받으면 넘겨준다.
