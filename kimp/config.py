@@ -216,6 +216,11 @@ class Settings:
     bybit_deposit_tag: str = ""
     upbit_deposit_address: str = ""
     upbit_deposit_tag: str = ""
+    # 바이비트 → 업비트 출금의 트래블룰 수신자 정보 (한국 KYC 계정은 필수, 2026-11-17 retCode 131074 로 거절됨)
+    #   BYBIT_BENEFICIARY_NAME: 받는 쪽(업비트) KYC 실명. 비우면 수신자 정보 없이 보내고 거절된다 (시작 때 경고)
+    #   BYBIT_VASP_ENTITY_ID : 받는 거래소 id (GET /v5/asset/withdraw/vasp/list). 업비트는 목록에 없어 'others'
+    bybit_beneficiary_name: str = ""
+    bybit_vasp_entity_id: str = "others"
 
     # ------------------------------------------------------------------
     # 텔레그램 알림 (비우면 알림 없음)
@@ -688,6 +693,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         bybit_deposit_tag=_env_str("BYBIT_DEPOSIT_TAG", ""),
         upbit_deposit_address=_env_str("UPBIT_DEPOSIT_ADDRESS", ""),
         upbit_deposit_tag=_env_str("UPBIT_DEPOSIT_TAG", ""),
+        bybit_beneficiary_name=_env_str("BYBIT_BENEFICIARY_NAME", ""),
+        bybit_vasp_entity_id=_env_str("BYBIT_VASP_ENTITY_ID", d.bybit_vasp_entity_id) or "others",
         telegram_bot_token=_env_str("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=_env_str("TELEGRAM_CHAT_ID", ""),
         coins=_env_list("COINS", ",".join(d.coins)),

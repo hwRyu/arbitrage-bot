@@ -87,6 +87,17 @@ CLEAN_RETRY_SEC = 600.0            # 정리 모드(/clean) 송금이 안 나갔�
 CLEAN_MARKER = "CLEAN"             # 정리 모드 마커 파일 이름 (STOP 파일과 같은 폴더, 재기동해도 정리 모드가 이어진다)
 
 
+def clean_marker_path(settings: Settings) -> str:
+    """
+    정리 모드 마커 파일 경로. 실거래는 data/CLEAN, 페이퍼·드라이런은 data/CLEAN.paper / data/CLEAN.dry_run
+
+    모드마다 다른 이유: 실거래 봇이 /clean 으로 만든 마커를 같은 폴더에서 도는 페이퍼 봇·테스트 엔진이 읽으면 그쪽도
+    정리 모드로 시작해 버린다 (2026-11-17 실제로 테스트 51개가 그렇게 깨졌다). DB 를 모드별로 나누는 것과 같은 원칙
+    """
+    name = CLEAN_MARKER if settings.mode == "live" else f"{CLEAN_MARKER}.{settings.mode}"
+    return os.path.join(os.path.dirname(settings.stop_file) or ".", name)
+
+
 def _as_utc(dt):
     """
     DB 에서 읽은 시각에 UTC 를 붙인다
@@ -171,7 +182,7 @@ class Engine:
         self._clean_transfer_id: Optional[int] = None
         self._clean_retry_at = 0.0
         self._resume_rebalance = False      # /resume 으로 정리 모드를 풀었다 → 다음 스캔에 자본을 목표 비율로 재분배
-        self._clean_file = os.path.join(os.path.dirname(settings.stop_file) or ".", CLEAN_MARKER)
+        self._clean_file = clean_marker_path(settings)
         if os.path.exists(self._clean_file):
             self._clean = True
             self._close_requests.add("*")

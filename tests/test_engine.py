@@ -901,7 +901,7 @@ class CleanCommandTest(unittest.TestCase):
         import tempfile
         self._tmp = tempfile.TemporaryDirectory()
         self.stop_file = os.path.join(self._tmp.name, "STOP")
-        self.clean_file = os.path.join(self._tmp.name, "CLEAN")
+        self.clean_file = os.path.join(self._tmp.name, "CLEAN.paper")   # 페이퍼 모드 마커 (실거래는 CLEAN)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -1033,6 +1033,18 @@ class CleanCommandTest(unittest.TestCase):
         self.assertEqual(engine.transfers, [])
         _, bybit = self._balances(sf, broker)
         self.assertAlmostEqual(bybit, 5.0, delta=0.01)
+
+    def test_clean_marker_is_per_mode(self):
+        """실거래 봇의 data/CLEAN 을 페이퍼 봇·테스트가 읽지 않도록 마커 이름은 모드마다 다르다"""
+        from dataclasses import replace as dc_replace
+
+        from kimp.engine import clean_marker_path
+        base = make_settings(stop_file=os.path.join("x", "STOP"))                      # paper_trading 기본 True
+        self.assertEqual(clean_marker_path(base), os.path.join("x", "CLEAN.paper"))
+        live = dc_replace(base, paper_trading=False, live_dry_run=False)
+        self.assertEqual(clean_marker_path(live), os.path.join("x", "CLEAN"))
+        dry = dc_replace(base, paper_trading=False, live_dry_run=True)
+        self.assertEqual(clean_marker_path(dry), os.path.join("x", "CLEAN.dry_run"))
 
     def test_clean_marker_survives_restart(self):
         """마커 파일이 있으면 새 엔진도 정리 모드로 시작한다 (신규 진입 막힘 + 남은 포지션 청산 요청)"""

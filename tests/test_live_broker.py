@@ -314,6 +314,7 @@ class FakeBybit(FakeExchange):
         self.free_usdt -= amount
         wid = self._id()
         self.withdrawals.append({"id": wid, "status": "pending", "amount": amount})
+        self.sent = (amount, address, params)
         return {"id": wid}
 
 
@@ -1430,6 +1431,42 @@ class WithdrawArgsTest(unittest.TestCase):
         self.assertEqual(seen["params"]["tag"], "메모123")
         self.assertEqual(seen["address"], "주소")
         self.assertEqual(seen["amount"], 100.0)
+        self.assertNotIn("beneficiary", seen["params"])   # 업비트 출금에는 바이비트 트래블룰 항목이 없다
+
+    def test_bybit_withdraw_carries_travel_rule_beneficiary(self):
+        """
+        바이비트 → 업비트 출금에는 트래블룰 수신자 정보(beneficiary) 를 붙인다 (한국 KYC 계정 필수)
+
+        2026-11-17 /clean 정리 송금 1,007 USDT 가 이 항목이 없어 retCode 131074 "Beneficiary info is required" 로 거절됐다.
+        업비트는 바이비트 VASP 목록에 없어 vaspEntityId='others', 이름은 받는 쪽(업비트) KYC 실명이다.
+        """
+        from dataclasses import replace as dc_replace
+
+        prices = Prices()
+        s = dc_replace(settings(), upbit_deposit_address="업비트주소", bybit_beneficiary_name="홍길동")
+        by = FakeBybit(prices)
+        ex = LiveExecutor(FakeUpbit(prices), by, s, sleep=lambda _x: None)
+        with make_session_factory(":memory:")() as session:
+            ex.withdraw(session, False, 100.0, "TRC20")
+        amount, address, params = by.sent
+        self.assertEqual((amount, address), (100.0, "업비트주소"))
+        self.assertEqual(params["network"], "TRC20")
+        self.assertEqual(params["beneficiary"], {"vaspEntityId": "others", "beneficiaryName": "홍길동"})
+        self.assertEqual(settings().bybit_vasp_entity_id, "others")   # 기본값: 업비트는 목록에 없다
+
+    def test_bybit_withdraw_without_name_warns(self):
+        """실명이 비어 있으면 수신자 정보 없이 보내되 경고를 남긴다 (바이비트가 거절할 것이므로 사람이 알아야 한다)"""
+        from dataclasses import replace as dc_replace
+
+        prices = Prices()
+        s = dc_replace(settings(), upbit_deposit_address="업비트주소", bybit_beneficiary_name="")
+        by = FakeBybit(prices)
+        ex = LiveExecutor(FakeUpbit(prices), by, s, sleep=lambda _x: None)
+        with make_session_factory(":memory:")() as session, \
+                self.assertLogs("kimp.live_executor", level=logging.WARNING) as logs:
+            ex.withdraw(session, False, 100.0, "TRC20")
+        self.assertNotIn("beneficiary", by.sent[2])
+        self.assertTrue(any("수신자 정보 없음" in m for m in logs.output))
 
 
 class TransferDecimalsTest(unittest.TestCase):

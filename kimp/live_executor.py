@@ -734,6 +734,15 @@ class LiveExecutor:
                 params = {"network": self.s.bybit_transfer_network}
                 if tag:
                     params["tag"] = tag
+                # 트래블룰 수신자 정보 (한국 KYC 계정 필수). 2026-11-17 /clean 정리 송금 1,007 USDT 가 이게 없어서
+                # retCode 131074 "Beneficiary info is required" 로 거절됐다 (11-09 의 112 USDT 는 통과 — 그 사이 적용).
+                # 업비트는 바이비트 VASP 목록에 없어 vaspEntityId='others' ("Others (including Upbit)"), 이름은 받는 쪽 KYC 실명
+                if self.s.bybit_beneficiary_name:
+                    params["beneficiary"] = {"vaspEntityId": self.s.bybit_vasp_entity_id,
+                                             "beneficiaryName": self.s.bybit_beneficiary_name}
+                else:
+                    logger.warning("[출금 수신자 정보 없음] BYBIT_BENEFICIARY_NAME 이 비어 있어 트래블룰 정보 없이 보냅니다 — "
+                                   "한국 KYC 계정은 바이비트가 거절합니다 (131074)")
                 try:
                     r = self.by.withdraw("USDT", amount_usdt, address, params)
                 finally:
